@@ -26,8 +26,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         import uvicorn
 
+        from . import identity
         from .server import create_app
 
+        identity.model_path()  # download now rather than during the first take
         uvicorn.run(create_app(args.data), host=args.host, port=args.port)
         return 0
 
@@ -39,7 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(result))
         return 0
-    print(f"Match: {result['overall']:.0f} / 100")
+    print(f"Match: {result['overall']:.0f} / 100  (the real person on another mic ~90, a stranger ~20)")
+    if result["accepted"]:
+        print("Passes a speaker check: a voice-verification model would take this for the same person.")
     for c in result["components"]:
         score_text = "  –" if c["score"] is None else f"{c['score']:3.0f}"
         print(f"  {c['label']:<13}{score_text}  {c['detail']}")

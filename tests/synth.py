@@ -29,7 +29,7 @@ def voice(
         y = np.diff(np.floor(phase), prepend=0.0)  # one impulse per glottal cycle
         # F4 and F5 are fixed per voice; without them Praat's five-formant fit
         # parks a spare pole near 2 kHz and reports it as F3.
-        for centre, bandwidth in zip((*formants, 3500, 4500), (80, 100, 140, 200, 250)):
+        for centre, bandwidth in zip((*formants, 3500, 4500), (80, 100, 140, 200, 250), strict=True):
             r = np.exp(-np.pi * bandwidth / SR)
             theta = 2 * np.pi * centre * formant_scale / SR
             y = lfilter([1.0], [1.0, -2 * r * np.cos(theta), r * r], y)

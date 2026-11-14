@@ -56,3 +56,13 @@ def test_contour_is_on_the_targets_timeline():
 def test_silence_is_rejected():
     with pytest.raises(AnalysisError):
         analyze(np.zeros(16000, dtype=np.float32))
+
+
+def test_noisy_lead_in_and_tail_are_trimmed():
+    clean = voice()
+    rng = np.random.default_rng(0)
+    pad = np.zeros(16000, dtype=np.float32)
+    padded = np.concatenate([pad, clean, pad])
+    speech_rms = np.sqrt(np.mean(clean**2))
+    noisy = padded + rng.standard_normal(len(padded)).astype(np.float32) * speech_rms / 10  # 20 dB SNR
+    assert abs(analyze(noisy).duration - analyze(clean).duration) < 0.15

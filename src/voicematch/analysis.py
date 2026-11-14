@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import librosa
 import numpy as np
 import parselmouth
 import soundfile as sf
+
+from . import identity
 
 SR = 16000
 HOP = 160  # 10 ms
@@ -48,6 +51,26 @@ class Voice:
     @property
     def voiced(self) -> np.ndarray:
         return np.isfinite(self.f0)
+
+    @cached_property
+    def embedding(self) -> np.ndarray:
+        """Speaker fingerprint; computed on first use because it loads a model."""
+        return identity.embed(self.y, SR)
+
+    @property
+    def spoken(self) -> slice:
+        """Frames from the first to the last voiced sound, plus 50 ms either side
+        for unvoiced consonants. Leaves out breaths, sighs and clicks at the
+        edges, which differ from take to take but aren't part of the line."""
+        idx = np.flatnonzero(self.voiced)
+        if idx.size < MIN_VOICED_FRAMES:
+            return slice(0, len(self.times))
+        return slice(max(0, idx[0] - 5), min(len(self.times), idx[-1] + 6))
+
+    @property
+    def spoken_duration(self) -> float:
+        span = self.spoken
+        return (span.stop - span.start) * HOP / SR
 
     @property
     def median_f0(self) -> float | None:
@@ -97,7 +120,7 @@ def _prepare(y: np.ndarray) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0 or float(np.max(np.abs(y))) < 1e-4:
         raise AnalysisError("That recording is silent — check the microphone.")
-    y, _ = librosa.effects.trim(y, top_db=40)
+    y = _trim(y)
     seconds = len(y) / SR
     if seconds < MIN_SECONDS:
         raise AnalysisError("That recording is too short to score.")
@@ -106,6 +129,26 @@ def _prepare(y: np.ndarray) -> np.ndarray:
             f"That clip is {seconds:.0f} s long — keep it under {MAX_SECONDS:.0f} s."
         )
     return 0.9 * y / float(np.max(np.abs(y)))
+
+
+def _trim(y: np.ndarray, pad: float = 0.05) -> np.ndarray:
+    """Cut the lead-in and tail that are only background.
+
+    A fixed "40 dB below the peak" rule never fires in a room with audible
+    noise, and then a second of hiss at each end skews timing, alignment and
+    the speaker embedding. So the cut-off sits above the measured noise floor.
+    """
+    rms = librosa.feature.rms(y=y, frame_length=N_FFT, hop_length=HOP)[0]
+    db = 20 * np.log10(np.maximum(rms, 1e-10))
+    peak, floor = float(db.max()), float(np.percentile(db, 10))
+    threshold = max(peak - 40, floor + min(15.0, max(6.0, 0.3 * (peak - floor))))
+    loud = np.flatnonzero(db > threshold)
+    if loud.size == 0:
+        return y
+    margin = int(pad * SR)
+    start = max(0, loud[0] * HOP - margin)
+    end = min(len(y), (loud[-1] + 1) * HOP + N_FFT // 2 + margin)
+    return y[start:end]
 
 
 def _pitch(snd: parselmouth.Sound, times: np.ndarray) -> np.ndarray:

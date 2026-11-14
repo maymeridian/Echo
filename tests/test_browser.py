@@ -87,7 +87,7 @@ def test_upload_target_record_takes_and_delete(server, page, tmp_path):
     page.wait_for_selector("#result:not([hidden])", timeout=20000)
     first = int(page.text_content("#overall"))
     assert 0 <= first <= 100
-    assert page.locator("#components li").count() == 5
+    assert page.locator("#components li").count() == 6
     assert "baseline" in page.text_content("#score-note")
 
     record(page, "#record")

@@ -4,4 +4,7 @@ __pycache__/
 .pytest_cache/
 
 # Voice clips and takes stay on this machine, never in git.
-data/
+/data/
+
+# Downloaded models and calibration datasets.
+cache/

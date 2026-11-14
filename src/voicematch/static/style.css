@@ -8,6 +8,8 @@
   --accent: #d9480f;
   --target: #3b6ea8;
   --track: #ebe8e1;
+  --good: #1f6f43;
+  --good-bg: #e3f1e8;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -19,6 +21,8 @@
     --accent: #ff7a3d;
     --target: #7fb0e6;
     --track: #2a2926;
+    --good: #7fd6a2;
+    --good-bg: #1d3327;
   }
 }
 
@@ -122,6 +126,8 @@ input[type="text"] {
 .score span { font-size: 56px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
 .score small { margin-left: 6px; color: var(--muted); font-size: 14px; }
 #score-note { margin: 0; color: var(--muted); }
+.scale { margin: -10px 0 0; font-size: 13px; color: var(--muted); }
+.check { margin: 0; padding: 8px 12px; border-radius: 6px; background: var(--good-bg); color: var(--good); font-weight: 600; }
 
 .components { display: flex; flex-direction: column; gap: 10px; }
 .components li { display: grid; grid-template-columns: 100px 1fr 34px; gap: 4px 12px; align-items: center; }

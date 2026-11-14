@@ -238,6 +238,7 @@ function renderResult() {
   if (!shown) return;
   $("#overall").textContent = Math.round(shown.overall);
   $("#take-audio").src = `/api/targets/${current.id}/takes/${shown.id}/audio`;
+  $("#check").hidden = !shown.accepted;
 
   const earlier = takes.filter((t) => t.created < shown.created).map((t) => t.overall);
   const best = Math.max(...earlier);

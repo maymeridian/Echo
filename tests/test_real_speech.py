@@ -1,0 +1,69 @@
+"""Checks on real speech: four CMU ARCTIC clips (see data/arctic/COPYING).
+
+bdl and rms are two American men and slt an American woman, all reading
+sentence a0001; bdl also reads a0002. None of them were used to calibrate.
+"""
+
+from pathlib import Path
+
+import librosa
+import numpy as np
+import pytest
+from calibrate import channel
+
+from voicematch import analyze, compare, identity, load
+
+DATA = Path(__file__).parent / "data" / "arctic"
+
+
+@pytest.fixture(scope="module")
+def clip():
+    cache = {}
+
+    def get(name: str):
+        if name not in cache:
+            cache[name] = analyze(load(DATA / f"{name}.wav"))
+        return cache[name]
+
+    return get
+
+
+def test_speaker_check_accepts_the_same_man_and_nobody_else(clip):
+    target = clip("bdl_arctic_a0001")
+    assert compare(target, clip("bdl_arctic_a0002"))["accepted"]  # other sentence, same man
+    assert not compare(target, clip("rms_arctic_a0001"))["accepted"]
+    assert not compare(target, clip("slt_arctic_a0001"))["accepted"]
+
+
+def test_same_voice_through_a_mic_scores_high_and_strangers_low(clip):
+    target = clip("bdl_arctic_a0001")
+    through_mic = analyze(channel(load(DATA / "bdl_arctic_a0001.wav"), seed=5))
+    assert compare(target, through_mic)["overall"] > 85
+    assert compare(target, clip("rms_arctic_a0001"))["overall"] < 45
+    assert compare(target, clip("slt_arctic_a0001"))["overall"] < 45
+
+
+def test_different_words_are_flagged(clip):
+    result = compare(clip("bdl_arctic_a0001"), clip("bdl_arctic_a0002"))
+    scores = {c["key"]: c["score"] for c in result["components"]}
+    assert min(scores, key=scores.get) == "articulation"
+    assert any("same words" in hint for hint in result["hints"])
+
+
+def test_noise_gated_clip_keeps_its_voice(clip):
+    # Clips cut from videos often have their pauses gated to exact silence,
+    # which without dither in the features knocks the embedding off.
+    y = clip("bdl_arctic_a0001").y
+    rms = librosa.feature.rms(y=y, frame_length=400, hop_length=160)[0]
+    keep = np.repeat(20 * np.log10(rms / rms.max() + 1e-12) > -30, 160)
+    keep = np.pad(keep, (0, max(0, len(y) - len(keep))))[: len(y)]
+    gated = np.where(keep, y, 0).astype(np.float32)
+    assert np.mean(gated == 0) > 0.1
+    assert identity.similarity(identity.embed(y), identity.embed(gated)) > 0.95
+
+
+
+def test_a_take_that_stops_early_asks_about_the_whole_line(clip):
+    y = load(DATA / "bdl_arctic_a0001.wav")
+    result = compare(clip("bdl_arctic_a0001"), analyze(y[: int(len(y) * 0.6)]))
+    assert any("Did you say the whole line?" in hint for hint in result["hints"])
