@@ -20,6 +20,7 @@ The target is always the clean studio file. The take goes through a simulated
 microphone and room (band limit, reverb, noise), because in real use the
 target comes from a clip and the take from your own mic.
 
+    python tools/calibrate.py cohort-mean               # writes speaker_mean.json
     python tools/calibrate.py collect --ravdess cache/ravdess --out cache/pairs.jsonl
     python tools/calibrate.py fit cache/pairs.jsonl     # writes calibration.json
 
@@ -160,6 +161,52 @@ def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
     print(f"wrote {len(pairs)} pairs to {out}", file=sys.stderr)
 
 
+# ---------- cohort mean for speaker embeddings ----------
+
+
+def cohort_files(cache: Path) -> dict[str, list[str]]:
+    """Speakers unrelated to the VCC2018 validation: RAVDESS actors (neutral and
+    calm takes), PTDB-TUG talkers and the Hillenbrand adults."""
+    spk = defaultdict(list)
+    for f in sorted((cache / "ravdess").glob("Actor_*/03-01-0[12]-01-*.wav")):
+        spk["ravdess" + f.parent.name].append(str(f))
+    for f in sorted((cache / "ptdb").glob("mic_*.wav")):
+        spk["ptdb" + f.stem.split("_")[1]].append(str(f))
+    for f in sorted((cache / "hillenbrand" / "audio").glob("[mw]*.wav")):
+        spk["h95" + f.stem[:3]].append(str(f))
+    return spk
+
+
+def _raw_embedding(path: str):
+    from voicematch import identity
+    from voicematch.analysis import _prepare
+
+    try:
+        return path, identity.raw_embed(_prepare(load(path)))
+    except AnalysisError:
+        return path, None
+
+
+def cohort_mean(cache: Path, workers: int) -> None:
+    """Mean of the speakers' average embeddings, so no one speaker (or corpus
+    with many takes) dominates. Writes src/voicematch/speaker_mean.json."""
+    from voicematch import identity
+
+    cohort = cohort_files(cache)
+    files = sorted({f for fs in cohort.values() for f in fs})
+    with ProcessPoolExecutor(workers) as pool:
+        emb = dict(pool.map(_raw_embedding, files, chunksize=16))
+    cents = [np.mean([emb[f] for f in fs if emb[f] is not None], axis=0) for fs in cohort.values()]
+    mean = np.mean(cents, axis=0)
+    out = CALIBRATION.parent / "speaker_mean.json"
+    out.write_text(json.dumps({
+        "model": identity.MODEL_NAME,
+        "source": f"{len(cents)} speakers: RAVDESS, PTDB-TUG, Hillenbrand et al. 1995 adults (tools/calibrate.py)",
+        "mean": [round(float(v), 6) for v in mean],
+    }) + "\n", "utf-8")
+    print(f"wrote {out} from {len(cents)} speakers, |mean| = {np.linalg.norm(mean):.3f}")
+
+
 # ---------- fit ----------
 
 KEYS = ["identity", "pitch", "melody", "resonance", "articulation", "tempo", "timing"]
@@ -241,12 +288,17 @@ def main() -> None:
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--workers", type=int, default=8)
     c.add_argument("--seed", type=int, default=0)
+    cm = sub.add_parser("cohort-mean", help="write speaker_mean.json from unrelated speakers")
+    cm.add_argument("--cache", type=Path, default=Path("cache"))
+    cm.add_argument("--workers", type=int, default=8)
     f = sub.add_parser("fit")
     f.add_argument("pairs", type=Path)
     f.add_argument("--dry-run", action="store_true", help="print, don't write calibration.json")
     args = parser.parse_args()
     if args.command == "collect":
         collect(args.ravdess, args.out, args.workers, args.seed)
+    elif args.command == "cohort-mean":
+        cohort_mean(args.cache, args.workers)
     else:
         fit(args.pairs, not args.dry_run)
 

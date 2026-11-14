@@ -29,7 +29,7 @@ voicematch = "voicematch.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-voicematch = ["static/*"]
+voicematch = ["static/*", "*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

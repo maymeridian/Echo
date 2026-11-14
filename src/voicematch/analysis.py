@@ -27,9 +27,14 @@ MIN_VOICED_FRAMES = 20  # 0.2 s of voiced sound before pitch is trusted
 
 PITCH_FLOOR = 60.0
 PITCH_CEILING = 600.0
-# One ceiling for every voice so a target and a take are always measured the
-# same way; 5500 Hz is Praat's setting for five formants in a shorter vocal tract.
-FORMANT_CEILING = 5500.0
+# The formant ceiling has to suit the vocal tract: about 5000 Hz for men, more for
+# women and children. Each recording gets the candidate whose F1-F3 tracks jump
+# least from frame to frame (the idea behind Barreda's FastTrack, 2021): a wrong
+# ceiling makes the tracker hop between resonances. Against Hillenbrand et al.
+# (1995) this cuts F2/F3 errors over 15% from 5.6%/6.9% to 1.5%/2.8% compared
+# with a fixed 5500 Hz (tools/validate.py formant-lines).
+FORMANT_CEILINGS = tuple(range(4500, 7001, 250))
+FALLBACK_CEILING = 5500.0
 
 
 class AnalysisError(ValueError):
@@ -42,6 +47,7 @@ class Voice:
     times: np.ndarray  # frame centres in seconds
     f0: np.ndarray  # Hz per frame, NaN where unvoiced
     formants: np.ndarray  # (3, frames) F1-F3 in Hz, NaN where unvoiced
+    formant_ceiling: float  # Hz, chosen for this voice
     mfcc: np.ndarray  # (12, frames), mean-normalised, energy dropped
 
     @property
@@ -113,7 +119,8 @@ def analyze(y: np.ndarray) -> Voice:
 
     snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
     f0 = _pitch(snd, times)
-    return Voice(y=y, times=times, f0=f0, formants=_formants(snd, times, f0), mfcc=mfcc)
+    formants, ceiling = formant_tracks(snd, times, f0)
+    return Voice(y=y, times=times, f0=f0, formants=formants, formant_ceiling=ceiling, mfcc=mfcc)
 
 
 def _prepare(y: np.ndarray) -> np.ndarray:
@@ -169,12 +176,33 @@ def _pitch(snd: parselmouth.Sound, times: np.ndarray) -> np.ndarray:
     return f0
 
 
-def _formants(snd: parselmouth.Sound, times: np.ndarray, f0: np.ndarray) -> np.ndarray:
+def formant_tracks(
+    snd: parselmouth.Sound, times: np.ndarray, f0: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """F1-F3 on voiced frames, with the ceiling that gives the smoothest tracks."""
+    voiced = np.flatnonzero(np.isfinite(f0))  # formants only mean much when voiced
+    runs = [r for r in np.split(voiced, np.flatnonzero(np.diff(voiced) > 1) + 1) if r.size >= 5]
+    if not runs:  # too little continuous voicing to judge smoothness
+        return _tracks_at(snd, times, voiced, FALLBACK_CEILING), FALLBACK_CEILING
+    best = (np.inf, FALLBACK_CEILING, None)
+    for ceiling in FORMANT_CEILINGS:
+        tracks = _tracks_at(snd, times, voiced, ceiling)
+        semitones = 12 * np.log2(tracks)
+        jumps = np.concatenate([np.abs(np.diff(semitones[:, r], axis=1)) for r in runs], axis=1)
+        roughness = float(np.nanmean(jumps)) if np.isfinite(jumps).any() else np.inf
+        if roughness < best[0]:
+            best = (roughness, float(ceiling), tracks)
+    if best[2] is None:  # no candidate produced usable tracks
+        return _tracks_at(snd, times, voiced, FALLBACK_CEILING), FALLBACK_CEILING
+    return best[2], best[1]
+
+
+def _tracks_at(snd: parselmouth.Sound, times: np.ndarray, frames: np.ndarray, ceiling: float) -> np.ndarray:
     formant = snd.to_formant_burg(
-        time_step=HOP / SR, max_number_of_formants=5, maximum_formant=FORMANT_CEILING
+        time_step=HOP / SR, max_number_of_formants=5, maximum_formant=float(ceiling)
     )
     out = np.full((3, len(times)), np.nan)
-    for i in np.flatnonzero(np.isfinite(f0)):  # formants only mean much when voiced
+    for i in frames:
         for k in range(3):
             out[k, i] = formant.get_value_at_time(k + 1, float(times[i]))
     return out

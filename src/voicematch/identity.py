@@ -12,6 +12,7 @@ recording level and strangers score nearly as close as the same person.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 import threading
@@ -89,9 +90,37 @@ def _fbank(y: np.ndarray, sr: int) -> np.ndarray:
     return feats - feats.mean(axis=0)
 
 
-def embed(y: np.ndarray, sr: int = 16000) -> np.ndarray:
-    """Unit-length speaker embedding of a mono recording."""
+def raw_embed(y: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """Unit-length model output, before the cohort mean is taken off."""
     e = _get_session().run(None, {"feats": _fbank(y, sr)[None]})[0][0].astype(np.float64)
+    return e / np.linalg.norm(e)
+
+
+def _cohort_mean() -> np.ndarray | None:
+    path = Path(__file__).parent / "speaker_mean.json"
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text("utf-8"))
+    if data.get("model") != MODEL_NAME:
+        return None
+    return np.asarray(data["mean"], dtype=np.float64)
+
+
+_MEAN = _cohort_mean()
+
+
+def embed(y: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """Unit-length speaker embedding of a mono recording.
+
+    The mean embedding of 137 unrelated speakers is subtracted first, as in
+    WeSpeaker's own scoring; what every voice has in common then stops
+    counting as similarity. Against the VCC2018 listening tests this raised
+    the rank correlation with listeners by 0.009 (bootstrap 95% CI 0.007 to
+    0.010; tools/validate.py vcc2018 --models).
+    """
+    e = raw_embed(y, sr)
+    if _MEAN is not None:
+        e = e - _MEAN
     return e / np.linalg.norm(e)
 
 

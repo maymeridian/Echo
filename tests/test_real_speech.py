@@ -67,3 +67,9 @@ def test_a_take_that_stops_early_asks_about_the_whole_line(clip):
     y = load(DATA / "bdl_arctic_a0001.wav")
     result = compare(clip("bdl_arctic_a0001"), analyze(y[: int(len(y) * 0.6)]))
     assert any("Did you say the whole line?" in hint for hint in result["hints"])
+
+
+def test_formant_ceiling_follows_the_vocal_tract(clip):
+    # Shorter vocal tracts need a higher ceiling (tools/validate.py formant-lines).
+    men = [clip("bdl_arctic_a0001").formant_ceiling, clip("rms_arctic_a0001").formant_ceiling]
+    assert clip("slt_arctic_a0001").formant_ceiling > max(men)

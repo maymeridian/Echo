@@ -33,7 +33,7 @@ own way. Each part of the breakdown uses the same scale.
 
 The page also shows **"Passes a speaker check"** when a speaker-verification
 model would accept the take as the same person. That threshold lets 1% of
-same-sex strangers through and accepts 86% of the real person's own takes.
+same-sex strangers through and accepts 88% of the real person's own takes.
 
 ## How it works
 
@@ -51,8 +51,10 @@ part needs **both recordings to say the same words**.
 | Rhythm | 15% | Length from first to last voiced sound, and timing within the line |
 
 Voice uses WeSpeaker's ResNet34-LM (trained on VoxCeleb), run on the CPU with
-onnxruntime. Pitch and formants come from Praat (via parselmouth); MFCCs and
-alignment from librosa.
+onnxruntime, with the mean embedding of 137 unrelated speakers subtracted.
+Pitch and formants come from Praat (via parselmouth). Each recording gets its
+own formant ceiling: the one, from 4500 to 7000 Hz, whose tracks jump least from
+frame to frame. MFCCs and alignment come from librosa.
 
 ### Calibration
 
@@ -74,22 +76,25 @@ Headline scores on the calibration pairs (10th / 50th / 90th percentile):
 
 | Pair | Score |
 | --- | --- |
-| Same actor, same line, clean | 73 / 98 / 100 |
-| Same actor, same line, through a mic | 48 / 90 / 100 |
-| Same actor, different emotion | 32 / 71 / 97 |
-| Same actor, other sentence | 27 / 57 / 84 |
-| Same-sex stranger, same line | 11 / 20 / 41 |
-| Other-sex stranger, same line, same emotion | 11 / 16 / 28 |
+| Same actor, same line, clean | 71 / 98 / 100 |
+| Same actor, same line, through a mic | 46 / 90 / 100 |
+| Same actor, different emotion | 33 / 72 / 97 |
+| Same actor, other sentence | 28 / 58 / 83 |
+| Same-sex stranger, same line | 12 / 20 / 40 |
+| Other-sex stranger, same line, same emotion | 11 / 15 / 24 |
 
 To re-run it, download `Audio_Speech_Actors_01-24.zip` from Zenodo and unzip
 it into `cache/ravdess`, then:
 
 ```powershell
+.\.venv\Scripts\python tools\calibrate.py cohort-mean
 .\.venv\Scripts\python tools\calibrate.py collect --ravdess cache\ravdess --out cache\pairs.jsonl
 .\.venv\Scripts\python tools\calibrate.py fit cache\pairs.jsonl
 ```
 
-This writes `src/voicematch/calibration.json`. Only the fitted numbers are in
+`cohort-mean` also needs the PTDB-TUG and Hillenbrand data used in Validation
+below. These steps write `src/voicematch/speaker_mean.json` and
+`src/voicematch/calibration.json`. Only the fitted numbers are in
 git; RAVDESS itself (CC BY-NC-SA 4.0) stays in the ignored `cache/`.
 
 **Limits.** RAVDESS is acted speech: short lines from one studio. The
@@ -99,8 +104,9 @@ four CMU ARCTIC clips agrees with the scale:
 
 | ARCTIC pair | Score |
 | --- | --- |
-| Another man, same line | 30 |
-| A woman, same line | 28 |
+| Another man, same line | 31 |
+| A woman, same line | 27 |
+| Same man, other sentence (passes the speaker check) | 76 |
 | Same man, through a simulated mic | above 85 |
 
 ### Things that were wrong and are now tested
@@ -116,6 +122,113 @@ four CMU ARCTIC clips agrees with the scale:
 - **Trimming:** trimming used to cut only what was 40 dB below the peak, which
   never happens in a room with audible noise. Now it cuts relative to the
   measured noise floor.
+- **Formant ceiling:** a fixed 5500 Hz ceiling mis-tracked women's and
+  children's F2 and F3 (see Validation). The ceiling is now chosen per
+  recording.
+
+## Validation
+
+`tools/validate.py` checks each measurement against data with known answers.
+The data goes in the ignored `cache/`. Each command's docstring says where to
+download it.
+
+### Against human judgments
+
+The whole scorer was run on the Voice Conversion Challenge 2018 similarity
+test (Lorenzo-Trueba et al., Odyssey 2018; [data](https://doi.org/10.7488/ds/2337),
+CC BY 4.0). It has 21,343 pairs: listeners heard a converted clip and a natural
+recording of the same sentence and judged whether they were the same speaker,
+from 1 (different, sure) to 4 (same, sure). Each converted clip is, in effect,
+a machine's impression of the target voice. That makes this the closest public
+test of what the app measures.
+
+| Measure | Per pair | Per system |
+| --- | --- | --- |
+| **Headline** | **0.52** | **0.93** |
+| Voice | 0.49 | 0.92 |
+| Pitch | 0.47 | 0.78 |
+| Resonance | 0.42 | 0.91 |
+| Articulation | 0.21 | 0.33 |
+
+The table shows Pearson correlation with the mean listener rating. The
+per-system column averages over 72 groups (system × compared-with × task),
+each with many ratings.
+
+Each pair has only 1.4 ratings on average, so listener noise caps the per-pair
+numbers. For comparison, Ahn et al. (2024,
+[arXiv:2407.18505](https://arxiv.org/abs/2407.18505)) report two results on
+their VCC2018 test split:
+
+- **0.51:** a pretrained ECAPA speaker model, with no training on VCC2018.
+- **0.57:** SVSNet, a model trained on VCC2018 itself.
+
+Their split differs from this one, so the comparison is approximate.
+
+Fitting the weights directly to these ratings, with whole systems held out,
+would raise the rank correlation on conversions against their target from
+0.38 to 0.40. Most of that gain comes from dropping melody and rhythm, for the
+reason given under "Tried and not used". The weights stay as calibrated.
+
+### Pitch
+
+The pitch tracker was checked against [PTDB-TUG](http://www2.spsc.tugraz.at/databases/PTDB-TUG/)
+(Pirker et al., Interspeech 2011): 160 sentences from 10 women and 10 men, with
+reference pitch taken from a laryngograph. The current tracker (Praat
+autocorrelation, 60–600 Hz) was the best of five:
+
+| Tracker | Gross errors (>20% off) | Voicing wrong | Fine error |
+| --- | --- | --- | --- |
+| **Autocorrelation, 60–600 Hz (used)** | **2.1%** (women 3.6%, men 0.5%) | 4.5% | 11 cents |
+| Cross-correlation, 60–600 Hz | 2.8% | 4.5% | 14 cents |
+| Two-pass range, De Looze & Hirst 2008 | 2.4% | 4.3% | 12 cents |
+| Two-pass range, Hirst 2011 | 2.6% | 4.2% | 12 cents |
+
+The adaptive ranges fix some octave-down errors for women, but they cause more
+octave-up errors than they fix.
+
+### Formants
+
+The formant tracker was checked against the hand-checked measurements of
+[Hillenbrand et al. (1995)](https://github.com/santiagobarreda/hillenbrand_et_al_1995):
+1,668 /hVd/ words from 45 men, 48 women and 46 children. Each speaker's 12
+words were joined into one recording, and one ceiling was chosen per recording
+without vowel labels, as the app does. The table shows the share of
+measurements more than 15% off:
+
+| Ceiling | F1 | F2 | F3 | Children's F2 / F3 |
+| --- | --- | --- | --- | --- |
+| Fixed 5500 Hz (before) | 1.8% | 5.6% | 6.9% | 10.4% / 11.3% |
+| **Least frame-to-frame jumping, per recording (used)** | **0.9%** | **1.5%** | **2.8%** | **2.4% / 4.3%** |
+
+Median errors are 1–2% throughout. The chosen ceilings come out where
+phonetics puts them without being told: 5000 Hz for men, 5750 for women and
+6000 for children.
+
+### Tried and not used
+
+- **Larger or different speaker models.** On the VCC2018 judgments, the
+  following models all agree with listeners within 0.02 of each other:
+  WeSpeaker ResNet293 and CAM++, 3D-Speaker ERes2Net and CAM++. ResNet293 is
+  the best verifier, four times slower, and slightly *worse*. That matches
+  Chen et al. (2026, [arXiv:2609.33999](https://arxiv.org/abs/2609.33999)):
+  lower verification error doesn't buy agreement with listeners.
+- **Averaging three models.** This adds 0.015 rank correlation for three times
+  the work and two more downloads. It's worth revisiting if Voice ever needs
+  that extra.
+- **Projecting embeddings onto a few principal directions.** Chen et al. found
+  that low-dimensional embeddings match perception better, but that came from
+  training with a bottleneck. Projecting afterwards lowered agreement, from
+  0.48 to 0.31 at three dimensions.
+- **Voice quality (CPPS, harmonics-to-noise).** These are standard breathiness
+  measures. On RAVDESS they barely tell a retake from a stranger (AUC 0.61 and
+  0.59). The simulated mic alone moves CPPS by 1 dB, about twice the typical
+  difference between a retake and a stranger. As a part of the score they would
+  mostly measure your microphone.
+- **Melody and rhythm can't be checked against VCC2018.** Voice conversion
+  keeps the source speaker's timing and intonation, so in that data these parts
+  track the source, not the voice people hear. The evidence for them comes from
+  mimicry research: speaking rate is what amateur impersonators change most
+  (Vestman et al. 2020, [arXiv:1906.01454](https://arxiv.org/abs/1906.01454)).
 
 ## Layout
 
@@ -125,11 +238,13 @@ src/voicematch/
   identity.py        speaker embeddings (model download, features, ONNX)
   scoring.py         target + take -> distances -> calibrated scores, hints, chart
   calibration.json   curves and weights from tools/calibrate.py
+  speaker_mean.json  mean speaker embedding of 137 unrelated speakers
   store.py           targets and takes on disk
   server.py          FastAPI app
   cli.py             `voicematch serve`, `voicematch score`
   static/            the page: records, converts to 16 kHz WAV, shows results
-tools/calibrate.py   fits calibration.json from RAVDESS
+tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
+tools/validate.py    checks pitch, formants and the whole score against reference data
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
 
@@ -151,4 +266,10 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
    before trusting it: sherpa-onnx's speaker pipeline wasn't right.
 3. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
-4. **Live feedback.** Show pitch against the target while recording.
+4. **Check against VoxSim.** VoxSim has 69k human similarity ratings on
+   real-world VoxCeleb clips (Ahn et al., Interspeech 2024,
+   [arXiv:2407.18505](https://arxiv.org/abs/2407.18505)). Its ratings are
+   open (CC BY 4.0) and are in `cache/voxsim`. The VoxCeleb1 audio needs a
+   download key from https://mm.kaist.ac.kr/datasets/voxceleb/, which asks for
+   your name and email.
+5. **Live feedback.** Show pitch against the target while recording.
