@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Voice clips and takes stay on this machine, never in git.
+data/

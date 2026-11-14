@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Match</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <h1>Voice Match</h1>
+      <ul id="targets" class="targets"></ul>
+
+      <div class="new-target">
+        <h2>Add a voice</h2>
+        <input id="new-name" type="text" maxlength="80" placeholder="Name this clip" aria-label="Clip name">
+        <div class="row">
+          <label class="btn">
+            <input id="new-file" type="file" accept="audio/*,video/*" hidden>Upload clip
+          </label>
+          <button id="new-record" class="btn" type="button">Record clip</button>
+        </div>
+        <p class="fine">One line, under 30 seconds, with as little music or background noise as you can find.</p>
+      </div>
+    </aside>
+
+    <main>
+      <p id="status" class="status" role="status"></p>
+
+      <section id="empty" class="empty">
+        <h2>Pick a voice to imitate</h2>
+        <p>Add a short clip of the voice on the left, then record yourself saying the same line.</p>
+      </section>
+
+      <section id="practice" hidden>
+        <header class="practice-head">
+          <h2 id="target-name"></h2>
+          <button id="delete-target" class="link" type="button">Delete</button>
+        </header>
+        <div class="player">
+          <span>Target</span>
+          <audio id="target-audio" controls></audio>
+        </div>
+
+        <div class="recorder">
+          <button id="record" class="record" type="button">
+            <span class="dot"></span><span id="record-label">Record a take</span>
+          </button>
+          <div class="meter" aria-hidden="true"><div id="level"></div></div>
+        </div>
+
+        <section id="result" class="result" hidden>
+          <div class="score-row">
+            <div class="score"><span id="overall"></span><small>/ 100 match</small></div>
+            <p id="score-note"></p>
+          </div>
+          <div class="player">
+            <span>You</span>
+            <audio id="take-audio" controls></audio>
+          </div>
+          <ul id="components" class="components"></ul>
+          <div id="hints-wrap">
+            <h3>Work on</h3>
+            <ul id="hints" class="hints"></ul>
+          </div>
+          <figure>
+            <figcaption>
+              Pitch through the line
+              <span class="legend"><i class="sw target"></i>target <i class="sw take"></i>you</span>
+            </figcaption>
+            <canvas id="contour"></canvas>
+          </figure>
+        </section>
+
+        <section id="history" class="history" hidden>
+          <h3>Takes <span id="history-note"></span></h3>
+          <div id="takes" class="takes"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
