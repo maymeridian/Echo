@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]
+e2e = ["playwright"]  # drives the installed Edge or Chrome; no browser download
 
 [project.scripts]
 voicematch = "voicematch.cli:main"

@@ -57,8 +57,12 @@ src/voicematch/
   server.py     FastAPI app
   cli.py        `voicematch serve`, `voicematch score`
   static/       the page: records, converts to 16 kHz WAV, shows results
-tests/          synthetic-voice tests for the scorer and the API
+tests/          synthetic-voice tests for the scorer, the API and the page
 ```
+
+`tests/test_browser.py` drives the page in headless Edge or Chrome with the
+microphone fed from a WAV file. It runs when Playwright is installed
+(`pip install -e ".[e2e]"`) and is skipped otherwise.
 
 ## Next
 
