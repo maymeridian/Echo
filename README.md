@@ -42,7 +42,8 @@ same-sex strangers through and accepts 88% of the real person's own takes.
 **The words.** Each target is transcribed once, with Whisper base.en on the
 CPU, and the page shows its line. Each take is transcribed and compared word
 by word. When the take skipped, swapped or added words, the first hint says
-which, for example "You left out “Steels, etc”". The word check doesn't change
+which, for example "You left out “Steels, etc”". If the recogniser misheard
+the target, correct the line with Edit next to it. The word check doesn't change
 the score. It's advice only, because the recogniser sometimes mishears a
 correct take (see Validation).
 
@@ -356,20 +357,17 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
 
 ## Next
 
-1. **Let the line be corrected on the page.** Some false alarms come from the
-   recogniser mishearing the *target*, for example "Get there talking" for
-   "Kids are talking". Editing the line on the page would remove those.
-2. **Clip cleaning.** Strip music and background noise from target clips
+1. **Clip cleaning.** Strip music and background noise from target clips
    before analysis, using vocal separation and a denoiser, and let a clip be
    trimmed in the page. Check any off-the-shelf pipeline against its reference
    before trusting it: sherpa-onnx's speaker pipeline wasn't right.
-3. **Check the scale with real microphones.** Record a few people saying lines
+2. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
-4. **Train Voice on all of VoxSim.** The listener model was trained on
+3. **Train Voice on all of VoxSim.** The listener model was trained on
    3,037 of VoxSim's 24,921 training pairs. Fetching the rest of the clips
    (`voxsim-fetch --train-pairs 24921`, about 8 GB) and re-running
    `tools/train_similarity.py` should help, since tree models gain from more
    data. Beyond that, fine-tuning the speaker network itself on the ratings
    (Ahn et al. 2024) or training it with a prototypical loss (Chen et al. 2026)
    needs a GPU.
-5. **Live feedback.** Show pitch against the target while recording.
+4. **Live feedback.** Show pitch against the target while recording.

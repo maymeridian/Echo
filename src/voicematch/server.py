@@ -63,6 +63,13 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         targets[meta["id"]] = voice
         return meta
 
+    @app.patch("/api/targets/{target_id}")
+    async def edit_target(target_id: str, request: Request) -> dict:
+        """Correct the line when the recogniser misheard the target."""
+        body = await request.json()
+        text = str(body.get("line", "")).strip()[:500]
+        return store.update_target(target_id, words=text.split())
+
     @app.delete("/api/targets/{target_id}")
     def delete_target(target_id: str) -> Response:
         store.delete_target(target_id)

@@ -77,11 +77,13 @@ def test_upload_target_record_takes_and_delete(server, page, tmp_path):
 
     page.goto(server)
     page.wait_for_selector("#empty:not([hidden])")
+    assert not page.is_visible("#result")  # hidden elements must actually be hidden
 
     page.fill("#new-name", "Synthetic")
     page.set_input_files("#new-file", str(clip))
     page.wait_for_selector("#practice:not([hidden])")
     assert page.text_content("#target-name") == "Synthetic"
+    assert not page.is_visible("#line-form") and not page.is_visible("#result")
 
     record(page, "#record")
     page.wait_for_selector("#result:not([hidden])", timeout=20000)
@@ -98,6 +100,14 @@ def test_upload_target_record_takes_and_delete(server, page, tmp_path):
     page.reload()
     page.wait_for_selector("#result:not([hidden])")
     assert page.locator("#takes button").count() == 2
+
+    # Correct the line by hand; it survives a reload.
+    page.click("#edit-line")
+    page.fill("#line-input", "a made up line")
+    page.click("#line-form button[type=submit]")
+    page.wait_for_function("document.querySelector('#target-line').textContent.includes('a made up line')")
+    page.reload()
+    page.wait_for_function("document.querySelector('#target-line').textContent.includes('a made up line')")
 
     page.on("dialog", lambda dialog: dialog.accept())
     page.click("#delete-target")

@@ -223,8 +223,7 @@ async function select(target) {
   if (!target) return;
   $("#target-name").textContent = target.name;
   $("#target-audio").src = `/api/targets/${target.id}/audio`;
-  $("#target-line").hidden = !target.words?.length;
-  $("#target-line").textContent = target.words?.length ? `“${target.words.join(" ")}”` : "";
+  renderLine();
   try {
     takes = await api(`/api/targets/${target.id}/takes`);
     if (takes.length) shown = await api(`/api/targets/${target.id}/takes/${takes.at(-1).id}`);
@@ -233,6 +232,39 @@ async function select(target) {
   }
   renderResult();
   renderHistory();
+}
+
+function renderLine() {
+  const words = current?.words ?? [];
+  $("#target-line").textContent = words.length ? `“${words.join(" ")}”` : "No words recognised in this clip.";
+  $("#target-line").classList.toggle("empty", !words.length);
+  $("#edit-line").textContent = words.length ? "Edit" : "Add the line";
+  $("#line-form").hidden = true;
+  $("#edit-line").parentElement.hidden = false;
+}
+
+function editLine() {
+  $("#line-input").value = (current.words ?? []).join(" ");
+  $("#edit-line").parentElement.hidden = true;
+  $("#line-form").hidden = false;
+  $("#line-input").focus();
+}
+
+async function saveLine(event) {
+  event.preventDefault();
+  try {
+    const meta = await api(`/api/targets/${current.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ line: $("#line-input").value }),
+    });
+    current.words = meta.words;
+    targets = targets.map((t) => (t.id === meta.id ? { ...t, words: meta.words } : t));
+    renderLine();
+    setStatus("Line saved; it's used from the next take.");
+  } catch (err) {
+    setStatus(err.message, true);
+  }
 }
 
 function renderResult() {
@@ -370,6 +402,9 @@ $("#new-file").onchange = async (e) => {
   e.target.value = "";
   if (file) await createTarget(file);
 };
+$("#edit-line").onclick = editLine;
+$("#cancel-line").onclick = renderLine;
+$("#line-form").onsubmit = saveLine;
 $("#delete-target").onclick = async () => {
   if (!confirm(`Delete "${current.name}" and all its takes?`)) return;
   try {

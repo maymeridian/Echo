@@ -28,6 +28,10 @@ def test_add_target_record_take_and_read_it_back(tmp_path):
     assert [t["id"] for t in listed] == [take["id"]]
     assert client.get(f"/api/targets/{target['id']}/takes/{take['id']}").json() == take
 
+    edited = client.patch(f"/api/targets/{target['id']}", json={"line": "  say this line  "}).json()
+    assert edited["words"] == ["say", "this", "line"]
+    assert client.get("/api/targets").json()[0]["words"] == ["say", "this", "line"]
+
     assert client.delete(f"/api/targets/{target['id']}").status_code == 204
     assert client.get("/api/targets").json() == []
 

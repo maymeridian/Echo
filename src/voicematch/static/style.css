@@ -27,6 +27,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }  /* class rules with display: flex would otherwise win */
 body {
   margin: 0;
   background: var(--bg);
@@ -100,8 +101,14 @@ input[type="text"] {
 
 .practice-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .player { display: flex; align-items: center; gap: 12px; }
-.target-line { margin: -8px 0 14px; font-size: 17px; }
+.line-row { display: flex; align-items: baseline; gap: 10px; margin: -8px 0 14px; }
+.target-line { margin: 0; font-size: 17px; }
 .target-line::before { content: "Line: "; color: var(--muted); font-size: 13px; }
+.target-line.empty { color: var(--muted); font-size: 14px; }
+.line-form { display: flex; gap: 8px; align-items: center; margin: -8px 0 14px; }
+.line-form input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: inherit; font: inherit; }
+.line-form .btn { flex: 0 0 auto; }
 .player span { width: 52px; font-size: 13px; color: var(--muted); }
 
 .recorder { display: flex; align-items: center; gap: 16px; margin: 24px 0; }
