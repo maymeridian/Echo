@@ -9,7 +9,7 @@ from .scoring import compare
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="voicematch", description=__doc__)
+    parser = argparse.ArgumentParser(prog="echo-voice", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the practice app in your browser")

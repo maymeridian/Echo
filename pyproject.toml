@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "voicematch"
+name = "echo-voice"
 version = "0.1.0"
 description = "Practice a voice impression and measure how close you get."
 requires-python = ">=3.10"
@@ -25,13 +25,13 @@ dev = ["pytest", "httpx"]
 e2e = ["playwright"]  # drives the installed Edge or Chrome; no browser download
 
 [project.scripts]
-voicematch = "voicematch.cli:main"
+echo-voice = "echo_voice.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-voicematch = ["static/*", "*.json"]
+echo_voice = ["static/*", "*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

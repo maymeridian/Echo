@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from voicematch import analyze, compare, load
-from voicematch.line import compare_words, transcribe
+from echo_voice import analyze, compare, load
+from echo_voice.line import compare_words, transcribe
 
 LINE = "Author of the Danger Trail, Philip Steels, etc.".split()
 

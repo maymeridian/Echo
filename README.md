@@ -1,6 +1,7 @@
-# voice-match
+# Echo
 
-Practice a voice impression and measure how close you get.
+Practice a voice impression and measure how close you get. Named after Echo,
+the nymph of Greek myth who could only speak in other people's words.
 
 Add a clip of the voice you're imitating, trim it to one line in the page,
 record yourself saying the same line, and get a 0–100 match with a breakdown of what to change: voice identity,
@@ -12,17 +13,17 @@ can see whether you're getting closer.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
-.\.venv\Scripts\voicematch serve
+.\.venv\Scripts\echo-voice serve
 ```
 
 Then open http://127.0.0.1:8000. Clips and takes are stored in `data/`, which
 is not tracked by git. The first run downloads the speaker model (26 MB) to
-`~/.cache/voicematch`; set `VOICEMATCH_CACHE` to put it elsewhere.
+`~/.cache/echo`; set `ECHO_CACHE` to put it elsewhere.
 
 To score two files without the app:
 
 ```powershell
-.\.venv\Scripts\voicematch score target.wav take.wav
+.\.venv\Scripts\echo-voice score target.wav take.wav
 ```
 
 ## What the number means
@@ -126,8 +127,8 @@ it into `cache/ravdess`, then:
 ```
 
 `cohort-mean` also needs the PTDB-TUG and Hillenbrand data used in Validation
-below. These steps write `src/voicematch/speaker_mean.json` and
-`src/voicematch/calibration.json`. Only the fitted numbers are in
+below. These steps write `src/echo_voice/speaker_mean.json` and
+`src/echo_voice/calibration.json`. Only the fitted numbers are in
 git; RAVDESS itself (CC BY-NC-SA 4.0) stays in the ignored `cache/`.
 
 **Limits.** RAVDESS is acted speech: short lines from one studio. The
@@ -381,7 +382,7 @@ the score, so it only produces hints.
 ## Layout
 
 ```
-src/voicematch/
+src/echo_voice/
   analysis.py        recording -> pitch, formants, MFCCs on one 10 ms frame grid
   identity.py        speaker embeddings (model download, features, ONNX)
   scoring.py         target + take -> distances -> calibrated scores, hints, chart
@@ -394,7 +395,7 @@ src/voicematch/
   speaker_mean.json  mean speaker embedding of 137 unrelated speakers
   store.py           targets and takes on disk
   server.py          FastAPI app
-  cli.py             `voicematch serve`, `voicematch score`
+  cli.py             `echo-voice serve`, `echo-voice score`
   static/            the page: records, trims, live pitch (pitch.js), shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
 tools/validate.py    checks pitch, formants, cleaning, the word check and the whole score against reference data

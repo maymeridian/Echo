@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from calibrate import channel
 
-from voicematch import analyze, compare, identity, load
+from echo_voice import analyze, compare, identity, load
 
 DATA = Path(__file__).parent / "data" / "arctic"
 
@@ -72,8 +72,8 @@ def test_a_take_that_stops_early_asks_about_the_whole_line(clip):
 def test_cleaning_recovers_a_target_with_music_under_it(clip):
     from validate import beat
 
-    from voicematch import clean
-    from voicematch.analysis import _prepare
+    from echo_voice import clean
+    from echo_voice.analysis import _prepare
 
     speech = _prepare(load(DATA / "bdl_arctic_a0001.wav"))
     music = beat(len(speech), seed=1)

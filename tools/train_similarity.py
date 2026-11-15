@@ -1,10 +1,10 @@
-"""Train the listener-similarity model (src/voicematch/similarity.py) on VoxSim.
+"""Train the listener-similarity model (src/echo_voice/similarity.py) on VoxSim.
 
     python tools/train_similarity.py --voxsim cache/voxsim --audio cache/voxceleb1
 
 Uses VoxSim training pairs whose clips are in --audio (fetch them with
 `tools/validate.py voxsim-fetch`) and reports results on the VoxSim test split,
-which training never sees. Writes src/voicematch/similarity_model.json: the
+which training never sees. Writes src/echo_voice/similarity_model.json: the
 fitted trees as plain JSON, checked to give the same predictions as
 scikit-learn, so the app needs no pickle and no scikit-learn.
 
@@ -27,10 +27,10 @@ from scipy.stats import pearsonr, spearmanr
 sys.path.insert(0, str(Path(__file__).parent))
 from validate import voxsim_pairs  # noqa: E402
 
-from voicematch import similarity  # noqa: E402
-from voicematch.analysis import MAX_SECONDS, SR, AnalysisError, analyze, load  # noqa: E402
+from echo_voice import similarity  # noqa: E402
+from echo_voice.analysis import MAX_SECONDS, SR, AnalysisError, analyze, load  # noqa: E402
 
-OUT = Path(__file__).parents[1] / "src" / "voicematch" / "similarity_model.json"
+OUT = Path(__file__).parents[1] / "src" / "echo_voice" / "similarity_model.json"
 MONOTONIC = [1, -1, -1, -1, -1]  # see similarity.FEATURES
 
 

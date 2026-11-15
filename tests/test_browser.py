@@ -14,7 +14,7 @@ import soundfile as sf
 import uvicorn
 from synth import SR, voice
 
-from voicematch.server import create_app
+from echo_voice.server import create_app
 
 sync_api = pytest.importorskip("playwright.sync_api")
 

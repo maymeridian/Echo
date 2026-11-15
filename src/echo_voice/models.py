@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def cache_dir() -> Path:
-    return Path(os.environ.get("VOICEMATCH_CACHE") or Path.home() / ".cache" / "voicematch")
+    return Path(os.environ.get("ECHO_CACHE") or Path.home() / ".cache" / "echo")
 
 
 def fetch(name: str, url: str, sha256: str, what: str) -> Path:

@@ -6,7 +6,7 @@ import soundfile as sf
 from fastapi.testclient import TestClient
 from synth import SR, voice
 
-from voicematch.server import create_app
+from echo_voice.server import create_app
 
 
 def wav(samples) -> bytes:

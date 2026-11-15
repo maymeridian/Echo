@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from synth import voice
 
-from voicematch import AnalysisError, analyze, compare
+from echo_voice import AnalysisError, analyze, compare
 
 
 def score(take: np.ndarray, target: np.ndarray | None = None) -> dict:
@@ -69,7 +69,7 @@ def test_noisy_lead_in_and_tail_are_trimmed():
 
 
 def test_listener_model_is_monotonic_and_handles_gaps():
-    from voicematch import similarity
+    from echo_voice import similarity
 
     base = np.array([0.3, 2.0, 0.5, 0.5, 0.5])  # see similarity.FEATURES
     for i, direction in enumerate([1, -1, -1, -1, -1]):

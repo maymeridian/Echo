@@ -53,7 +53,7 @@ from pathlib import Path
 import numpy as np
 import parselmouth
 
-from voicematch.analysis import SR, load
+from echo_voice.analysis import SR, load
 
 # ---------- pitch ----------
 
@@ -331,10 +331,10 @@ def _line_job(item):
     chosen = {"fixed 5500 (current)": 5500.0}
     for label, fn in CRITERIA.items():
         chosen[label] = float(min(LINE_CEILINGS, key=lambda c: fn(st[c], runs)))
-    from voicematch.analysis import formant_tracks
+    from echo_voice.analysis import formant_tracks
 
     f0 = np.where(pitch > 0, pitch, np.nan)
-    chosen["voicematch.analysis (production)"] = formant_tracks(snd, times, f0)[1]
+    chosen["echo_voice.analysis (production)"] = formant_tracks(snd, times, f0)[1]
     out = {}
     for label, ceiling in chosen.items():
         formant = snd.to_formant_burg(time_step=0.005, max_number_of_formants=5, maximum_formant=ceiling)
@@ -423,8 +423,8 @@ def vcc_pairs(root: Path) -> list[dict]:
 
 
 def _vcc_job(group):
-    from voicematch.analysis import AnalysisError, analyze
-    from voicematch.scoring import compare
+    from echo_voice.analysis import AnalysisError, analyze
+    from echo_voice.scoring import compare
 
     target_path, pairs = group
     try:
@@ -532,7 +532,7 @@ def embed_with(model: str, y: np.ndarray) -> np.ndarray:
     import kaldi_native_fbank as knf
     import onnxruntime
 
-    from voicematch.models import cache_dir
+    from echo_voice.models import cache_dir
 
     filename, framework = SPEAKER_MODELS[model]
     if model not in _sessions:
@@ -560,7 +560,7 @@ def embed_with(model: str, y: np.ndarray) -> np.ndarray:
 
 
 def _embed_job(path: str):
-    from voicematch.analysis import AnalysisError, _prepare
+    from echo_voice.analysis import AnalysisError, _prepare
 
     try:
         y = _prepare(load(path))
@@ -739,8 +739,8 @@ def voxsim_fetch(root: Path, out: Path, train_pairs: int, workers: int) -> None:
 def _voxsim_features(path: str):
     """Word-independent features of one clip: speaker embeddings, median pitch
     and median formants (as the app measures them)."""
-    from voicematch import identity
-    from voicematch.analysis import MAX_SECONDS, AnalysisError, _prepare, analyze
+    from echo_voice import identity
+    from echo_voice.analysis import MAX_SECONDS, AnalysisError, _prepare, analyze
 
     y = load(path)[: int((MAX_SECONDS - 1) * SR)]
     try:
@@ -765,7 +765,7 @@ def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
 
     from scipy.stats import pearsonr, spearmanr
 
-    from voicematch.scoring import CALIBRATION, curve
+    from echo_voice.scoring import CALIBRATION, curve
 
     sets = {"VoxSim test": voxsim_pairs(root, "test"),
             "VoxSim train sample": random.Random(0).sample(voxsim_pairs(root, "train"), 3000)}
@@ -791,7 +791,7 @@ def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
 
     from types import SimpleNamespace
 
-    from voicematch import similarity
+    from echo_voice import similarity
 
     def measures(fa, fb):
         def ns(f):
@@ -856,8 +856,8 @@ def _transcribe_job(item):
 
     from calibrate import channel
 
-    from voicematch.analysis import AnalysisError, _prepare
-    from voicematch.line import transcribe
+    from echo_voice.analysis import AnalysisError, _prepare
+    from echo_voice.line import transcribe
 
     path, cut = item
     y = load(path)
@@ -879,7 +879,7 @@ def validate_line(ravdess: Path, workers: int) -> None:
     import json
     import random
 
-    from voicematch.line import compare_words
+    from echo_voice.line import compare_words
 
     files = sorted(str(f) for f in ravdess.glob("Actor_*/03-01-*.wav"))
     rng = random.Random(0)
@@ -943,7 +943,7 @@ _denoisers: dict = {}
 def _denoise(kind: str, y: np.ndarray) -> np.ndarray:
     import sherpa_onnx as so
 
-    from voicematch.models import cache_dir
+    from echo_voice.models import cache_dir
 
     if kind not in _denoisers:
         filename, family = DENOISERS[kind]
@@ -992,10 +992,10 @@ def _clean_speech(cache: Path) -> list[str]:
 def _cleaning_job(item):
     import librosa
 
-    from voicematch import clean
-    from voicematch.analysis import AnalysisError, _prepare, analyze
-    from voicematch.scoring import compare
-    from voicematch.similarity import rating
+    from echo_voice import clean
+    from echo_voice.analysis import AnalysisError, _prepare, analyze
+    from echo_voice.scoring import compare
+    from echo_voice.similarity import rating
 
     path, music_path, snr, seed = item
     speech = _prepare(load(path))

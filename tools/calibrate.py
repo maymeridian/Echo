@@ -42,10 +42,10 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import butter, fftconvolve, sosfilt
 
-from voicematch.analysis import SR, AnalysisError, analyze, load
-from voicematch.scoring import component_scores, measure, overall, weighted
+from echo_voice.analysis import SR, AnalysisError, analyze, load
+from echo_voice.scoring import component_scores, measure, overall, weighted
 
-CALIBRATION = Path(__file__).parents[1] / "src" / "voicematch" / "calibration.json"
+CALIBRATION = Path(__file__).parents[1] / "src" / "echo_voice" / "calibration.json"
 
 
 def low_priority() -> None:
@@ -188,8 +188,8 @@ def cohort_files(cache: Path) -> dict[str, list[str]]:
 
 
 def _raw_embedding(path: str):
-    from voicematch import identity
-    from voicematch.analysis import _prepare
+    from echo_voice import identity
+    from echo_voice.analysis import _prepare
 
     try:
         return path, identity.raw_embed(_prepare(load(path)))
@@ -199,8 +199,8 @@ def _raw_embedding(path: str):
 
 def cohort_mean(cache: Path, workers: int) -> None:
     """Mean of the speakers' average embeddings, so no one speaker (or corpus
-    with many takes) dominates. Writes src/voicematch/speaker_mean.json."""
-    from voicematch import identity
+    with many takes) dominates. Writes src/echo_voice/speaker_mean.json."""
+    from echo_voice import identity
 
     cohort = cohort_files(cache)
     files = sorted({f for fs in cohort.values() for f in fs})

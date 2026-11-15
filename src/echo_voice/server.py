@@ -21,9 +21,9 @@ STATIC = Path(__file__).parent / "static"
 
 
 def create_app(data_dir: str | Path | None = None) -> FastAPI:
-    store = Store(Path(data_dir or os.environ.get("VOICEMATCH_DATA", "data")))
+    store = Store(Path(data_dir or os.environ.get("ECHO_DATA", "data")))
     targets: dict[str, Voice] = {}  # analysed targets, so each take only analyses itself
-    app = FastAPI(title="Voice Match")
+    app = FastAPI(title="Echo")
 
     @app.exception_handler(NotFound)
     async def not_found(_: Request, __: NotFound) -> JSONResponse:

@@ -8,7 +8,7 @@
 
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { yin } from "../src/voicematch/static/pitch.js";
+import { yin } from "../src/echo_voice/static/pitch.js";
 
 function readWav(path) {
   const buf = readFileSync(path);
