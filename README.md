@@ -373,6 +373,21 @@ the score, so it only produces hints.
   0.59). The simulated mic alone moves CPPS by 1 dB, about twice the typical
   difference between a retake and a stranger. As a part of the score they would
   mostly measure your microphone.
+- **Speaking-style and voice-quality gaps as Voice inputs.** Six gaps were
+  tried as extra inputs to the listener model: pitch range, speaking rate,
+  voiced share, spectral envelope (mean MFCCs over voiced frames), CPPS and HNR.
+  Each was tuned on the held-out training speakers. Only the spectral envelope
+  helped there (+0.022). The four that helped at all, taken together, did better
+  on VoxSim's test split overall, but not for strangers:
+
+  | Test split, Spearman | All pairs | Strangers | Same speaker |
+  | --- | --- | --- | --- |
+  | Five inputs (used) | 0.772 | 0.624 | 0.489 |
+  | With pitch range, spectral envelope, CPPS, HNR | 0.802 | 0.619 | 0.573 |
+
+  An impression is always a stranger, so they weren't adopted. The envelope
+  also carries the microphone and room, so the gain on same-speaker pairs may
+  come from matching recordings, not voices.
 - **Melody and rhythm can't be checked against VCC2018.** Voice conversion
   keeps the source speaker's timing and intonation, so in that data these parts
   track the source, not the voice people hear. The evidence for them comes from
@@ -423,10 +438,8 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
    out much lower than 90, the simulated mic was too kind, and the curves need
    anchoring on real recordings.
 2. **Give Voice more to go on.** The listener model has hit the ceiling of
-   its five inputs: eight times more training data changed nothing. Two routes
-   could go further:
-   - **Speaking-style features:** pitch range and speaking rate, so the model
-     sees more than timbre and pitch level.
-   - **Fine-tune the speaker network on the ratings:** as Ahn et al. (2024)
-     did, or train it with a prototypical loss (Chen et al. 2026). Either needs
-     a GPU.
+   its five inputs: eight times more training data changed nothing, and
+   speaking-style and voice-quality gaps didn't help with strangers (see "Tried
+   and not used"). The remaining route is to fine-tune the speaker network on
+   the ratings, as Ahn et al. (2024) did, or train it with a prototypical loss
+   (Chen et al. 2026). Either needs a GPU.
