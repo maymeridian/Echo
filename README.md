@@ -39,6 +39,13 @@ The page also shows **"Passes a speaker check"** when a speaker-verification
 model would accept the take as the same person. That threshold lets 1% of
 same-sex strangers through and accepts 88% of the real person's own takes.
 
+**The words.** Each target is transcribed once, with Whisper base.en on the
+CPU, and the page shows its line. Each take is transcribed and compared word
+by word. When the take skipped, swapped or added words, the first hint says
+which, for example "You left out “Steels, etc”". The word check doesn't change
+the score. It's advice only, because the recogniser sometimes mishears a
+correct take (see Validation).
+
 ## How it works
 
 The take is time-aligned to the target (dynamic time warping over MFCCs), so
@@ -275,6 +282,25 @@ Median errors are 1–2% throughout. The chosen ceilings come out where
 phonetics puts them without being told: 5000 Hz for men, 5750 for women and
 6000 for children.
 
+### The word check
+
+The word check was tested on RAVDESS, where every actor says the same two
+sentences. The target was clean and the take went through the simulated mic.
+The target's words also came from the recogniser, as they do in the app.
+
+| Case | Flagged |
+| --- | --- |
+| Same sentence, other actor or emotion (false alarms) | 7.1% |
+| The other sentence ("Dogs are sitting" for "Kids are talking") | 100% |
+| Take cut to its first 60% | 90% |
+| Take cut to its last 60% | 96% |
+
+Through the mic, the recogniser gets 96.8% of words right. One misheard word
+in a correct take is common ("Docs" for "Dogs"), so a take is flagged only
+when at least 2 words, or 15% of the line, are off. Flagging on any single
+word gave 20% false alarms. Even 7% is too many to let the word check lower
+the score, so it only produces hints.
+
 ### Tried and not used
 
 - **Larger or different speaker models.** On the VCC2018 judgments, the
@@ -308,6 +334,7 @@ src/voicematch/
   analysis.py        recording -> pitch, formants, MFCCs on one 10 ms frame grid
   identity.py        speaker embeddings (model download, features, ONNX)
   scoring.py         target + take -> distances -> calibrated scores, hints, chart
+  line.py            speech recognition and the word-by-word comparison
   similarity.py      the listener-similarity model behind Voice
   similarity_model.json  its trees, from tools/train_similarity.py
   calibration.json   curves and weights from tools/calibrate.py
@@ -317,7 +344,7 @@ src/voicematch/
   cli.py             `voicematch serve`, `voicematch score`
   static/            the page: records, converts to 16 kHz WAV, shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
-tools/validate.py    checks pitch, formants and the whole score against reference data
+tools/validate.py    checks pitch, formants, the word check and the whole score against reference data
 tools/train_similarity.py  trains similarity_model.json on VoxSim ratings
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
@@ -329,11 +356,9 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
 
 ## Next
 
-1. **Check the line with speech recognition.** Transcribe the target once and
-   each take, then compare the words. This would show the line to say, point
-   out skipped or added words, and stop the line-match parts from scoring a
-   different sentence. Sound-based alignment can't do this: it was tried, and
-   flagged words as missing for 65% of strangers who said the whole line.
+1. **Let the line be corrected on the page.** Some false alarms come from the
+   recogniser mishearing the *target*, for example "Get there talking" for
+   "Kids are talking". Editing the line on the page would remove those.
 2. **Clip cleaning.** Strip music and background noise from target clips
    before analysis, using vocal separation and a denoiser, and let a clip be
    trimmed in the page. Check any off-the-shelf pipeline against its reference

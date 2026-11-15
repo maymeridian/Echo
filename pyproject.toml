@@ -16,6 +16,7 @@ dependencies = [
     "uvicorn",
     "onnxruntime>=1.17",
     "kaldi-native-fbank>=1.20",
+    "faster-whisper>=1.0",
 ]
 
 [project.optional-dependencies]

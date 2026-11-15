@@ -223,6 +223,8 @@ async function select(target) {
   if (!target) return;
   $("#target-name").textContent = target.name;
   $("#target-audio").src = `/api/targets/${target.id}/audio`;
+  $("#target-line").hidden = !target.words?.length;
+  $("#target-line").textContent = target.words?.length ? `“${target.words.join(" ")}”` : "";
   try {
     takes = await api(`/api/targets/${target.id}/takes`);
     if (takes.length) shown = await api(`/api/targets/${target.id}/takes/${takes.at(-1).id}`);

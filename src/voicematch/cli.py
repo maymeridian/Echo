@@ -33,8 +33,11 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run(create_app(args.data), host=args.host, port=args.port)
         return 0
 
+    from . import line
+
     try:
-        result = compare(analyze(load(args.target)), analyze(load(args.take)))
+        target, take = analyze(load(args.target)), analyze(load(args.take))
+        result = compare(target, take, line.transcribe(target.y), line.transcribe(take.y))
     except AnalysisError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -44,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Match: {result['overall']:.0f} / 100  (the real person on another mic ~90, a stranger ~20)")
     if result["accepted"]:
         print("Passes a speaker check: a voice-verification model would take this for the same person.")
+    if result["line"]:
+        print(f"Line: {result['line']['target']}\nSaid: {result['line']['take']}")
     for c in result["components"]:
         score_text = "  –" if c["score"] is None else f"{c['score']:3.0f}"
         print(f"  {c['label']:<13}{score_text}  {c['detail']}")

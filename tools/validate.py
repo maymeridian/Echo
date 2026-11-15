@@ -27,6 +27,11 @@
         only the needed clips out of the VoxCeleb1 zips on the Hugging Face
         mirror (ProgramComputer/voxceleb; accept its terms and log in first).
 
+    python tools/validate.py line --ravdess cache/ravdess
+        The word check (line.py) on RAVDESS, where every actor says the same two
+        sentences: how often it flags a take that did say the line (false
+        alarms), and how often it catches the other sentence or a take cut short.
+
 Each prints the current method next to the alternatives that were considered.
 """
 
@@ -780,6 +785,99 @@ def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
             print(f"{name:42s}" + "".join(f"{c:>18s}" for c in cells))
 
 
+# ---------- the word check (line.py) ----------
+
+
+def _low_priority():
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+
+
+def _transcribe_job(item):
+    import zlib
+
+    from calibrate import channel
+
+    from voicematch.analysis import AnalysisError, _prepare
+    from voicematch.line import transcribe
+
+    path, cut = item
+    y = load(path)
+    out = {}
+    try:
+        out["clean"] = transcribe(_prepare(y))
+        mic = channel(y, zlib.crc32(Path(path).stem.encode()))
+        out["mic"] = transcribe(_prepare(mic))
+        if cut:
+            prepared = _prepare(mic)
+            out["first60"] = transcribe(prepared[: int(len(prepared) * 0.6)])
+            out["last60"] = transcribe(prepared[int(len(prepared) * 0.4):])
+    except AnalysisError:
+        return path, None
+    return path, out
+
+
+def validate_line(ravdess: Path, workers: int) -> None:
+    import json
+    import random
+
+    from voicematch.line import compare_words
+
+    files = sorted(str(f) for f in ravdess.glob("Actor_*/03-01-*.wav"))
+    rng = random.Random(0)
+    cut = set(rng.sample(files, 300))
+    cache = ravdess.parent / "ravdess_transcripts.json"
+    words = json.loads(cache.read_text("utf-8")) if cache.exists() else {}
+    todo = [(f, f in cut) for f in files if f not in words]
+    if todo:
+        print(f"transcribing {len(todo)} files...", file=sys.stderr)
+        with ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
+            for i, (path, out) in enumerate(pool.map(_transcribe_job, todo, chunksize=8), 1):
+                words[path] = out
+                if i % 200 == 0:
+                    cache.write_text(json.dumps(words), "utf-8")
+                    print(f"  {i}/{len(todo)}", file=sys.stderr)
+        cache.write_text(json.dumps(words), "utf-8")
+
+    truth = {"01": "kids are talking by the door", "02": "dogs are sitting by the door"}
+    meta = {f: Path(f).stem.split("-") for f in files if words.get(f)}
+    # How well the recogniser hears the sentences at all.
+    for kind in ("clean", "mic"):
+        rates = [compare_words(truth[meta[f][4]].split(), words[f][kind]).match_rate for f in meta]
+        print(f"recognised words, {kind:5s}: {np.mean(rates):.1%} of the sentence on average, "
+              f"{np.mean(np.array(rates) == 1):.1%} of files word-perfect")
+
+    by_statement = defaultdict(list)
+    for f, m in meta.items():
+        by_statement[m[4]].append(f)
+    same, other = [], []
+    for _ in range(3000):
+        st = rng.choice(["01", "02"])
+        a, b = rng.sample(by_statement[st], 2)
+        same.append(compare_words(words[a]["clean"], words[b]["mic"]))
+        c = rng.choice(by_statement["02" if st == "01" else "01"])
+        other.append(compare_words(words[a]["clean"], words[c]["mic"]))
+    first = [compare_words(words[f]["clean"], words[f]["first60"]) for f in cut if words.get(f)]
+    last = [compare_words(words[f]["clean"], words[f]["last60"]) for f in cut if words.get(f)]
+
+    def flagged(checks):
+        return np.mean([c.flagged for c in checks])
+
+    print("\nTarget clean, take through the simulated mic; target words come from the recogniser too.")
+    print(f"same sentence, other actor/emotion: flagged {flagged(same):.1%} (false alarms); "
+          f"median match {np.median([c.match_rate for c in same]):.2f}")
+    print(f"the other sentence:                 flagged {flagged(other):.1%}; "
+          f"median match {np.median([c.match_rate for c in other]):.2f}")
+    print(f"take cut to its first 60%:          flagged {flagged(first):.1%}")
+    print(f"take cut to its last 60%:           flagged {flagged(last):.1%}")
+    fa = [c for c in same if c.flagged]
+    print("\nexamples of false alarms (line / said):")
+    for c in fa[:6]:
+        print("   ", " ".join(c.target), "/", " ".join(c.take))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -798,10 +896,12 @@ def main() -> None:
     vf.add_argument("--voxsim", type=Path, required=True)
     vf.add_argument("--out", type=Path, required=True)
     vf.add_argument("--train-pairs", type=int, default=0, help="also fetch this many random training pairs")
+    li = sub.add_parser("line")
+    li.add_argument("--ravdess", type=Path, required=True)
     ve = sub.add_parser("voxsim")
     ve.add_argument("--voxsim", type=Path, required=True)
     ve.add_argument("--audio", type=Path, required=True)
-    for s in (p, f, fl, v, vf, ve):
+    for s in (p, f, fl, v, vf, ve, li):
         s.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
     if args.command == "pitch":
@@ -810,6 +910,8 @@ def main() -> None:
         validate_formants(args.h95, args.workers)
     elif args.command == "formant-lines":
         validate_formant_lines(args.h95, args.workers)
+    elif args.command == "line":
+        validate_line(args.ravdess, args.workers)
     elif args.command == "voxsim":
         voxsim_eval(args.voxsim, args.audio, args.workers)
     elif args.command == "voxsim-fetch":

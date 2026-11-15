@@ -52,17 +52,26 @@ class Store:
         metas = [json.loads(p.read_text("utf-8")) for p in self.root.glob("*/meta.json")]
         return sorted(metas, key=lambda m: m["created"])
 
-    def add_target(self, name: str, voice: Voice) -> dict:
+    def add_target(self, name: str, voice: Voice, words: list[str] | None = None) -> dict:
         meta = {
             "id": secrets.token_hex(6),
             "name": name,
             "created": _now(),
             "duration": round(voice.duration, 2),
+            "words": words,
         }
         path = self.root / meta["id"]
         (path / "takes").mkdir(parents=True)
         sf.write(path / "target.wav", voice.y, SR, subtype="PCM_16")
         (path / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        return meta
+
+    def target_meta(self, target_id: str) -> dict:
+        return json.loads((self._target_dir(target_id) / "meta.json").read_text("utf-8"))
+
+    def update_target(self, target_id: str, **fields) -> dict:
+        meta = self.target_meta(target_id) | fields
+        (self._target_dir(target_id) / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
         return meta
 
     def delete_target(self, target_id: str) -> None:

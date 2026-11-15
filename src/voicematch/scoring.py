@@ -20,7 +20,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 
-from . import identity, similarity
+from . import identity, line, similarity
 from .analysis import MIN_VOICED_FRAMES, Voice
 
 CALIBRATION = json.loads((Path(__file__).parent / "calibration.json").read_text("utf-8"))
@@ -141,8 +141,14 @@ class Component:
     hint: str | None = None
 
 
-def compare(target: Voice, take: Voice) -> dict:
+def compare(
+    target: Voice, take: Voice, target_words: list[str] | None = None, take_words: list[str] | None = None
+) -> dict:
+    """Score a take. With both transcripts, also check the take said the line."""
     m = measure(target, take)
+    check = None
+    if target_words and len(target_words) >= 2 and take_words is not None:
+        check = line.compare_words(target_words, take_words)
     scores = component_scores(m.distances())
     components = [
         _identity(m, scores["identity"]),
@@ -150,7 +156,7 @@ def compare(target: Voice, take: Voice) -> dict:
         _melody(m, scores["melody"]),
         _resonance(m, scores["resonance"]),
         _articulation(m, scores["articulation"]),
-        _rhythm(m, scores["rhythm"]),
+        _rhythm(m, scores["rhythm"], None if check is None else not check.flagged),
     ]
     scored = [c for c in components if c.score is not None]
     weakest = sorted((c for c in scored if c.hint and c.score < 80), key=lambda c: c.score)
@@ -168,9 +174,33 @@ def compare(target: Voice, take: Voice) -> dict:
             }
             for c in components
         ],
-        "hints": [c.hint for c in weakest[:3]],
+        "hints": (_line_hints(check) + [c.hint for c in weakest])[:3],
+        "line": None if check is None else {
+            "target": " ".join(check.target),
+            "take": " ".join(check.take),
+            "match": round(check.match_rate, 2),
+            "flagged": check.flagged,
+        },
         "contour": _contour(target, take, m.ti, m.ki),
     }
+
+
+def _phrase(words: str) -> str:
+    return words.strip(".,!?;:\"'“”‘’…-– ")
+
+
+def _line_hints(check: line.LineCheck | None) -> list[str]:
+    """Word problems come first: the line-matching parts mean little until the
+    take says the target's words."""
+    if check is None or not check.flagged:
+        return []
+    if check.match_rate < 0.5:
+        return [f"That doesn't sound like the target's line. It says “{_phrase(' '.join(check.target))}”; "
+                f"you said “{_phrase(' '.join(check.take)) or '…'}”."]
+    hints = [f"You said “{_phrase(said)}” where the line has “{_phrase(has)}”." for has, said in check.swaps()]
+    hints += [f"You left out “{_phrase(w)}”." for w in check.runs("miss")]
+    hints += [f"You added “{_phrase(w)}”." for w in check.runs("extra")]
+    return hints[:2]
 
 
 def _unmeasured(key: str, label: str) -> Component:
@@ -274,18 +304,25 @@ def _articulation(m: Measures, score: float) -> Component:
     )
 
 
-def _rhythm(m: Measures, score: float) -> Component:
+def _rhythm(m: Measures, score: float, words_complete: bool | None = None) -> Component:
+    """`words_complete`: the word check found every word (True), found words
+    missing or added (False), or didn't run (None)."""
     ratio = 2**m.tempo
     percent = abs(ratio - 1) * 100
-    # Timing can't tell a rushed line from a skipped word (that needs speech
-    # recognition), so a big difference asks rather than assumes.
-    if ratio > 1.35:
+    big = ratio > 1.35 or ratio < 0.75
+    if big and words_complete is False:
+        # The word hints already explain the length; don't guess at a second cause.
+        way = "longer" if ratio > 1 else "shorter"
+        return Component("rhythm", "Rhythm", score, f"{percent:.0f}% {way} than the target")
+    # Without the word check, timing can't tell a rushed line from a skipped
+    # word, so a big difference asks rather than assumes.
+    if big and words_complete is None and ratio > 1.35:
         detail = f"{percent:.0f}% longer than the target"
         hint = (
             f"Your take ran {percent:.0f}% longer than the target. Did you add or repeat "
             "anything? If it's the same line, speed up."
         )
-    elif ratio < 0.75:
+    elif big and words_complete is None:
         detail = f"{percent:.0f}% shorter than the target"
         hint = (
             f"Your take was {percent:.0f}% shorter than the target. Did you say the whole "

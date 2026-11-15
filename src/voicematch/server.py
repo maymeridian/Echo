@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
+from . import line
 from .analysis import SR, AnalysisError, Voice, analyze, decode, load
 from .scoring import compare
 from .store import NotFound, Store
@@ -47,10 +48,18 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     def list_targets() -> list[dict]:
         return store.list_targets()
 
+    def target_words(target_id: str, voice: Voice) -> list[str]:
+        """The target's words, transcribed once and kept with the clip."""
+        meta = store.target_meta(target_id)
+        if meta.get("words") is None:
+            meta = store.update_target(target_id, words=line.transcribe(voice.y))
+        return meta["words"]
+
     @app.post("/api/targets", status_code=201)
     async def add_target(request: Request, name: str = "") -> dict:
         voice = await uploaded_voice(request)
-        meta = store.add_target(name.strip()[:80] or "Untitled", voice)
+        words = await run_in_threadpool(line.transcribe, voice.y)
+        meta = store.add_target(name.strip()[:80] or "Untitled", voice, words)
         targets[meta["id"]] = voice
         return meta
 
@@ -72,7 +81,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     async def add_take(target_id: str, request: Request) -> dict:
         target = await run_in_threadpool(target_voice, target_id)
         take = await uploaded_voice(request)
-        result = await run_in_threadpool(compare, target, take)
+        said = await run_in_threadpool(target_words, target_id, target)
+        words = await run_in_threadpool(line.transcribe, take.y)
+        result = await run_in_threadpool(compare, target, take, said, words)
         return store.add_take(target_id, take, result)
 
     @app.get("/api/targets/{target_id}/takes/{take_id}")

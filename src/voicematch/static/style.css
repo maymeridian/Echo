@@ -100,6 +100,8 @@ input[type="text"] {
 
 .practice-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .player { display: flex; align-items: center; gap: 12px; }
+.target-line { margin: -8px 0 14px; font-size: 17px; }
+.target-line::before { content: "Line: "; color: var(--muted); font-size: 13px; }
 .player span { width: 52px; font-size: 13px; color: var(--muted); }
 
 .recorder { display: flex; align-items: center; gap: 16px; margin: 24px 0; }
