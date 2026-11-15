@@ -18,6 +18,15 @@
         4 (same, sure). Download: https://doi.org/10.7488/ds/2337 and
         https://doi.org/10.7488/ds/2496 (CC BY 4.0).
 
+    python tools/validate.py voxsim-fetch --voxsim cache/voxsim --out cache/voxceleb1
+    python tools/validate.py voxsim --voxsim cache/voxsim --audio cache/voxceleb1
+        The speaker-identity measures against VoxSim (Ahn et al., Interspeech
+        2024, arXiv:2407.18505): human 1-6 similarity ratings of VoxCeleb1
+        clip pairs, different sentences, recorded in the wild. Ratings from
+        https://mm.kaist.ac.kr/projects/voxsim/ (CC BY 4.0). voxsim-fetch pulls
+        only the needed clips out of the VoxCeleb1 zips on the Hugging Face
+        mirror (ProgramComputer/voxceleb; accept its terms and log in first).
+
 Each prints the current method next to the alternatives that were considered.
 """
 
@@ -600,6 +609,168 @@ def vcc_models(root: Path, scored: Path, workers: int) -> None:
     report_vcc(scored, extra)
 
 
+# ---------- VoxSim (human ratings of in-the-wild pairs) ----------
+
+VOX_ZIPS = {
+    "dev": "datasets/ProgramComputer/voxceleb/vox1/vox1_dev_wav.zip",
+    "test": "datasets/ProgramComputer/voxceleb/vox1/vox1_test_wav.zip",
+}
+
+
+def voxsim_pairs(root: Path, split: str) -> list[dict]:
+    import csv
+
+    name = "voxsim_test_list.txt" if split == "test" else "voxsim_train_list_average.txt"
+    with open(root / name, encoding="utf-8") as f:
+        return [{"a": r[0], "b": r[1], "same": r[2] == "1", "rating": float(r[4])} for r in csv.reader(f)]
+
+
+def _fetch_member(fs, zpath: str, info, out: Path) -> bool:
+    import struct
+    import zlib
+
+    head = fs.cat_file(zpath, start=info.header_offset, end=info.header_offset + 30)
+    name_len, extra_len = struct.unpack("<HH", head[26:30])
+    start = info.header_offset + 30 + name_len + extra_len
+    data = fs.cat_file(zpath, start=start, end=start + info.compress_size)
+    if info.compress_type == 8:
+        data = zlib.decompress(data, -15)
+    elif info.compress_type != 0:
+        raise ValueError(f"unsupported compression {info.compress_type}")
+    if zlib.crc32(data) & 0xFFFFFFFF != info.CRC:
+        return False
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    return True
+
+
+def voxsim_fetch(root: Path, out: Path, train_pairs: int, workers: int) -> None:
+    import random
+    import zipfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    from huggingface_hub import HfFileSystem
+
+    pairs = voxsim_pairs(root, "test")
+    if train_pairs:
+        pairs += random.Random(0).sample(voxsim_pairs(root, "train"), train_pairs)
+    need = {c for p in pairs for c in (p["a"], p["b"])}
+    todo = {c for c in need if not (out / c).exists()}
+    print(f"{len(need)} clips needed, {len(todo)} to fetch", file=sys.stderr)
+    fs = HfFileSystem()
+    for split, zpath in VOX_ZIPS.items():
+        with fs.open(zpath, "rb", block_size=16 * 2**20) as f:
+            index = {i.filename.split("wav/", 1)[-1]: i for i in zipfile.ZipFile(f).infolist()}
+        jobs = [(c, index[c]) for c in sorted(todo) if c in index]
+        print(f"{split}: {len(index)} files in the zip, fetching {len(jobs)}", file=sys.stderr)
+        bad = 0
+        with ThreadPoolExecutor(workers) as pool:
+            futures = [pool.submit(_fetch_member, fs, zpath, info, out / c) for c, info in jobs]
+            for i, fut in enumerate(futures, 1):
+                bad += not fut.result()
+                if i % 1000 == 0:
+                    print(f"  {i}/{len(jobs)}", file=sys.stderr)
+        print(f"{split}: {len(jobs) - bad} written, {bad} failed the CRC check", file=sys.stderr)
+    missing = [c for c in need if not (out / c).exists()]
+    print(f"done; {len(missing)} clips still missing", file=sys.stderr)
+
+
+def _voxsim_features(path: str):
+    """Word-independent features of one clip: speaker embeddings, median pitch
+    and median formants (as the app measures them)."""
+    from voicematch import identity
+    from voicematch.analysis import MAX_SECONDS, AnalysisError, _prepare, analyze
+
+    y = load(path)[: int((MAX_SECONDS - 1) * SR)]
+    try:
+        v = analyze(y)
+    except AnalysisError:
+        return path, None
+    yp = _prepare(y)
+    formants = np.nanmedian(v.formants[:, v.voiced], axis=1) if v.voiced.sum() >= 20 else np.full(3, np.nan)
+    return path, {
+        "emb": v.embedding,
+        "raw": identity.raw_embed(yp),
+        "cam": embed_with("wespeaker CAM++-LM", yp),
+        "eres": embed_with("3d-speaker ERes2Net", yp),
+        "f0": v.median_f0,
+        "formants": formants,
+    }
+
+
+def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
+    import pickle
+    import random
+
+    from scipy.stats import pearsonr, spearmanr
+
+    from voicematch.scoring import CALIBRATION, curve
+
+    sets = {"VoxSim test": voxsim_pairs(root, "test"),
+            "VoxSim train sample": random.Random(0).sample(voxsim_pairs(root, "train"), 3000)}
+    clips = sorted({c for ps in sets.values() for p in ps for c in (p["a"], p["b"]) if (audio / c).exists()})
+    cache = audio / "features.pkl"
+    feats = pickle.loads(cache.read_bytes()) if cache.exists() else {}
+    todo = [str(audio / c) for c in clips if str(audio / c) not in feats]
+    if todo:
+        print(f"analysing {len(todo)} clips...", file=sys.stderr)
+        with ProcessPoolExecutor(workers) as pool:
+            for i, (path, f) in enumerate(pool.map(_voxsim_features, todo, chunksize=8), 1):
+                feats[path] = f
+                if i % 2000 == 0:
+                    print(f"  {i}/{len(todo)}", file=sys.stderr)
+                    cache.write_bytes(pickle.dumps(feats))
+        cache.write_bytes(pickle.dumps(feats))
+
+    def cosine(a, b):
+        return float(a @ b / np.linalg.norm(a) / np.linalg.norm(b))
+
+    curves = CALIBRATION["curves"]
+    w = CALIBRATION["weights"]
+
+    def measures(fa, fb):
+        out = {
+            "Voice (current)": cosine(fa["emb"], fb["emb"]),
+            "  without mean subtraction": cosine(fa["raw"], fb["raw"]),
+            "  average of 3 models": (cosine(fa["emb"], fb["emb"]) + cosine(fa["cam"], fb["cam"])
+                                      + cosine(fa["eres"], fb["eres"])) / 3,
+        }
+        pitch = None
+        if fa["f0"] and fb["f0"]:
+            pitch = abs(12 * np.log2(fa["f0"] / fb["f0"]))
+            out["Pitch (median, semitones apart)"] = -pitch
+        res = None
+        if np.all(np.isfinite(fa["formants"])) and np.all(np.isfinite(fb["formants"])):
+            res = float(np.mean(np.abs(12 * np.log2(fa["formants"] / fb["formants"]))))
+            out["Resonance (median formants apart)"] = -res
+        parts = {"identity": curve(1 - out["Voice (current)"], **curves["identity"])}
+        if pitch is not None:
+            parts["pitch"] = curve(pitch, **curves["pitch"])
+        if res is not None:
+            parts["resonance"] = curve(res, **curves["resonance"])
+        out["Voice + pitch + resonance (app weights)"] = (
+            sum(w[k] * v for k, v in parts.items()) / sum(w[k] for k in parts))
+        return out
+
+    for label, pairs in sets.items():
+        rows = []
+        for p in pairs:
+            fa, fb = feats.get(str(audio / p["a"])), feats.get(str(audio / p["b"]))
+            if fa and fb:
+                rows.append((p, measures(fa, fb)))
+        print(f"\n{label}: {len(rows)} pairs ({sum(p['same'] for p, _ in rows)} same speaker), "
+              "human ratings 1-6. Pearson / Spearman.")
+        print(f"{'measure':42s}{'all pairs':>17s}{'different speakers':>20s}{'same speaker':>17s}")
+        names = list(dict.fromkeys(k for _, m in rows for k in m))
+        for name in names:
+            cells = []
+            for sel in (lambda p: True, lambda p: not p["same"], lambda p: p["same"]):
+                xs = [(m[name], p["rating"]) for p, m in rows if sel(p) and name in m]
+                x, y = np.array(xs).T
+                cells.append(f"{pearsonr(x, y)[0]:6.3f} / {spearmanr(x, y)[0]:6.3f}")
+            print(f"{name:42s}" + "".join(f"{c:>18s}" for c in cells))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -614,7 +785,14 @@ def main() -> None:
     v.add_argument("--out", type=Path, required=True)
     v.add_argument("--report-only", action="store_true")
     v.add_argument("--models", action="store_true", help="compare speaker models and projections")
-    for s in (p, f, fl, v):
+    vf = sub.add_parser("voxsim-fetch")
+    vf.add_argument("--voxsim", type=Path, required=True)
+    vf.add_argument("--out", type=Path, required=True)
+    vf.add_argument("--train-pairs", type=int, default=0, help="also fetch this many random training pairs")
+    ve = sub.add_parser("voxsim")
+    ve.add_argument("--voxsim", type=Path, required=True)
+    ve.add_argument("--audio", type=Path, required=True)
+    for s in (p, f, fl, v, vf, ve):
         s.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
     if args.command == "pitch":
@@ -623,6 +801,10 @@ def main() -> None:
         validate_formants(args.h95, args.workers)
     elif args.command == "formant-lines":
         validate_formant_lines(args.h95, args.workers)
+    elif args.command == "voxsim":
+        voxsim_eval(args.voxsim, args.audio, args.workers)
+    elif args.command == "voxsim-fetch":
+        voxsim_fetch(args.voxsim, args.out, args.train_pairs, args.workers)
     elif args.models:
         vcc_models(args.vcc, args.out, args.workers)
     elif args.report_only:

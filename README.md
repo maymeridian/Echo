@@ -169,6 +169,41 @@ would raise the rank correlation on conversions against their target from
 0.38 to 0.40. Most of that gain comes from dropping melody and rhythm, for the
 reason given under "Tried and not used". The weights stay as calibrated.
 
+**Real-world clips: VoxSim.** VoxSim (Ahn et al., Interspeech 2024) has
+human ratings, from 1 (definitely different) to 6 (definitely the same), of
+pairs of VoxCeleb1 clips: celebrities in interviews and talk shows, saying
+different sentences. These pairs can't test the parts that need the same
+words, but they test Voice, Pitch and Resonance on recordings like the clips
+you'd use. Resonance here uses median formants instead of aligned ones.
+
+The table shows Spearman rank correlation with the ratings on VoxSim's test
+split, 2,775 pairs:
+
+| Measure | All pairs | Different speakers only |
+| --- | --- | --- |
+| Voice | 0.74 | 0.15 |
+| Pitch | 0.48 | 0.46 |
+| Resonance | 0.47 | 0.49 |
+| **Voice + Pitch + Resonance, app weights** | **0.72** | **0.54** |
+
+- **Voice tells people apart.** It matches the VoxSim paper's pretrained ECAPA
+  baseline: Pearson 0.761 here against 0.768 there.
+- **Voice barely ranks strangers.** It does little to order strangers by how
+  close they sound, which is exactly what an impression is. Chen et al.
+  (2026) found the same for speaker models trained this way.
+- **Pitch and resonance rank strangers.** They do it three times better, and
+  together with Voice they reach 0.54. A random sample of 3,000 VoxSim
+  training pairs gives the same picture: 0.57 for strangers.
+- **The weights hold up.** Weights fitted on those training pairs gain at
+  most 0.02 on the test split, and only by giving up accuracy elsewhere.
+  Fitted for strangers, they score 0.56 there but drop to 0.59 on all pairs.
+  The app's calibrated weights are near both optima at once.
+
+`tools/validate.py voxsim-fetch` downloads only the 10,953 clips these pairs
+need, about 2.8 GB, from the VoxCeleb1 zips on the Hugging Face mirror. Each
+clip is checked against the zip's CRC. You need a Hugging Face login that has
+accepted the mirror's terms.
+
 ### Pitch
 
 The pitch tracker was checked against [PTDB-TUG](http://www2.spsc.tugraz.at/databases/PTDB-TUG/)
@@ -266,10 +301,10 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
    before trusting it: sherpa-onnx's speaker pipeline wasn't right.
 3. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
-4. **Check against VoxSim.** VoxSim has 69k human similarity ratings on
-   real-world VoxCeleb clips (Ahn et al., Interspeech 2024,
-   [arXiv:2407.18505](https://arxiv.org/abs/2407.18505)). Its ratings are
-   open (CC BY 4.0) and are in `cache/voxsim`. The VoxCeleb1 audio needs a
-   download key from https://mm.kaist.ac.kr/datasets/voxceleb/, which asks for
-   your name and email.
+4. **A speaker model that ranks strangers.** On VoxSim the current model
+   barely orders strangers by how close they sound (0.15). Chen et al. (2026)
+   got 0.4–0.5 from prototypical-loss training and up to 0.74 with a
+   low-dimensional bottleneck. Fine-tuning on VoxSim's ratings, as Ahn et al.
+   (2024) do, is the other route. Either would make Voice useful for
+   impressions, not just for identity.
 5. **Live feedback.** Show pitch against the target while recording.
