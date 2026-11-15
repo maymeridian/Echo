@@ -167,7 +167,7 @@ async function submitTake(blob) {
 
 async function createTarget(blob) {
   const name = $("#new-name").value.trim();
-  setStatus("Adding clip…");
+  setStatus("Adding clip: separating the voice from any music, which can take a little while…");
   try {
     const target = await postWav(`/api/targets?name=${encodeURIComponent(name)}`, await toWav(blob));
     targets.push(target);

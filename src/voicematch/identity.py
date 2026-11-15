@@ -11,15 +11,13 @@ recording level and strangers score nearly as close as the same person.
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import sys
 import threading
-import urllib.request
 from pathlib import Path
 
 import numpy as np
+
+from .models import fetch
 
 MODEL_NAME = "wespeaker_en_voxceleb_resnet34_LM.onnx"
 MODEL_URL = (
@@ -32,28 +30,9 @@ _lock = threading.Lock()
 _session = None
 
 
-def cache_dir() -> Path:
-    return Path(os.environ.get("VOICEMATCH_CACHE") or Path.home() / ".cache" / "voicematch")
-
-
 def model_path() -> Path:
     """Path to the model, downloading it the first time."""
-    path = cache_dir() / "models" / MODEL_NAME
-    if path.is_file():
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(".part")
-    print(f"Downloading the speaker model ({MODEL_NAME}, 26 MB)...", file=sys.stderr, flush=True)
-    digest = hashlib.sha256()
-    with urllib.request.urlopen(MODEL_URL, timeout=60) as response, open(partial, "wb") as out:
-        while chunk := response.read(1 << 20):
-            digest.update(chunk)
-            out.write(chunk)
-    if digest.hexdigest() != MODEL_SHA256:
-        partial.unlink()
-        raise RuntimeError(f"The downloaded {MODEL_NAME} doesn't match its expected hash.")
-    partial.replace(path)
-    return path
+    return fetch(MODEL_NAME, MODEL_URL, MODEL_SHA256, "the speaker model, 26 MB")
 
 
 def _get_session():

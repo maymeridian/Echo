@@ -32,6 +32,13 @@
         sentences: how often it flags a take that did say the line (false
         alarms), and how often it catches the other sentence or a take cut short.
 
+    python tools/validate.py cleaning --music cache/music
+        Clip cleaning: clean sentences (CMU ARCTIC, RAVDESS, VCC2018 targets)
+        mixed with music (six public-domain/CC0 recordings from Wikimedia
+        Commons, plus a synthetic drum-and-bass loop) at 0, 5 and 10 dB, then
+        scored raw, after vocal separation, and after two speech denoisers,
+        against the clean original.
+
 Each prints the current method next to the alternatives that were considered.
 """
 
@@ -525,7 +532,7 @@ def embed_with(model: str, y: np.ndarray) -> np.ndarray:
     import kaldi_native_fbank as knf
     import onnxruntime
 
-    from voicematch.identity import cache_dir
+    from voicematch.models import cache_dir
 
     filename, framework = SPEAKER_MODELS[model]
     if model not in _sessions:
@@ -878,6 +885,140 @@ def validate_line(ravdess: Path, workers: int) -> None:
         print("   ", " ".join(c.target), "/", " ".join(c.take))
 
 
+# ---------- clip cleaning ----------
+
+DENOISERS = {"GTCRN denoiser": ("gtcrn_simple.onnx", "gtcrn"), "DPDFNet denoiser": ("dpdfnet2.onnx", "dpdfnet")}
+_denoisers: dict = {}
+
+
+def _denoise(kind: str, y: np.ndarray) -> np.ndarray:
+    import sherpa_onnx as so
+
+    from voicematch.models import cache_dir
+
+    if kind not in _denoisers:
+        filename, family = DENOISERS[kind]
+        model = so.OfflineSpeechDenoiserModelConfig(num_threads=1)
+        getattr(model, family).model = str(cache_dir() / "models" / filename)
+        _denoisers[kind] = so.OfflineSpeechDenoiser(so.OfflineSpeechDenoiserConfig(model=model))
+    out = _denoisers[kind].run(y.astype(np.float32).tolist(), SR)
+    z = np.asarray(out.samples, dtype=np.float32)
+    if out.sample_rate != SR:
+        import librosa
+
+        z = librosa.resample(z, orig_sr=out.sample_rate, target_sr=SR)
+    return np.pad(z, (0, max(0, len(y) - len(z))))[: len(y)]
+
+
+def beat(n: int, seed: int) -> np.ndarray:
+    """A drum-and-bass loop at 100-130 bpm: kick, snare noise, hats, bass line."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / SR
+    beat_s = 60 / rng.uniform(100, 130)
+    y = np.zeros(n)
+    for k in range(int(n / SR / beat_s) + 1):
+        i = int(k * beat_s * SR)
+        tt = np.arange(min(n - i, int(0.25 * SR))) / SR
+        if k % 2 == 0:
+            y[i:i + len(tt)] += np.sin(2 * np.pi * (50 + 80 * np.exp(-tt * 30)) * tt) * np.exp(-tt * 12)
+        else:
+            y[i:i + len(tt)] += 0.5 * rng.standard_normal(len(tt)) * np.exp(-tt * 25)
+        h = i + int(beat_s * SR / 2)
+        if h < n:
+            hh = np.arange(min(n - h, int(0.05 * SR))) / SR
+            y[h:h + len(hh)] += 0.15 * rng.standard_normal(len(hh)) * np.exp(-hh * 80)
+    notes = 55 * 2 ** (rng.choice([0, 3, 5, 7, 10], size=int(n / SR / beat_s) + 1) / 12)
+    y += 0.4 * np.sin(2 * np.pi * np.repeat(notes, int(beat_s * SR))[:n] * t)
+    return y.astype(np.float32)
+
+
+def _clean_speech(cache: Path) -> list[str]:
+    files = sorted(str(f) for f in (Path(__file__).parents[1] / "tests" / "data" / "arctic").glob("*.wav"))
+    files += sorted(str(f) for f in (cache / "ravdess").glob("Actor_*/03-01-01-01-01-01-*.wav"))
+    for spk in ("VCC2TF1", "VCC2TF2", "VCC2TM1", "VCC2TM2"):
+        files += sorted(str(f) for f in (cache / "vcc2018" / "vcc2018_reference" / spk).glob("*.wav"))[:5]
+    return files
+
+
+def _cleaning_job(item):
+    import librosa
+
+    from voicematch import clean
+    from voicematch.analysis import AnalysisError, _prepare, analyze
+    from voicematch.scoring import compare
+    from voicematch.similarity import rating
+
+    path, music_path, snr, seed = item
+    speech = _prepare(load(path))
+    if music_path == "beat":
+        music = beat(len(speech), seed)
+    elif music_path is None:
+        music = np.zeros_like(speech)
+    else:
+        rng = np.random.default_rng(seed)
+        dur = librosa.get_duration(path=music_path)
+        start = rng.uniform(20, dur - 40)
+        music, _ = librosa.load(music_path, sr=SR, mono=True, offset=start, duration=len(speech) / SR + 0.5)
+        music = music[: len(speech)]
+    if music_path is not None:
+        music = music * np.sqrt(np.mean(speech**2) / max(np.mean(music**2), 1e-12)) / 10 ** (snr / 20)
+    mix = speech + music
+    versions = {"raw (no cleaning)": mix, "vocal separation (UVR)": clean.vocals(mix)}
+    for kind in DENOISERS:
+        versions[kind] = _denoise(kind, mix)
+    ref = analyze(speech)
+    out = {}
+    for name, y in versions.items():
+        n = min(len(y), len(speech))
+        a = y[:n] @ speech[:n] / (speech[:n] @ speech[:n])
+        err = y[:n] - a * speech[:n]
+        sisdr = 10 * np.log10((a * a * (speech[:n] @ speech[:n])) / max(err @ err, 1e-12))
+        try:
+            v = analyze(y)
+        except AnalysisError:
+            out[name] = None
+            continue
+        pitch = (abs(12 * np.log2(v.median_f0 / ref.median_f0))
+                 if v.median_f0 is not None and ref.median_f0 is not None else np.nan)
+        formants = float(np.nanmean(np.abs(12 * np.log2(v.median_formants / ref.median_formants))))
+        out[name] = {"sisdr": float(sisdr), "pitch": pitch, "formants": formants,
+                     "listener": rating(ref, v), "headline": compare(ref, v)["overall"]}
+    return {"file": path, "music": music_path, "snr": snr, "results": out}
+
+
+def validate_cleaning(music_dir: Path, workers: int) -> None:
+    import json
+    import random
+
+    cache = Path(__file__).parents[1] / "cache"
+    files = _clean_speech(cache)
+    music = sorted(str(f) for f in music_dir.glob("*.ogg")) + ["beat"]
+    rng = random.Random(0)
+    items = []
+    for i, f in enumerate(files):
+        items.append((f, None, None, i))
+        for snr in (0, 5, 10):
+            items.append((f, rng.choice(music), snr, rng.randrange(10**6)))
+    out_path = cache / "cleaning_results.json"
+    print(f"{len(files)} sentences, {len(items)} versions to clean and score...", file=sys.stderr)
+    with ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
+        rows = list(pool.map(_cleaning_job, items))
+    out_path.write_text(json.dumps(rows), "utf-8")
+
+    methods = list(rows[0]["results"])
+    for snr in (None, 10, 5, 0):
+        sel = [r for r in rows if r["snr"] == snr]
+        label = "no music (does cleaning harm clean speech?)" if snr is None else f"music at {snr} dB below the voice"
+        print(f"\n{label}: {len(sel)} sentences. Medians against the clean original.")
+        print(f"{'':26s}{'SI-SDR':>8s}{'pitch off':>11s}{'formants off':>14s}{'listener 1-6':>14s}{'headline':>10s}")
+        for m in methods:
+            ok = [r["results"][m] for r in sel if r["results"].get(m)]
+            def med(k, ok=ok):
+                return np.nanmedian([o[k] for o in ok])
+            print(f"{m:26s}{med('sisdr'):7.1f}dB{med('pitch'):9.2f} st{med('formants'):11.2f} st"
+                  f"{med('listener'):13.2f}{med('headline'):10.0f}   ({len(sel) - len(ok)} failed)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -898,10 +1039,12 @@ def main() -> None:
     vf.add_argument("--train-pairs", type=int, default=0, help="also fetch this many random training pairs")
     li = sub.add_parser("line")
     li.add_argument("--ravdess", type=Path, required=True)
+    cl = sub.add_parser("cleaning")
+    cl.add_argument("--music", type=Path, required=True)
     ve = sub.add_parser("voxsim")
     ve.add_argument("--voxsim", type=Path, required=True)
     ve.add_argument("--audio", type=Path, required=True)
-    for s in (p, f, fl, v, vf, ve, li):
+    for s in (p, f, fl, v, vf, ve, li, cl):
         s.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
     if args.command == "pitch":
@@ -910,6 +1053,8 @@ def main() -> None:
         validate_formants(args.h95, args.workers)
     elif args.command == "formant-lines":
         validate_formant_lines(args.h95, args.workers)
+    elif args.command == "cleaning":
+        validate_cleaning(args.music, args.workers)
     elif args.command == "line":
         validate_line(args.ravdess, args.workers)
     elif args.command == "voxsim":

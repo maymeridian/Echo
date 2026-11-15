@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from . import line
-from .analysis import SR, AnalysisError, Voice, analyze, decode, load
+from . import clean, line
+from .analysis import MAX_SECONDS, SR, AnalysisError, Voice, analyze, decode, load
 from .scoring import compare
 from .store import NotFound, Store
 
@@ -28,16 +28,25 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     async def not_found(_: Request, __: NotFound) -> JSONResponse:
         return JSONResponse({"detail": "Not found."}, status_code=404)
 
-    async def uploaded_voice(request: Request) -> Voice:
+    async def uploaded_audio(request: Request):
         data = await request.body()
         if not data:
             raise HTTPException(400, "No audio received.")
         if len(data) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "That file is too large.")
         try:
-            return await run_in_threadpool(lambda: analyze(decode(data)))
+            return await run_in_threadpool(decode, data)
         except AnalysisError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    async def analysed(y) -> Voice:
+        try:
+            return await run_in_threadpool(analyze, y)
+        except AnalysisError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    async def uploaded_voice(request: Request) -> Voice:
+        return await analysed(await uploaded_audio(request))
 
     def target_voice(target_id: str) -> Voice:
         if target_id not in targets:
@@ -57,9 +66,14 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     @app.post("/api/targets", status_code=201)
     async def add_target(request: Request, name: str = "") -> dict:
-        voice = await uploaded_voice(request)
+        original = await uploaded_audio(request)
+        if len(original) > (MAX_SECONDS + 5) * SR:  # check before the slow cleaning step
+            raise HTTPException(422, f"That clip is {len(original) / SR:.0f} s long — keep it under {MAX_SECONDS:.0f} s.")
+        # Targets usually come from films or videos: take the voice out of any
+        # music or background first (clean.py), and score that.
+        voice = await analysed(await run_in_threadpool(clean.vocals, original))
         words = await run_in_threadpool(line.transcribe, voice.y)
-        meta = store.add_target(name.strip()[:80] or "Untitled", voice, words)
+        meta = store.add_target(name.strip()[:80] or "Untitled", voice, words, original)
         targets[meta["id"]] = voice
         return meta
 

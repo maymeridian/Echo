@@ -69,6 +69,20 @@ def test_a_take_that_stops_early_asks_about_the_whole_line(clip):
     assert any("Did you say the whole line?" in hint for hint in result["hints"])
 
 
+def test_cleaning_recovers_a_target_with_music_under_it(clip):
+    from validate import beat
+
+    from voicematch import clean
+    from voicematch.analysis import _prepare
+
+    speech = _prepare(load(DATA / "bdl_arctic_a0001.wav"))
+    music = beat(len(speech), seed=1)
+    mix = speech + music * np.sqrt(np.mean(speech**2) / np.mean(music**2))  # music as loud as the voice
+    reference = analyze(speech)
+    assert compare(reference, analyze(mix))["overall"] < 80
+    assert compare(reference, analyze(clean.vocals(mix)))["overall"] > 95
+
+
 def test_formant_ceiling_follows_the_vocal_tract(clip):
     # Shorter vocal tracts need a higher ceiling (tools/validate.py formant-lines).
     men = [clip("bdl_arctic_a0001").formant_ceiling, clip("rms_arctic_a0001").formant_ceiling]

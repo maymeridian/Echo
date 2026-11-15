@@ -52,7 +52,11 @@ class Store:
         metas = [json.loads(p.read_text("utf-8")) for p in self.root.glob("*/meta.json")]
         return sorted(metas, key=lambda m: m["created"])
 
-    def add_target(self, name: str, voice: Voice, words: list[str] | None = None) -> dict:
+    def add_target(
+        self, name: str, voice: Voice, words: list[str] | None = None, original=None
+    ) -> dict:
+        """`voice` is the cleaned clip that gets scored; `original` (samples at
+        SR) is the upload as it came, kept for reference."""
         meta = {
             "id": secrets.token_hex(6),
             "name": name,
@@ -63,6 +67,8 @@ class Store:
         path = self.root / meta["id"]
         (path / "takes").mkdir(parents=True)
         sf.write(path / "target.wav", voice.y, SR, subtype="PCM_16")
+        if original is not None:
+            sf.write(path / "original.wav", original, SR, subtype="PCM_16")
         (path / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
         return meta
 

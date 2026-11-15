@@ -21,6 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     score.add_argument("target")
     score.add_argument("take")
     score.add_argument("--json", action="store_true", help="print the full result as JSON")
+    score.add_argument("--no-clean", action="store_true", help="don't separate the target's voice from music first")
 
     args = parser.parse_args(argv)
     if args.command == "serve":
@@ -33,10 +34,12 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run(create_app(args.data), host=args.host, port=args.port)
         return 0
 
-    from . import line
+    from . import clean, line
 
     try:
-        target, take = analyze(load(args.target)), analyze(load(args.take))
+        raw = load(args.target)
+        target = analyze(raw if args.no_clean else clean.vocals(raw))
+        take = analyze(load(args.take))
         result = compare(target, take, line.transcribe(target.y), line.transcribe(take.y))
     except AnalysisError as exc:
         print(exc, file=sys.stderr)

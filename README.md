@@ -39,6 +39,13 @@ The page also shows **"Passes a speaker check"** when a speaker-verification
 model would accept the take as the same person. That threshold lets 1% of
 same-sex strangers through and accepts 88% of the real person's own takes.
 
+**Music under the target.** Every target clip goes through vocal separation
+(UVR-MDX-NET-Voc_FT, on the CPU) before anything is measured. Clips from films
+and videos usually have music or background under the voice, which throws off
+pitch, formants and Voice. The upload is kept as `original.wav` next to the
+cleaned `target.wav`. Your takes aren't cleaned: they come from your own mic,
+and changing your voice before scoring it would defeat the point.
+
 **The words.** Each target is transcribed once, with Whisper base.en on the
 CPU, and the page shows its line. Each take is transcribed and compared word
 by word. When the take skipped, swapped or added words, the first hint says
@@ -283,6 +290,28 @@ Median errors are 1–2% throughout. The chosen ceilings come out where
 phonetics puts them without being told: 5000 Hz for men, 5750 for women and
 6000 for children.
 
+### Clip cleaning
+
+48 clean sentences (CMU ARCTIC, RAVDESS, VCC2018 targets) were mixed with
+music. The music was six public-domain or CC0 recordings from Wikimedia Commons
+(orchestra, piano, strings, oboe, mandolin) plus a synthetic drum-and-bass
+loop. Each mix was scored against the clean original, where 100 is a perfect
+match. The table shows medians, with the worst 10% in brackets:
+
+| Music level | Uncleaned | Vocal separation (used) | DPDFNet denoiser | GTCRN denoiser |
+| --- | --- | --- | --- | --- |
+| None | 100 | 100 | 100 | 100 |
+| 10 dB below the voice | 99 (79) | 100 (100) | 100 | 100 |
+| 5 dB below | 86 (50) | 100 (99) | 100 | 100 |
+| As loud as the voice | 51 (23) | 100 (99) | 100 | 100 |
+
+The headline hides how far the parts drift. With music as loud as the voice,
+uncleaned pitch is 1.9 semitones off and formants 2.4. After separation they
+are 0.07 and 0.34, and SI-SDR rises from 0 dB to 15.6 dB, against 12.2 dB for
+DPDFNet and 6.7 dB for GTCRN. On clean speech separation changes almost
+nothing (SI-SDR 37 dB), which is why every target is cleaned.
+`tools/validate.py cleaning` reproduces the numbers.
+
 ### The word check
 
 The word check was tested on RAVDESS, where every actor says the same two
@@ -336,6 +365,8 @@ src/voicematch/
   identity.py        speaker embeddings (model download, features, ONNX)
   scoring.py         target + take -> distances -> calibrated scores, hints, chart
   line.py            speech recognition and the word-by-word comparison
+  clean.py           vocal separation for target clips
+  models.py          model downloads, checked against pinned hashes
   similarity.py      the listener-similarity model behind Voice
   similarity_model.json  its trees, from tools/train_similarity.py
   calibration.json   curves and weights from tools/calibrate.py
@@ -345,7 +376,7 @@ src/voicematch/
   cli.py             `voicematch serve`, `voicematch score`
   static/            the page: records, converts to 16 kHz WAV, shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
-tools/validate.py    checks pitch, formants, the word check and the whole score against reference data
+tools/validate.py    checks pitch, formants, cleaning, the word check and the whole score against reference data
 tools/train_similarity.py  trains similarity_model.json on VoxSim ratings
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
@@ -357,10 +388,8 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
 
 ## Next
 
-1. **Clip cleaning.** Strip music and background noise from target clips
-   before analysis, using vocal separation and a denoiser, and let a clip be
-   trimmed in the page. Check any off-the-shelf pipeline against its reference
-   before trusting it: sherpa-onnx's speaker pipeline wasn't right.
+1. **Trim clips in the page.** Pick the line out of a longer clip instead of
+   preparing it elsewhere.
 2. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
 3. **Train Voice on all of VoxSim.** The listener model was trained on

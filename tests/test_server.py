@@ -1,5 +1,7 @@
 import io
 
+import numpy as np
+
 import soundfile as sf
 from fastapi.testclient import TestClient
 from synth import SR, voice
@@ -42,4 +44,6 @@ def test_bad_audio_and_unknown_ids_are_reported(tmp_path):
     assert bad.status_code == 422
     assert bad.json()["detail"] == "Couldn't read that audio."
     assert client.post("/api/targets/nope/takes", content=wav(voice())).status_code == 404
+    too_long = client.post("/api/targets", content=wav(np.tile(voice(), 25)))  # about 45 s
+    assert too_long.status_code == 422 and "keep it under" in too_long.json()["detail"]
     assert client.get("/api/targets/..%2F..%2Fx/audio").status_code == 404
