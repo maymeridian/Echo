@@ -29,6 +29,22 @@
     <main>
       <p id="status" class="status" role="status"></p>
 
+      <section id="trim" class="trim" hidden>
+        <h2>Pick the line</h2>
+        <p class="fine">Move the ends to just the line you want to imitate (under 30 seconds), then play it to check.</p>
+        <canvas id="trim-wave"></canvas>
+        <div class="trim-sliders">
+          <label>Start <input id="trim-start" type="range" min="0" step="0.05"></label>
+          <label>End <input id="trim-end" type="range" min="0" step="0.05"></label>
+        </div>
+        <div class="trim-actions">
+          <span id="trim-len"></span>
+          <button id="trim-play" class="btn" type="button">Play selection</button>
+          <button id="trim-use" class="record" type="button">Use this part</button>
+          <button id="trim-cancel" class="link" type="button">Cancel</button>
+        </div>
+      </section>
+
       <section id="empty" class="empty">
         <h2>Pick a voice to imitate</h2>
         <p>Add a short clip of the voice on the left, then record yourself saying the same line.</p>

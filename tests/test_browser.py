@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 
+import numpy as np
 import pytest
 import soundfile as sf
 import uvicorn
@@ -81,7 +82,9 @@ def test_upload_target_record_takes_and_delete(server, page, tmp_path):
 
     page.fill("#new-name", "Synthetic")
     page.set_input_files("#new-file", str(clip))
-    page.wait_for_selector("#practice:not([hidden])")
+    page.wait_for_selector("#trim:not([hidden])")
+    page.click("#trim-use")
+    page.wait_for_selector("#practice:not([hidden])", timeout=60000)
     assert page.text_content("#target-name") == "Synthetic"
     assert not page.is_visible("#line-form") and not page.is_visible("#result")
 
@@ -115,6 +118,27 @@ def test_upload_target_record_takes_and_delete(server, page, tmp_path):
     assert page.errors == []
 
 
+def test_a_long_clip_is_trimmed_to_the_line(server, page, tmp_path):
+    clip = tmp_path / "long.wav"
+    sf.write(clip, np.tile(voice(), 25), SR, subtype="PCM_16")  # about 45 s, over the limit
+
+    page.goto(server)
+    page.fill("#new-name", "Long clip")
+    page.set_input_files("#new-file", str(clip))
+    page.wait_for_selector("#trim:not([hidden])")
+    assert page.eval_on_selector("#trim-end", "e => Number(e.value)") == 30  # starts at the limit
+    page.eval_on_selector("#trim-end", "e => { e.value = 40; e.dispatchEvent(new Event('input')); }")
+    assert page.is_disabled("#trim-use")  # 40 s is too long
+    page.eval_on_selector("#trim-start", "e => { e.value = 2; e.dispatchEvent(new Event('input')); }")
+    page.eval_on_selector("#trim-end", "e => { e.value = 8; e.dispatchEvent(new Event('input')); }")
+    assert "6.0 s selected" in page.text_content("#trim-len")
+    page.click("#trim-use")
+    page.wait_for_selector("#practice:not([hidden])", timeout=60000)
+    duration = page.evaluate("fetch('/api/targets').then(r => r.json()).then(t => t[0].duration)")
+    assert 4 < duration <= 6.05  # trimmed of silence at the edges too
+    assert page.errors == []
+
+
 def test_record_a_target_from_the_microphone(server, page):
     page.goto(server)
     page.click("#new-record")
@@ -122,6 +146,8 @@ def test_record_a_target_from_the_microphone(server, page):
 
     page.fill("#new-name", "From mic")
     record(page, "#new-record")
-    page.wait_for_selector("#practice:not([hidden])", timeout=20000)
+    page.wait_for_selector("#trim:not([hidden])", timeout=20000)
+    page.click("#trim-use")
+    page.wait_for_selector("#practice:not([hidden])", timeout=60000)
     assert page.text_content("#target-name") == "From mic"
     assert page.errors == []

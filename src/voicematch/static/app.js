@@ -3,6 +3,7 @@
 
 const SR = 16000;
 const MAX_SECONDS = 30;
+const MAX_TRIM_SECONDS = 600; // longer clips can be opened, then trimmed to the line
 const $ = (selector) => document.querySelector(selector);
 
 let targets = [];
@@ -53,7 +54,7 @@ function encodeWav(samples) {
   return new Blob([view], { type: "audio/wav" });
 }
 
-async function toWav(blob) {
+async function decodeMono(blob, maxSeconds) {
   // decodeAudioData resamples to the context's rate, so a 16 kHz context
   // hands back 16 kHz audio whatever the file was.
   const ctx = new OfflineAudioContext(1, 1, SR);
@@ -63,16 +64,18 @@ async function toWav(blob) {
   } catch {
     throw new Error("Couldn't read that audio.");
   }
-  if (decoded.duration > MAX_SECONDS + 1) {
-    throw new Error(`That clip is ${Math.round(decoded.duration)} s long — trim it to under ${MAX_SECONDS} s.`);
+  if (decoded.duration > maxSeconds) {
+    throw new Error(`That clip is ${Math.round(decoded.duration)} s long — the limit is ${maxSeconds} s.`);
   }
   const mono = new Float32Array(decoded.length);
   for (let c = 0; c < decoded.numberOfChannels; c++) {
     const channel = decoded.getChannelData(c);
     for (let i = 0; i < mono.length; i++) mono[i] += channel[i] / decoded.numberOfChannels;
   }
-  return encodeWav(mono);
+  return mono;
 }
+
+const toWav = async (blob) => encodeWav(await decodeMono(blob, MAX_SECONDS + 1));
 
 class Recorder {
   async start(onLevel) {
@@ -146,7 +149,7 @@ async function stopRecording() {
   renderControls();
   const blob = await recorder.stop();
   if (kind === "take") await submitTake(blob);
-  else await createTarget(blob);
+  else await openTrim(blob);
 }
 
 const toggleRecording = (kind) => (session ? stopRecording() : startRecording(kind));
@@ -165,11 +168,11 @@ async function submitTake(blob) {
   }
 }
 
-async function createTarget(blob) {
+async function createTarget(samples) {
   const name = $("#new-name").value.trim();
   setStatus("Adding clip: separating the voice from any music, which can take a little while…");
   try {
-    const target = await postWav(`/api/targets?name=${encodeURIComponent(name)}`, await toWav(blob));
+    const target = await postWav(`/api/targets?name=${encodeURIComponent(name)}`, encodeWav(samples));
     targets.push(target);
     $("#new-name").value = "";
     setStatus("");
@@ -177,6 +180,113 @@ async function createTarget(blob) {
   } catch (err) {
     setStatus(err.message, true);
   }
+}
+
+// ---------- trimming a new clip to the line ----------
+
+let trimming = null; // { samples }
+let trimPlayer = null;
+
+async function openTrim(blob) {
+  let samples;
+  try {
+    samples = await decodeMono(blob, MAX_TRIM_SECONDS);
+  } catch (err) {
+    setStatus(err.message, true);
+    return;
+  }
+  const seconds = samples.length / SR;
+  trimming = { samples };
+  for (const id of ["#trim-start", "#trim-end"]) $(id).max = seconds.toFixed(2);
+  $("#trim-start").value = 0;
+  $("#trim-end").value = Math.min(seconds, MAX_SECONDS).toFixed(2);
+  $("#empty").hidden = true;
+  $("#practice").hidden = true;
+  $("#trim").hidden = false;
+  setStatus("");
+  renderTrim();
+}
+
+function trimRange() {
+  let a = Number($("#trim-start").value);
+  let b = Number($("#trim-end").value);
+  if (b < a) [a, b] = [b, a];
+  return [a, b];
+}
+
+function renderTrim() {
+  if (!trimming) return;
+  const [a, b] = trimRange();
+  const length = b - a;
+  const ok = length >= 0.5 && length <= MAX_SECONDS;
+  $("#trim-len").textContent = ok ? `${length.toFixed(1)} s selected` : `${length.toFixed(1)} s — pick 0.5 to ${MAX_SECONDS} s`;
+  $("#trim-len").classList.toggle("error", !ok);
+  $("#trim-use").disabled = !ok;
+  drawWave(a, b);
+}
+
+function drawWave(a, b) {
+  const canvas = $("#trim-wave");
+  const { samples } = trimming;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (!w) return;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement);
+  const seconds = samples.length / SR;
+  const per = Math.max(1, Math.floor(samples.length / w));
+  for (let x = 0; x < w; x++) {
+    let lo = 0;
+    let hi = 0;
+    for (let i = x * per; i < Math.min(samples.length, (x + 1) * per); i++) {
+      lo = Math.min(lo, samples[i]);
+      hi = Math.max(hi, samples[i]);
+    }
+    const t = (x / w) * seconds;
+    g.fillStyle = css.getPropertyValue(t >= a && t <= b ? "--accent" : "--line").trim();
+    g.fillRect(x, h / 2 - (hi * h) / 2, 1, Math.max(1, ((hi - lo) * h) / 2));
+  }
+}
+
+function stopTrimPlayback() {
+  if (trimPlayer) {
+    trimPlayer.close();
+    trimPlayer = null;
+  }
+}
+
+function playTrim() {
+  stopTrimPlayback();
+  const [a, b] = trimRange();
+  const part = trimming.samples.subarray(Math.round(a * SR), Math.round(b * SR));
+  const ctx = new AudioContext();
+  const buffer = ctx.createBuffer(1, part.length, SR);
+  buffer.copyToChannel(part, 0);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.onended = stopTrimPlayback;
+  source.start();
+  trimPlayer = ctx;
+}
+
+function closeTrim() {
+  stopTrimPlayback();
+  trimming = null;
+  $("#trim").hidden = true;
+  $("#empty").hidden = Boolean(current);
+  $("#practice").hidden = !current;
+}
+
+async function useTrim() {
+  const [a, b] = trimRange();
+  const part = trimming.samples.slice(Math.round(a * SR), Math.round(b * SR));
+  closeTrim();
+  await createTarget(part);
 }
 
 function nameGiven() {
@@ -400,8 +510,13 @@ $("#new-file").onclick = (e) => nameGiven() || e.preventDefault();
 $("#new-file").onchange = async (e) => {
   const [file] = e.target.files;
   e.target.value = "";
-  if (file) await createTarget(file);
+  if (file) await openTrim(file);
 };
+$("#trim-start").oninput = renderTrim;
+$("#trim-end").oninput = renderTrim;
+$("#trim-play").onclick = playTrim;
+$("#trim-use").onclick = useTrim;
+$("#trim-cancel").onclick = closeTrim;
 $("#edit-line").onclick = editLine;
 $("#cancel-line").onclick = renderLine;
 $("#line-form").onsubmit = saveLine;
@@ -415,7 +530,10 @@ $("#delete-target").onclick = async () => {
     setStatus(err.message, true);
   }
 };
-window.addEventListener("resize", drawContour);
+window.addEventListener("resize", () => {
+  drawContour();
+  renderTrim();
+});
 
 try {
   targets = await api("/api/targets");

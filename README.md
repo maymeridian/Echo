@@ -2,8 +2,8 @@
 
 Practice a voice impression and measure how close you get.
 
-Add a short clip of the voice you're imitating, record yourself saying the same
-line, and get a 0–100 match with a breakdown of what to change: voice identity,
+Add a clip of the voice you're imitating, trim it to one line in the page,
+record yourself saying the same line, and get a 0–100 match with a breakdown of what to change: voice identity,
 pitch, melody, resonance, articulation and rhythm. Every take is kept, so you
 can see whether you're getting closer.
 
@@ -388,15 +388,13 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
 
 ## Next
 
-1. **Trim clips in the page.** Pick the line out of a longer clip instead of
-   preparing it elsewhere.
-2. **Check the scale with real microphones.** Record a few people saying lines
+1. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
-3. **Train Voice on all of VoxSim.** The listener model was trained on
+2. **Train Voice on all of VoxSim.** The listener model was trained on
    3,037 of VoxSim's 24,921 training pairs. Fetching the rest of the clips
    (`voxsim-fetch --train-pairs 24921`, about 8 GB) and re-running
    `tools/train_similarity.py` should help, since tree models gain from more
    data. Beyond that, fine-tuning the speaker network itself on the ratings
    (Ahn et al. 2024) or training it with a prototypical loss (Chen et al. 2026)
    needs a GPU.
-4. **Live feedback.** Show pitch against the target while recording.
+3. **Live feedback.** Show pitch against the target while recording.
