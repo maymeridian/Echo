@@ -136,6 +136,9 @@ input[type="text"] {
 .record:disabled { opacity: 0.5; cursor: default; }
 .record .dot { width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
 .record.live .dot { border-radius: 2px; }
+.live { margin: -12px 0 24px; }
+.live-text { margin: 0 0 6px; font-variant-numeric: tabular-nums; }
+.live canvas { display: block; width: 100%; height: 120px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); }
 .meter { flex: 1; height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
 #level { height: 100%; width: 0; background: var(--accent); }
 

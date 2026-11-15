@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -89,6 +90,16 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         store.delete_target(target_id)
         targets.pop(target_id, None)
         return Response(status_code=204)
+
+    @app.get("/api/targets/{target_id}/profile")
+    def target_profile(target_id: str) -> dict:
+        """The target's pitch band, for the live view while recording."""
+        voice = target_voice(target_id)
+        f0 = voice.f0[voice.voiced]
+        if f0.size < 20:
+            return {"median_f0": None, "low": None, "high": None}
+        low, median, high = np.percentile(f0, [10, 50, 90])
+        return {"median_f0": round(float(median), 1), "low": round(float(low), 1), "high": round(float(high), 1)}
 
     @app.get("/api/targets/{target_id}/audio")
     def target_audio(target_id: str) -> FileResponse:

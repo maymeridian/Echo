@@ -23,6 +23,9 @@ def test_add_target_record_take_and_read_it_back(tmp_path):
     assert target["name"] == "Test voice"
     assert client.get(f"/api/targets/{target['id']}/audio").headers["content-type"] == "audio/wav"
 
+    profile = client.get(f"/api/targets/{target['id']}/profile").json()
+    assert 110 < profile["median_f0"] < 130 and profile["low"] < profile["median_f0"] < profile["high"]
+
     take = client.post(f"/api/targets/{target['id']}/takes", content=wav(voice(f0=150))).json()
     assert 0 < take["overall"] < 100
 

@@ -39,6 +39,11 @@ The page also shows **"Passes a speaker check"** when a speaker-verification
 model would accept the take as the same person. That threshold lets 1% of
 same-sex strangers through and accepts 88% of the real person's own takes.
 
+**Live pitch.** While you record a take, a chart scrolls your pitch over the
+last 5 seconds against the target's pitch band (10th to 90th percentile, line at
+the median), with a readout such as "You: 144 Hz · target about 95 Hz — go
+lower (7.2 st)".
+
 **Music under the target.** Every target clip goes through vocal separation
 (UVR-MDX-NET-Voc_FT, on the CPU) before anything is measured. Clips from films
 and videos usually have music or background under the voice, which throws off
@@ -272,6 +277,14 @@ autocorrelation, 60–600 Hz) was the best of five:
 The adaptive ranges fix some octave-down errors for women, but they cause more
 octave-up errors than they fix.
 
+The page's live tracker is YIN (de Cheveigné & Kawahara 2002) in
+`static/pitch.js`, run on 2048-sample frames as the browser sees them. On the
+same recordings it gets 1.9% gross errors (3.0% for women, 0.2% for men) with
+a 15-cent fine error. It skips 8.4% of voiced frames, which just leaves gaps in
+the live trace, and calls 1.0% of unvoiced frames voiced. A looser threshold
+fills the gaps but nearly triples the gross errors.
+`node tools/check_live_pitch.mjs cache/ptdb` reproduces this.
+
 ### Formants
 
 The formant tracker was checked against the hand-checked measurements of
@@ -374,10 +387,11 @@ src/voicematch/
   store.py           targets and takes on disk
   server.py          FastAPI app
   cli.py             `voicematch serve`, `voicematch score`
-  static/            the page: records, converts to 16 kHz WAV, shows results
+  static/            the page: records, trims, live pitch (pitch.js), shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
 tools/validate.py    checks pitch, formants, cleaning, the word check and the whole score against reference data
 tools/train_similarity.py  trains similarity_model.json on VoxSim ratings
+tools/check_live_pitch.mjs  checks the page's live pitch tracker against PTDB-TUG
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
 
@@ -397,4 +411,3 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
    data. Beyond that, fine-tuning the speaker network itself on the ratings
    (Ahn et al. 2024) or training it with a prototypical loss (Chen et al. 2026)
    needs a GPU.
-3. **Live feedback.** Show pitch against the target while recording.

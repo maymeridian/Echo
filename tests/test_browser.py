@@ -65,10 +65,13 @@ def page(tmp_path):
         browser.close()
 
 
-def record(page, button: str, seconds: float = 2.5) -> None:
+def record(page, button: str, seconds: float = 2.5, check_live: bool = False) -> None:
     page.click(button)
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Recording')")
     page.wait_for_timeout(seconds * 1000)
+    if check_live:  # the fake mic plays a 140 Hz voice; the target sits at 120 Hz
+        text = page.text_content("#live-text")
+        assert "You: 1" in text and "target about 12" in text and "go lower" in text, text
     page.click(button)
 
 
@@ -88,8 +91,9 @@ def test_upload_target_record_takes_and_delete(server, page, tmp_path):
     assert page.text_content("#target-name") == "Synthetic"
     assert not page.is_visible("#line-form") and not page.is_visible("#result")
 
-    record(page, "#record")
+    record(page, "#record", check_live=True)
     page.wait_for_selector("#result:not([hidden])", timeout=20000)
+    assert not page.is_visible("#live")
     first = int(page.text_content("#overall"))
     assert 0 <= first <= 100
     assert page.locator("#components li").count() == 6

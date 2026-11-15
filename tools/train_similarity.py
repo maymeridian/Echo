@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, spearmanr
 
 sys.path.insert(0, str(Path(__file__).parent))
 from validate import voxsim_pairs  # noqa: E402
@@ -94,6 +94,41 @@ def export(model) -> dict:
     return {"baseline": float(np.ravel(model._baseline_prediction)[0]), "trees": trees}
 
 
+def _speaker(clip: str) -> str:
+    return clip.split("/")[0]
+
+
+def tune(train: list[dict], clips, audio: Path) -> dict:
+    """Pick tree settings on held-out training speakers, never the test split.
+
+    10% of training speakers are set aside; pairs where both speakers are set
+    aside form the validation set, pairs where neither is form the fitting set,
+    and pairs that straddle the two are dropped, so no voice is in both."""
+    import itertools
+    import random
+
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    speakers = sorted({_speaker(c) for p in train for c in (p["a"], p["b"])})
+    held = set(random.Random(0).sample(speakers, len(speakers) // 10))
+    fit = [p for p in train if _speaker(p["a"]) not in held and _speaker(p["b"]) not in held]
+    val = [p for p in train if _speaker(p["a"]) in held and _speaker(p["b"]) in held]
+    Xf, yf, _ = table(fit, clips, audio)
+    Xv, yv, sv = table(val, clips, audio)
+    print(f"tuning: fit on {len(yf)} pairs, validate on {len(yv)} pairs from {len(held)} held-out speakers")
+    best = None
+    for depth, iters, rate, leaf in itertools.product((2, 3, 4, 6), (200, 500), (0.03, 0.1), (20, 100)):
+        params = dict(max_depth=depth, max_iter=iters, learning_rate=rate, min_samples_leaf=leaf)
+        model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params).fit(Xf, yf)
+        pred = model.predict(Xv)
+        # Both jobs count: ranking everyone, and ranking strangers.
+        score = (spearmanr(pred, yv)[0] + spearmanr(pred[~sv], yv[~sv])[0]) / 2
+        if best is None or score > best[0]:
+            best = (score, params)
+    print(f"  best on validation: {best[1]} (mean of all-pairs and stranger Spearman {best[0]:.3f})")
+    return best[1]
+
+
 def main() -> None:
     from sklearn.ensemble import HistGradientBoostingRegressor
 
@@ -101,6 +136,8 @@ def main() -> None:
     parser.add_argument("--voxsim", type=Path, required=True)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--analyse-only", action="store_true",
+                        help="just analyse the clips that are there (to warm the cache during a download)")
     args = parser.parse_args()
 
     train = [p for p in voxsim_pairs(args.voxsim, "train")
@@ -108,12 +145,15 @@ def main() -> None:
     test = voxsim_pairs(args.voxsim, "test")
     paths = sorted({str(args.audio / c) for p in train + test for c in (p["a"], p["b"])})
     clips = clip_features([p for p in paths if Path(p).exists()], args.audio / "clips.pkl", args.workers)
+    if args.analyse_only:
+        print(f"{len(clips)} clips analysed")
+        return
+    params = tune(train, clips, args.audio)
     Xtr, ytr, _ = table(train, clips, args.audio)
     Xte, yte, ste = table(test, clips, args.audio)
     print(f"training on {len(ytr)} VoxSim training pairs, testing on {len(yte)} test pairs")
 
-    model = HistGradientBoostingRegressor(max_depth=3, max_iter=200, learning_rate=0.05,
-                                          monotonic_cst=MONOTONIC, random_state=0).fit(Xtr, ytr)
+    model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params).fit(Xtr, ytr)
     exported = export(model)
     ours = np.array([similarity.predict(x, exported) for x in Xtr])
     theirs = np.clip(model.predict(Xtr), 1, 6)
@@ -121,12 +161,15 @@ def main() -> None:
 
     pred = np.array([similarity.predict(x, exported) for x in Xte])
     cos = Xte[:, 0]
-    print("Spearman with listeners on the VoxSim test split:")
+    print("Pearson / Spearman with listeners on the VoxSim test split:")
     for label, v in (("embedding similarity alone", cos), ("listener-similarity model", pred)):
-        print(f"  {label:28s} all {spearmanr(v, yte)[0]:.3f}  strangers {spearmanr(v[~ste], yte[~ste])[0]:.3f}"
-              f"  same speaker {spearmanr(v[ste], yte[ste])[0]:.3f}")
+        cells = []
+        for sel in (slice(None), ~ste, ste):
+            cells.append(f"{pearsonr(v[sel], yte[sel])[0]:.3f} / {spearmanr(v[sel], yte[sel])[0]:.3f}")
+        print(f"  {label:28s} all {cells[0]}   strangers {cells[1]}   same speaker {cells[2]}")
     exported.update(
         source=f"VoxSim, {len(ytr)} training pairs (tools/train_similarity.py)",
+        params=params,
         features=list(similarity.FEATURES),
         test_spearman={"all": round(float(spearmanr(pred, yte)[0]), 3),
                        "strangers": round(float(spearmanr(pred[~ste], yte[~ste])[0]), 3)},

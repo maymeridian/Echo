@@ -1,3 +1,5 @@
+import { yin } from "./pitch.js";
+
 // The browser's only audio jobs are capturing the microphone and turning any
 // clip into 16 kHz mono WAV; all measurement happens on the server.
 
@@ -78,7 +80,7 @@ async function decodeMono(blob, maxSeconds) {
 const toWav = async (blob) => encodeWav(await decodeMono(blob, MAX_SECONDS + 1));
 
 class Recorder {
-  async start(onLevel) {
+  async start(onLevel, onPitch) {
     // The browser's call-quality processing reshapes the voice, which is the
     // thing being measured, so all of it is off.
     this.stream = await navigator.mediaDevices.getUserMedia({
@@ -91,13 +93,18 @@ class Recorder {
 
     this.ctx = new AudioContext();
     const analyser = this.ctx.createAnalyser();
-    analyser.fftSize = 1024;
+    analyser.fftSize = 2048;
     this.ctx.createMediaStreamSource(this.stream).connect(analyser);
     const buffer = new Float32Array(analyser.fftSize);
     const tick = () => {
       if (this.media.state !== "recording") return;
       analyser.getFloatTimeDomainData(buffer);
-      onLevel(buffer.reduce((peak, x) => Math.max(peak, Math.abs(x)), 0));
+      const peak = buffer.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+      onLevel(peak);
+      if (onPitch && peak > 0) {
+        const frame = buffer.map((x) => x / peak);
+        onPitch(yin(frame, this.ctx.sampleRate)?.f0 ?? null);
+      }
       requestAnimationFrame(tick);
     };
     tick();
@@ -122,11 +129,96 @@ function setStatus(message, isError = false) {
   $("#status").classList.toggle("error", isError);
 }
 
+// ---------- live pitch while recording a take ----------
+
+const LIVE_SECONDS = 5;
+let live = null; // { profile, points: [{t, f0}], started }
+
+async function startLive() {
+  let profile = null;
+  try {
+    profile = await api(`/api/targets/${current.id}/profile`);
+  } catch {}
+  live = { profile, points: [], started: performance.now() };
+  $("#live").hidden = false;
+  $("#live-text").textContent = "Speak…";
+}
+
+function onLivePitch(f0) {
+  if (!live) return;
+  const t = (performance.now() - live.started) / 1000;
+  live.points.push({ t, f0 });
+  live.points = live.points.filter((p) => p.t > t - LIVE_SECONDS);
+  const recent = live.points.filter((p) => p.f0 && p.t > t - 0.5).map((p) => p.f0).sort((a, b) => a - b);
+  const target = live.profile?.median_f0;
+  if (recent.length >= 5) {
+    const now = recent[Math.floor(recent.length / 2)];
+    let text = `You: ${Math.round(now)} Hz`;
+    if (target) {
+      const st = 12 * Math.log2(now / target);
+      const advice = Math.abs(st) < 1 ? "on target" : st > 0 ? `go lower (${st.toFixed(1)} st)` : `go higher (${(-st).toFixed(1)} st)`;
+      text += ` · target about ${Math.round(target)} Hz — ${advice}`;
+    }
+    $("#live-text").textContent = text;
+  }
+  drawLive(t);
+}
+
+function drawLive(now) {
+  const canvas = $("#live-pitch");
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (!w) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement);
+  const color = (name) => css.getPropertyValue(name).trim();
+  const p = live.profile;
+  const voiced = live.points.filter((pt) => pt.f0).map((pt) => pt.f0);
+  // Pitch is heard in ratios, so the axis is logarithmic, around the target.
+  const centre = p?.median_f0 ?? (voiced.length ? voiced[voiced.length - 1] : 150);
+  let lo = centre / 2;
+  let hi = centre * 2;
+  for (const f of voiced) {
+    lo = Math.min(lo, f / 1.1);
+    hi = Math.max(hi, f * 1.1);
+  }
+  const y = (hz) => h - 6 - (Math.log(hz / lo) / Math.log(hi / lo)) * (h - 12);
+  const x = (t) => ((t - (now - LIVE_SECONDS)) / LIVE_SECONDS) * w;
+  if (p?.low && p?.high) {
+    g.fillStyle = color("--track");
+    g.fillRect(0, y(p.high), w, y(p.low) - y(p.high));
+    g.strokeStyle = color("--target");
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(0, y(p.median_f0));
+    g.lineTo(w, y(p.median_f0));
+    g.stroke();
+  }
+  g.fillStyle = color("--accent");
+  for (const pt of live.points) {
+    if (pt.f0) g.fillRect(x(pt.t) - 1.5, y(pt.f0) - 1.5, 3, 3);
+  }
+}
+
+function stopLive() {
+  live = null;
+  $("#live").hidden = true;
+}
+
 async function startRecording(kind) {
   const recorder = new Recorder();
+  if (kind === "take") await startLive();
   try {
-    await recorder.start((peak) => ($("#level").style.width = `${Math.min(100, peak * 140)}%`));
+    await recorder.start(
+      (peak) => ($("#level").style.width = `${Math.min(100, peak * 140)}%`),
+      kind === "take" ? onLivePitch : null,
+    );
   } catch {
+    stopLive();
     setStatus("Couldn't open the microphone — allow access for this page and try again.", true);
     return;
   }
@@ -145,6 +237,7 @@ async function stopRecording() {
   const { kind, recorder, timer } = session;
   session = null;
   clearInterval(timer);
+  stopLive();
   $("#level").style.width = "0";
   renderControls();
   const blob = await recorder.stop();
