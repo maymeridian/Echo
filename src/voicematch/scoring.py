@@ -3,7 +3,8 @@
 `measure` takes the raw distances. The take is time-aligned to the target first
 (DTW over MFCCs), so pitch, formants and timing compare the same moment of the
 line in both recordings; that part only works when both say the same words.
-The speaker-identity similarity doesn't depend on the words.
+Voice doesn't depend on the words: it's the rating listeners would likely give
+the pair (similarity.py, trained on VoxSim).
 
 `compare` maps each distance to 0-100 with curves from calibration.json (see
 tools/calibrate.py) and writes the details and hints.
@@ -19,7 +20,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 
-from . import identity
+from . import identity, similarity
 from .analysis import MIN_VOICED_FRAMES, Voice
 
 CALIBRATION = json.loads((Path(__file__).parent / "calibration.json").read_text("utf-8"))
@@ -30,6 +31,7 @@ class Measures:
     ti: np.ndarray  # alignment path: target frame indices
     ki: np.ndarray  # ...and the matching take frame indices
     identity: float  # cosine similarity of speaker embeddings, -1..1
+    listener: float  # rating listeners would likely give, 1 (different) .. 6 (same)
     articulation: float  # mean cosine distance between aligned MFCC frames
     tempo: float  # log2 of take / target length, first to last voiced sound
     timing: float  # how far the alignment strays from a uniform stretch, 0..1
@@ -42,7 +44,7 @@ class Measures:
     def distances(self) -> dict[str, float | None]:
         """Each measure as a non-negative distance where 0 is a perfect match."""
         return {
-            "identity": 1.0 - self.identity,
+            "identity": 6.0 - self.listener,
             "pitch": None if self.pitch is None else abs(self.pitch),
             "melody": self.melody,
             "resonance": self.resonance,
@@ -65,6 +67,7 @@ def measure(target: Voice, take: Voice) -> Measures:
         ti=ti,
         ki=ki,
         identity=identity.similarity(target.embedding, take.embedding),
+        listener=similarity.rating(target, take),
         articulation=float(cost[-1, -1]) / len(path),
         tempo=math.log2(take.spoken_duration / target.spoken_duration),
         timing=float(np.mean(np.abs(ti / max(1, n_t - 1) - ki / max(1, n_k - 1)))),
@@ -154,6 +157,7 @@ def compare(target: Voice, take: Voice) -> dict:
     return {
         "overall": round(overall(scores), 1),
         "identity": round(m.identity, 3),
+        "listener": round(m.listener, 2),
         "accepted": m.identity >= CALIBRATION["identity_accept"],
         "components": [
             {
@@ -173,11 +177,20 @@ def _unmeasured(key: str, label: str) -> Component:
     return Component(key, label, None, "not enough voiced sound to measure")
 
 
+# VoxSim's rating labels.
+LISTENER_LABELS = (
+    "definitely different speakers",
+    "probably different speakers",
+    "possibly different speakers",
+    "possibly the same speaker",
+    "probably the same speaker",
+    "definitely the same speaker",
+)
+
+
 def _identity(m: Measures, score: float) -> Component:
-    if m.identity >= CALIBRATION["identity_accept"]:
-        detail = "a speaker-verification model would accept this as the same person"
-    else:
-        detail = f"speaker similarity {m.identity:.2f}"
+    label = LISTENER_LABELS[min(5, max(0, round(m.listener) - 1))]
+    detail = f"listeners would likely say: {label} ({m.listener:.1f} of 6)"
     return Component(
         "identity",
         "Voice",

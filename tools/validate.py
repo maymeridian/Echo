@@ -728,12 +728,21 @@ def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
     curves = CALIBRATION["curves"]
     w = CALIBRATION["weights"]
 
+    from types import SimpleNamespace
+
+    from voicematch import similarity
+
     def measures(fa, fb):
+        def ns(f):
+            return SimpleNamespace(embedding=f["emb"], median_f0=f["f0"], median_formants=f["formants"])
+
+        listener = similarity.predict(similarity.features(ns(fa), ns(fb)))
         out = {
-            "Voice (current)": cosine(fa["emb"], fb["emb"]),
-            "  without mean subtraction": cosine(fa["raw"], fb["raw"]),
-            "  average of 3 models": (cosine(fa["emb"], fb["emb"]) + cosine(fa["cam"], fb["cam"])
-                                      + cosine(fa["eres"], fb["eres"])) / 3,
+            "Voice: listener model (current)": listener,
+            "  embedding similarity alone": cosine(fa["emb"], fb["emb"]),
+            "  ...without mean subtraction": cosine(fa["raw"], fb["raw"]),
+            "  ...average of 3 models": (cosine(fa["emb"], fb["emb"]) + cosine(fa["cam"], fb["cam"])
+                                         + cosine(fa["eres"], fb["eres"])) / 3,
         }
         pitch = None
         if fa["f0"] and fb["f0"]:
@@ -743,12 +752,12 @@ def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
         if np.all(np.isfinite(fa["formants"])) and np.all(np.isfinite(fb["formants"])):
             res = float(np.mean(np.abs(12 * np.log2(fa["formants"] / fb["formants"]))))
             out["Resonance (median formants apart)"] = -res
-        parts = {"identity": curve(1 - out["Voice (current)"], **curves["identity"])}
+        parts = {"identity": curve(6 - listener, **curves["identity"])}
         if pitch is not None:
             parts["pitch"] = curve(pitch, **curves["pitch"])
         if res is not None:
             parts["resonance"] = curve(res, **curves["resonance"])
-        out["Voice + pitch + resonance (app weights)"] = (
+        out["Voice + Pitch + Resonance (app weights)"] = (
             sum(w[k] * v for k, v in parts.items()) / sum(w[k] for k in parts))
         return out
 

@@ -79,6 +79,13 @@ class Voice:
         return (span.stop - span.start) * HOP / SR
 
     @property
+    def median_formants(self) -> np.ndarray:
+        """Typical F1-F3 in Hz over voiced frames; NaN with too little voicing."""
+        if self.voiced.sum() < MIN_VOICED_FRAMES:
+            return np.full(3, np.nan)
+        return np.nanmedian(self.formants[:, self.voiced], axis=1)
+
+    @property
     def median_f0(self) -> float | None:
         """Typical pitch in Hz, or None when there is too little voiced sound."""
         if self.voiced.sum() < MIN_VOICED_FRAMES:

@@ -31,6 +31,10 @@ To score two files without the app:
 microphone. **About 20:** a stranger of the same sex saying the same line their
 own way. Each part of the breakdown uses the same scale.
 
+The Voice part also says, in words, what listeners would likely answer if asked
+whether the two recordings are the same speaker. For example: "probably the
+same speaker (5.2 of 6)".
+
 The page also shows **"Passes a speaker check"** when a speaker-verification
 model would accept the take as the same person. That threshold lets 1% of
 same-sex strangers through and accepts 88% of the real person's own takes.
@@ -43,15 +47,24 @@ part needs **both recordings to say the same words**.
 
 | Part | Weight | What is compared |
 | --- | --- | --- |
-| Voice | 24% | Speaker-embedding similarity; doesn't depend on the words |
+| Voice | 24% | The rating listeners would likely give the pair; doesn't depend on the words |
 | Pitch | 15% | Median pitch, in semitones |
 | Melody | 12% | Shape of the pitch contour once the level difference is removed |
 | Resonance | 16% | Formants F1–F3 on aligned voiced frames (brighter or darker) |
 | Articulation | 19% | MFCC distance along the alignment (how the sounds are shaped) |
 | Rhythm | 15% | Length from first to last voiced sound, and timing within the line |
 
-Voice uses WeSpeaker's ResNet34-LM (trained on VoxCeleb), run on the CPU with
-onnxruntime, with the mean embedding of 137 unrelated speakers subtracted.
+Voice is a small model trained on human ratings (VoxSim, below). It predicts
+the listener rating from three things:
+
+- **Speaker similarity:** speaker-embedding similarity from WeSpeaker's
+  ResNet34-LM (trained on VoxCeleb), run on the CPU with onnxruntime. The mean
+  embedding of 137 unrelated speakers is subtracted first.
+- **Pitch gap:** the gap in median pitch.
+- **Formant gaps:** the gaps in median F1, F2 and F3.
+
+It's constrained so that more similarity can only raise the rating and bigger
+gaps can only lower it.
 Pitch and formants come from Praat (via parselmouth). Each recording gets its
 own formant ceiling: the one, from 4500 to 7000 Hz, whose tracks jump least from
 frame to frame. MFCCs and alignment come from librosa.
@@ -144,8 +157,8 @@ test of what the app measures.
 
 | Measure | Per pair | Per system |
 | --- | --- | --- |
-| **Headline** | **0.52** | **0.93** |
-| Voice | 0.49 | 0.92 |
+| **Headline** | **0.53** | **0.94** |
+| Voice | 0.56 | 0.95 |
 | Pitch | 0.47 | 0.78 |
 | Resonance | 0.42 | 0.91 |
 | Articulation | 0.21 | 0.33 |
@@ -160,9 +173,30 @@ numbers. For comparison, Ahn et al. (2024,
 their VCC2018 test split:
 
 - **0.51:** a pretrained ECAPA speaker model, with no training on VCC2018.
+- **0.56:** the same ECAPA model fine-tuned on VoxSim, still without training
+  on VCC2018.
 - **0.57:** SVSNet, a model trained on VCC2018 itself.
 
-Their split differs from this one, so the comparison is approximate.
+Their split differs from this one, so the comparison is approximate. Voice's
+listener model was trained only on VoxSim and lands next to Ahn et al.'s
+VoxSim-trained model here (0.56). Before, when Voice was speaker-embedding
+similarity alone, it scored 0.49.
+
+The new Voice costs a little on one slice: conversions compared with their
+target. There the headline's rank correlation dropped from 0.378 to 0.365
+(bootstrap 95% CI for the change, −0.016 to −0.010), even though Voice on its
+own improved from 0.371 to 0.393. The likely reason is that Voice now leans on
+the pitch gap, which is a weak signal in voice-converted speech, and the
+headline also counts pitch separately. The change was kept for two reasons:
+
+- **Across the rest of VCC2018 the headline improved:** 0.524 to 0.527 per
+  pair and 0.932 to 0.939 per system.
+- **On real speech the gain is large:** ranking strangers on VoxSim went from
+  0.15 to 0.62.
+
+These numbers were recomputed from cached features. That's exact because
+only Voice's curve, the weights and the headline curve changed in
+`calibration.json`.
 
 Fitting the weights directly to these ratings, with whole systems held out,
 would raise the rank correlation on conversions against their target from
@@ -176,28 +210,30 @@ different sentences. These pairs can't test the parts that need the same
 words, but they test Voice, Pitch and Resonance on recordings like the clips
 you'd use. Resonance here uses median formants instead of aligned ones.
 
-The table shows Spearman rank correlation with the ratings on VoxSim's test
-split, 2,775 pairs:
+The table shows Pearson / Spearman correlation with the ratings on VoxSim's
+test split: 2,775 pairs, none of them used for training.
 
 | Measure | All pairs | Different speakers only |
 | --- | --- | --- |
-| Voice | 0.74 | 0.15 |
-| Pitch | 0.48 | 0.46 |
-| Resonance | 0.47 | 0.49 |
-| **Voice + Pitch + Resonance, app weights** | **0.72** | **0.54** |
+| **Voice (listener model, used)** | **0.785 / 0.770** | **0.590 / 0.621** |
+| Speaker-embedding similarity alone (the previous Voice) | 0.761 / 0.744 | 0.237 / 0.150 |
+| Pitch alone | 0.493 / 0.484 | 0.414 / 0.457 |
+| Resonance alone | 0.400 / 0.467 | 0.326 / 0.492 |
 
-- **Voice tells people apart.** It matches the VoxSim paper's pretrained ECAPA
-  baseline: Pearson 0.761 here against 0.768 there.
-- **Voice barely ranks strangers.** It does little to order strangers by how
-  close they sound, which is exactly what an impression is. Chen et al.
-  (2026) found the same for speaker models trained this way.
-- **Pitch and resonance rank strangers.** They do it three times better, and
-  together with Voice they reach 0.54. A random sample of 3,000 VoxSim
-  training pairs gives the same picture: 0.57 for strangers.
-- **The weights hold up.** Weights fitted on those training pairs gain at
-  most 0.02 on the test split, and only by giving up accuracy elsewhere.
-  Fitted for strangers, they score 0.56 there but drop to 0.59 on all pairs.
-  The app's calibrated weights are near both optima at once.
+- **Embedding similarity tells people apart but barely ranks strangers.** It
+  matches the VoxSim paper's pretrained ECAPA baseline across all pairs
+  (Pearson 0.761 here against 0.768 there). Among strangers it does little to
+  order them by how close they sound, which is exactly what an impression is.
+  Chen et al. (2026) found the same for speaker models trained this way.
+- **Pitch and formant gaps fill the gap.** On their own they rank strangers
+  three times better. So Voice is now a model that combines all three, trained
+  with `tools/train_similarity.py` on 3,037 VoxSim training pairs.
+- **The model does both jobs.** It ranks strangers at 0.62 and beats the
+  pretrained ECAPA baseline across all pairs. Ahn et al.'s GPU-fine-tuned
+  model reaches 0.829; this one gets about half the way there from six numbers
+  and 200 small trees. It ships as plain JSON (`similarity_model.json`), and
+  the training script checks that the JSON gives exactly scikit-learn's
+  predictions.
 
 `tools/validate.py voxsim-fetch` downloads only the 10,953 clips these pairs
 need, about 2.8 GB, from the VoxCeleb1 zips on the Hugging Face mirror. Each
@@ -272,6 +308,8 @@ src/voicematch/
   analysis.py        recording -> pitch, formants, MFCCs on one 10 ms frame grid
   identity.py        speaker embeddings (model download, features, ONNX)
   scoring.py         target + take -> distances -> calibrated scores, hints, chart
+  similarity.py      the listener-similarity model behind Voice
+  similarity_model.json  its trees, from tools/train_similarity.py
   calibration.json   curves and weights from tools/calibrate.py
   speaker_mean.json  mean speaker embedding of 137 unrelated speakers
   store.py           targets and takes on disk
@@ -280,6 +318,7 @@ src/voicematch/
   static/            the page: records, converts to 16 kHz WAV, shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
 tools/validate.py    checks pitch, formants and the whole score against reference data
+tools/train_similarity.py  trains similarity_model.json on VoxSim ratings
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
 
@@ -301,10 +340,11 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
    before trusting it: sherpa-onnx's speaker pipeline wasn't right.
 3. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
-4. **A speaker model that ranks strangers.** On VoxSim the current model
-   barely orders strangers by how close they sound (0.15). Chen et al. (2026)
-   got 0.4–0.5 from prototypical-loss training and up to 0.74 with a
-   low-dimensional bottleneck. Fine-tuning on VoxSim's ratings, as Ahn et al.
-   (2024) do, is the other route. Either would make Voice useful for
-   impressions, not just for identity.
+4. **Train Voice on all of VoxSim.** The listener model was trained on
+   3,037 of VoxSim's 24,921 training pairs. Fetching the rest of the clips
+   (`voxsim-fetch --train-pairs 24921`, about 8 GB) and re-running
+   `tools/train_similarity.py` should help, since tree models gain from more
+   data. Beyond that, fine-tuning the speaker network itself on the ratings
+   (Ahn et al. 2024) or training it with a prototypical loss (Chen et al. 2026)
+   needs a GPU.
 5. **Live feedback.** Show pitch against the target while recording.

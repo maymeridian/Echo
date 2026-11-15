@@ -73,3 +73,10 @@ def test_formant_ceiling_follows_the_vocal_tract(clip):
     # Shorter vocal tracts need a higher ceiling (tools/validate.py formant-lines).
     men = [clip("bdl_arctic_a0001").formant_ceiling, clip("rms_arctic_a0001").formant_ceiling]
     assert clip("slt_arctic_a0001").formant_ceiling > max(men)
+
+
+def test_listener_rating_puts_the_same_man_well_above_strangers(clip):
+    target = clip("bdl_arctic_a0001")
+    assert compare(target, clip("bdl_arctic_a0002"))["listener"] > 4.5  # "probably the same"
+    assert compare(target, clip("rms_arctic_a0001"))["listener"] < 2.5
+    assert compare(target, clip("slt_arctic_a0001"))["listener"] < 2.5

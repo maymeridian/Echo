@@ -48,6 +48,15 @@ from voicematch.scoring import component_scores, measure, overall, weighted
 CALIBRATION = Path(__file__).parents[1] / "src" / "voicematch" / "calibration.json"
 
 
+def low_priority() -> None:
+    """Pool initializer: run workers below normal priority on Windows, so a long
+    calibration doesn't get in the way of whatever else the machine is doing."""
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+
+
 # ---------- simulated microphone and room ----------
 
 
@@ -110,7 +119,7 @@ def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
     meta = {p.stem: parse(p) for p in files}
     print(f"analysing {len(files)} files twice (clean and through a mic)…", file=sys.stderr)
     voices = {}
-    with ProcessPoolExecutor(workers) as pool:
+    with ProcessPoolExecutor(workers, initializer=low_priority) as pool:
         for i, (stem, v) in enumerate(pool.map(analyse_file, files, chunksize=8), 1):
             if v is not None:
                 voices[stem] = v
@@ -157,6 +166,7 @@ def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
             m = measure(voices[t]["clean"], voices[k][take_kind])
             row = {"kind": kind, "target": t, "take": k, **m.distances()}
             row.update(pitch_signed=m.pitch, resonance_signed=m.resonance_shift, tempo_signed=m.tempo)
+            row.update(cosine=m.identity, listener=m.listener)
             f.write(json.dumps(row) + "\n")
     print(f"wrote {len(pairs)} pairs to {out}", file=sys.stderr)
 
@@ -194,7 +204,7 @@ def cohort_mean(cache: Path, workers: int) -> None:
 
     cohort = cohort_files(cache)
     files = sorted({f for fs in cohort.values() for f in fs})
-    with ProcessPoolExecutor(workers) as pool:
+    with ProcessPoolExecutor(workers, initializer=low_priority) as pool:
         emb = dict(pool.map(_raw_embedding, files, chunksize=16))
     cents = [np.mean([emb[f] for f in fs if emb[f] is not None], axis=0) for fs in cohort.values()]
     mean = np.mean(cents, axis=0)
@@ -256,8 +266,8 @@ def fit(pairs_path: Path, write: bool) -> None:
         cells = ["/".join(f"{v:.0f}" for v in np.percentile(table[k], [10, 50, 90])) for k in kinds]
         print(f"{label:14s}" + "".join(f"{c:>13s}" for c in cells))
 
-    def cos(kind):
-        return 1 - np.array(by_kind[kind]["identity"])
+    def cos(kind):  # the speaker check uses the raw embedding similarity
+        return np.array([r["cosine"] for r in rows if r["kind"] == kind])
 
     accept = float(np.quantile(cos("same_sex"), 0.99))  # 1% of same-sex strangers get through
     same = np.concatenate([cos("retake"), cos("delivery"), cos("words")])

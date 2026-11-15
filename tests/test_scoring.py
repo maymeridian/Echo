@@ -66,3 +66,17 @@ def test_noisy_lead_in_and_tail_are_trimmed():
     speech_rms = np.sqrt(np.mean(clean**2))
     noisy = padded + rng.standard_normal(len(padded)).astype(np.float32) * speech_rms / 10  # 20 dB SNR
     assert abs(analyze(noisy).duration - analyze(clean).duration) < 0.15
+
+
+def test_listener_model_is_monotonic_and_handles_gaps():
+    from voicematch import similarity
+
+    base = np.array([0.3, 2.0, 0.5, 0.5, 0.5])  # see similarity.FEATURES
+    for i, direction in enumerate([1, -1, -1, -1, -1]):
+        for step in (0.1, 0.5, 2.0):
+            hi = base.copy()
+            hi[i] += step
+            assert direction * (similarity.predict(hi) - similarity.predict(base)) >= 0
+    no_pitch = base.copy()
+    no_pitch[1] = np.nan  # too little voicing to measure pitch
+    assert 1 <= similarity.predict(no_pitch) <= 6
