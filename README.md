@@ -410,8 +410,17 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
 
 ## Next
 
-1. **Check the scale with real microphones.** Record a few people saying lines
-   twice on different mics, and confirm the real person still lands near 90.
+1. **Check the scale with real microphones.** The calibration's mic is
+   simulated. The app itself can check it with real ones:
+   1. Record yourself saying a line on your phone, and add that recording as
+      a target.
+   2. Record the same line as a take on the computer's mic.
+   3. Repeat with a few lines, and with someone else as the target.
+
+   The real person on another mic should land near 90. Takes of other people
+   imitating that target should mostly land well below. If your own takes come
+   out much lower than 90, the simulated mic was too kind, and the curves need
+   anchoring on real recordings.
 2. **Give Voice more to go on.** The listener model has hit the ceiling of
    its five inputs: eight times more training data changed nothing. Two routes
    could go further:
