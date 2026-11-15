@@ -637,23 +637,47 @@ def voxsim_pairs(root: Path, split: str) -> list[dict]:
         return [{"a": r[0], "b": r[1], "same": r[2] == "1", "rating": float(r[4])} for r in csv.reader(f)]
 
 
-def _fetch_member(fs, zpath: str, info, out: Path) -> bool:
+def _member_from(buf: bytes, base: int, info) -> bytes | None:
+    """One zip member out of a downloaded byte range starting at `base`,
+    checked against its CRC; None if it doesn't check out."""
     import struct
     import zlib
 
-    head = fs.cat_file(zpath, start=info.header_offset, end=info.header_offset + 30)
-    name_len, extra_len = struct.unpack("<HH", head[26:30])
-    start = info.header_offset + 30 + name_len + extra_len
-    data = fs.cat_file(zpath, start=start, end=start + info.compress_size)
+    at = info.header_offset - base
+    if buf[at:at + 4] != b"PK\x03\x04":
+        return None
+    name_len, extra_len = struct.unpack("<HH", buf[at + 26:at + 30])
+    start = at + 30 + name_len + extra_len
+    data = buf[start:start + info.compress_size]
+    if len(data) != info.compress_size:
+        return None
     if info.compress_type == 8:
         data = zlib.decompress(data, -15)
     elif info.compress_type != 0:
-        raise ValueError(f"unsupported compression {info.compress_type}")
-    if zlib.crc32(data) & 0xFFFFFFFF != info.CRC:
-        return False
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(data)
-    return True
+        return None
+    return data if zlib.crc32(data) & 0xFFFFFFFF == info.CRC else None
+
+
+def _fetch_run(fs, zpath: str, run, out: Path) -> int:
+    """Download a run of neighbouring members in one ranged request. Each file
+    is written to a temporary name and renamed, so an interrupted fetch never
+    leaves a partial file behind. Returns how many failed."""
+    first, last = run[0][1], run[-1][1]
+    # Local headers can carry more "extra" bytes than the central directory says.
+    end = last.header_offset + 30 + len(last.filename.encode()) + 1024 + last.compress_size
+    buf = fs.cat_file(zpath, start=first.header_offset, end=end)
+    failed = 0
+    for clip, info in run:
+        data = _member_from(buf, first.header_offset, info)
+        if data is None:
+            failed += 1
+            continue
+        path = out / clip
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    return failed
 
 
 def voxsim_fetch(root: Path, out: Path, train_pairs: int, workers: int) -> None:
@@ -667,22 +691,47 @@ def voxsim_fetch(root: Path, out: Path, train_pairs: int, workers: int) -> None:
     if train_pairs:
         pairs += random.Random(0).sample(voxsim_pairs(root, "train"), train_pairs)
     need = {c for p in pairs for c in (p["a"], p["b"])}
-    todo = {c for c in need if not (out / c).exists()}
-    print(f"{len(need)} clips needed, {len(todo)} to fetch", file=sys.stderr)
     fs = HfFileSystem()
+    bad_sizes = []
     for split, zpath in VOX_ZIPS.items():
         with fs.open(zpath, "rb", block_size=16 * 2**20) as f:
             index = {i.filename.split("wav/", 1)[-1]: i for i in zipfile.ZipFile(f).infolist()}
-        jobs = [(c, index[c]) for c in sorted(todo) if c in index]
-        print(f"{split}: {len(index)} files in the zip, fetching {len(jobs)}", file=sys.stderr)
-        bad = 0
+        todo = []
+        for c in sorted(need):
+            info = index.get(c)
+            if info is None:
+                continue
+            path = out / c
+            if path.exists() and path.stat().st_size != info.file_size:
+                bad_sizes.append(c)  # left over from an interrupted run
+                path.unlink()
+            if not path.exists():
+                todo.append((c, info))
+        todo.sort(key=lambda t: t[1].header_offset)
+        # Members that sit next to each other in the zip come down together.
+        runs, size = [], 0
+        for c, info in todo:
+            gap_free = runs and info.header_offset - runs[-1][-1][1].header_offset < 2 * 2**20 and (
+                info.header_offset <= runs[-1][-1][1].header_offset + 30 + len(runs[-1][-1][1].filename.encode())
+                + 1024 + runs[-1][-1][1].compress_size)
+            if gap_free and size < 16 * 2**20:
+                runs[-1].append((c, info))
+                size += info.compress_size
+            else:
+                runs.append([(c, info)])
+                size = info.compress_size
+        print(f"{split}: {len(todo)} clips to fetch in {len(runs)} requests", file=sys.stderr)
+        failed = 0
         with ThreadPoolExecutor(workers) as pool:
-            futures = [pool.submit(_fetch_member, fs, zpath, info, out / c) for c, info in jobs]
-            for i, fut in enumerate(futures, 1):
-                bad += not fut.result()
+            for i, n in enumerate(pool.map(lambda r, zpath=zpath: _fetch_run(fs, zpath, r, out), runs), 1):
+                failed += n
                 if i % 1000 == 0:
-                    print(f"  {i}/{len(jobs)}", file=sys.stderr)
-        print(f"{split}: {len(jobs) - bad} written, {bad} failed the CRC check", file=sys.stderr)
+                    print(f"  {i}/{len(runs)}", file=sys.stderr)
+        print(f"{split}: {len(todo) - failed} written, {failed} failed their check", file=sys.stderr)
+    if bad_sizes:
+        (out / "refetched.txt").write_text("\n".join(bad_sizes), "utf-8")
+        print(f"{len(bad_sizes)} partial files from an earlier run were fetched again (listed in refetched.txt)",
+              file=sys.stderr)
     missing = [c for c in need if not (out / c).exists()]
     print(f"done; {len(missing)} clips still missing", file=sys.stderr)
 

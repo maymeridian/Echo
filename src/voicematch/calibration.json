@@ -2,8 +2,8 @@
   "source": "RAVDESS speech, 24 actors, takes through a simulated mic and room (tools/calibrate.py)",
   "curves": {
     "identity": {
-      "at90": 1.9838,
-      "at20": 4.038
+      "at90": 2.0317,
+      "at20": 4.1064
     },
     "pitch": {
       "at90": 1.3069,
@@ -39,8 +39,8 @@
     "rhythm": 0.152
   },
   "overall": {
-    "at90": 19.817,
-    "at20": 68.727
+    "at90": 19.815,
+    "at20": 68.474
   },
   "identity_accept": 0.4124,
   "auc": {

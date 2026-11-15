@@ -203,13 +203,13 @@ VoxSim-trained model here (0.56). Before, when Voice was speaker-embedding
 similarity alone, it scored 0.49.
 
 The new Voice costs a little on one slice: conversions compared with their
-target. There the headline's rank correlation dropped from 0.378 to 0.365
-(bootstrap 95% CI for the change, −0.016 to −0.010), even though Voice on its
-own improved from 0.371 to 0.393. The likely reason is that Voice now leans on
+target. There the headline's rank correlation dropped from 0.378 to 0.368
+(bootstrap 95% CI for the change, −0.013 to −0.007), even though Voice on its
+own improved from 0.371 to 0.402. The likely reason is that Voice now leans on
 the pitch gap, which is a weak signal in voice-converted speech, and the
 headline also counts pitch separately. The change was kept for two reasons:
 
-- **Across the rest of VCC2018 the headline improved:** 0.524 to 0.527 per
+- **Across the rest of VCC2018 the headline improved:** 0.524 to 0.528 per
   pair and 0.932 to 0.939 per system.
 - **On real speech the gain is large:** ranking strangers on VoxSim went from
   0.15 to 0.62.
@@ -235,7 +235,7 @@ test split: 2,775 pairs, none of them used for training.
 
 | Measure | All pairs | Different speakers only |
 | --- | --- | --- |
-| **Voice (listener model, used)** | **0.785 / 0.770** | **0.590 / 0.621** |
+| **Voice (listener model, used)** | **0.789 / 0.772** | **0.589 / 0.623** |
 | Speaker-embedding similarity alone (the previous Voice) | 0.761 / 0.744 | 0.237 / 0.150 |
 | Pitch alone | 0.493 / 0.484 | 0.414 / 0.457 |
 | Resonance alone | 0.400 / 0.467 | 0.326 / 0.492 |
@@ -247,16 +247,24 @@ test split: 2,775 pairs, none of them used for training.
   Chen et al. (2026) found the same for speaker models trained this way.
 - **Pitch and formant gaps fill the gap.** On their own they rank strangers
   three times better. So Voice is now a model that combines all three, trained
-  with `tools/train_similarity.py` on 3,037 VoxSim training pairs.
+  with `tools/train_similarity.py` on all 24,919 VoxSim training pairs. Its
+  settings were chosen on 10% of the training speakers, held out; the test
+  split was scored once.
+- **More data didn't move it.** Trained on 3,037 pairs it scored within 0.002
+  of these numbers on the test split. So the limit is the five inputs, not the
+  amount of training data. Adding where two speaker embeddings differ along
+  their 5 to 20 main directions didn't help either: test strangers 0.612 to
+  0.615, against 0.623 without.
 - **The model does both jobs.** It ranks strangers at 0.62 and beats the
   pretrained ECAPA baseline across all pairs. Ahn et al.'s GPU-fine-tuned
-  model reaches 0.829; this one gets about half the way there from six numbers
+  model reaches 0.829; this one gets about half the way there from five numbers
   and 200 small trees. It ships as plain JSON (`similarity_model.json`), and
   the training script checks that the JSON gives exactly scikit-learn's
   predictions.
 
-`tools/validate.py voxsim-fetch` downloads only the 10,953 clips these pairs
-need, about 2.8 GB, from the VoxCeleb1 zips on the Hugging Face mirror. Each
+`tools/validate.py voxsim-fetch` downloads only the clips these pairs need from
+the VoxCeleb1 zips on the Hugging Face mirror: 46,348 clips, about 11 GB, for
+all training and test pairs. It fetches neighbouring clips in one request. Each
 clip is checked against the zip's CRC. You need a Hugging Face login that has
 accepted the mirror's terms.
 
@@ -404,10 +412,11 @@ four CMU ARCTIC clips under their own licence (`COPYING` there).
 
 1. **Check the scale with real microphones.** Record a few people saying lines
    twice on different mics, and confirm the real person still lands near 90.
-2. **Train Voice on all of VoxSim.** The listener model was trained on
-   3,037 of VoxSim's 24,921 training pairs. Fetching the rest of the clips
-   (`voxsim-fetch --train-pairs 24921`, about 8 GB) and re-running
-   `tools/train_similarity.py` should help, since tree models gain from more
-   data. Beyond that, fine-tuning the speaker network itself on the ratings
-   (Ahn et al. 2024) or training it with a prototypical loss (Chen et al. 2026)
-   needs a GPU.
+2. **Give Voice more to go on.** The listener model has hit the ceiling of
+   its five inputs: eight times more training data changed nothing. Two routes
+   could go further:
+   - **Speaking-style features:** pitch range and speaking rate, so the model
+     sees more than timbre and pitch level.
+   - **Fine-tune the speaker network on the ratings:** as Ahn et al. (2024)
+     did, or train it with a prototypical loss (Chen et al. 2026). Either needs
+     a GPU.
