@@ -5,6 +5,7 @@ __pycache__/
 
 # Voice clips and takes stay on this machine, never in git.
 /data/
+/data-backup-*/
 
 # Downloaded models and calibration datasets.
 cache/

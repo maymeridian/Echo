@@ -32,3 +32,24 @@ def test_a_take_cut_short_is_told_which_words_it_left_out():
     result = compare(target, take, transcribe(target.y), transcribe(take.y))
     assert result["line"]["match"] < 1
     assert result["hints"][0].startswith("You left out")
+
+
+
+def test_word_edges_move_onto_the_audio():
+    import numpy as np
+
+    from echo_voice.line import refine_word_times
+
+    sr = 16000
+    t = np.arange(int(2.0 * sr)) / sr
+    y = 0.001 * np.random.default_rng(0).standard_normal(len(t))
+    for a, b in ((0.2, 0.7), (0.9, 1.6)):  # two "words", the second ending at 1.6 s
+        on = (t >= a) & (t < b)
+        y[on] += 0.5 * np.sin(2 * np.pi * 200 * t[on])
+    # As a recogniser might time them: each ending a fifth of a second early.
+    words = [{"text": "one", "start": 0.22, "end": 0.5}, {"text": "two", "start": 0.92, "end": 1.4}]
+    out = refine_word_times(y, words)
+    assert 0.68 <= out[0]["end"] <= 0.8 and 0.82 <= out[1]["start"] <= 0.92  # the pause between them
+    assert 1.58 <= out[1]["end"] <= 1.7  # to where the sound stops
+    assert out[0]["start"] <= 0.22 and all(w["refined"] for w in out)
+    assert refine_word_times(y, out) == out  # moved once

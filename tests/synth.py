@@ -35,3 +35,23 @@ def voice(
             y = lfilter([1.0], [1.0, -2 * r * np.cos(theta), r * r], y)
         parts += [envelope * y / np.max(np.abs(y)), np.zeros(int(0.06 * SR))]
     return np.concatenate(parts[:-1]).astype(np.float32)
+
+
+ARCTIC = __import__("pathlib").Path(__file__).parent / "data" / "arctic"
+
+
+def compilation(clips=("bdl_arctic_a0001", "bdl_arctic_a0002") * 2 + ("slt_arctic_a0001",), gap=1.2, tail=0.0):
+    """Real speech in a row, like a video of a character's voice lines: CMU
+    ARCTIC clips with `gap` s of quiet between them and `tail` s at the end.
+    The default is four lines by bdl (a man) and one by slt (a woman)."""
+    import soundfile as sf
+
+    rng = np.random.default_rng(0)
+    quiet = lambda seconds: 1e-4 * rng.standard_normal(int(seconds * SR))  # noqa: E731
+    parts = []
+    for name in clips:
+        y, sr = sf.read(ARCTIC / f"{name}.wav", dtype="float32")
+        assert sr == SR
+        parts += [0.5 * y / np.max(np.abs(y)), quiet(gap)]
+    parts.append(quiet(tail))
+    return np.concatenate(parts).astype(np.float32)

@@ -39,6 +39,17 @@
         scored raw, after vocal separation, and after two speech denoisers,
         against the clean original.
 
+    python tools/validate.py other-voice --vcc cache/vcc2018
+        The "other voice" tag on lines split from a long recording
+        (sources.py): for each VCC2018 speaker, 30 of their sentences mixed
+        with 8 by three others, all from the same studio, run through the job;
+        three rounds of fresh random picks.
+
+    python tools/validate.py speakers --vcc cache/vcc2018
+        Finding the speakers in a recording (sources.find_speakers): mixes of 1
+        to 4 VCC2018 speakers, how often the count is right and how many lines
+        go to the right speaker, at several thresholds.
+
 Each prints the current method next to the alternatives that were considered.
 """
 
@@ -1068,6 +1079,212 @@ def validate_cleaning(music_dir: Path, workers: int) -> None:
                   f"{med('listener'):13.2f}{med('headline'):10.0f}   ({len(sel) - len(ok)} failed)")
 
 
+# ---------- splitting long recordings: the "other voice" tag ----------
+
+
+def _other_voice_job(item):
+    _low_priority()
+    import random
+
+    from echo_voice import sources
+
+    main_speaker, files, sexes, seed = item
+    rng = random.Random(seed)
+    names = sorted(files)
+    same = [n for n in names if n != main_speaker and sexes[n] == sexes[main_speaker]]
+    other = [n for n in names if sexes[n] != sexes[main_speaker]]
+    plan = [(main_speaker, f) for f in rng.sample(files[main_speaker], 30)]
+    for n in rng.sample(same, 2):
+        plan += [(n, f) for f in rng.sample(files[n], 3)]
+    n = rng.choice(other)
+    plan += [(n, f) for f in rng.sample(files[n], 2)]
+    rng.shuffle(plan)
+    parts, marks, t = [], [], 0.0
+    gap = np.zeros(int(1.2 * SR), np.float32)
+    for who, f in plan:
+        y = load(f)
+        y = 0.5 * y / max(1e-6, float(np.abs(y).max()))
+        marks.append((t, t + len(y) / SR, who))
+        parts += [y, gap]
+        t += (len(y) + len(gap)) / SR
+    y = np.concatenate(parts)
+    out = []
+    for row in sources.measure(y, sources.split_lines(sources.transcribe_words(y))):
+        middle = (row["start"] + row["end"]) / 2
+        who = next((w for a, b, w in marks if a - 0.3 <= middle <= b + 0.3), None)
+        if who is not None and row["same_voice"] is not None:  # skip lines run across two sentences
+            out.append((who == main_speaker, sexes[who] == sexes[main_speaker], row["same_voice"]))
+    return out
+
+
+def validate_other_voice(vcc: Path, rounds: int, workers: int) -> None:
+    from echo_voice.sources import OTHER_VOICE
+
+    files = {}
+    for folder in ("vcc2018_evaluation", "vcc2018_reference"):
+        for d in sorted((vcc / folder).iterdir()):
+            if d.is_dir():
+                files.setdefault(d.name, []).extend(sorted(d.glob("*.wav")))
+    sexes = {n: n[5] for n in files}  # VCC2SF1 -> F
+    items = [(n, files, sexes, 100 * r + i) for r in range(rounds) for i, n in enumerate(sorted(files))]
+    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
+        rows = [r for result in pool.map(_other_voice_job, items) for r in result]
+    main = np.array([s for is_main, _, s in rows if is_main])
+    others = np.array([s for is_main, _, s in rows if not is_main])
+    same_sex = np.array([s for is_main, same, s in rows if not is_main and same])
+    print(f"{len(items)} recordings: {len(main)} main-speaker lines, {len(others)} by others ({len(same_sex)} same sex)")
+    print(f"lowest main-speaker line {main.min():.2f}; highest other {others.max():.2f}")
+    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
+        mark = "  <- used" if threshold == OTHER_VOICE else ""
+        print(
+            f"cosine < {threshold}: main lines tagged {np.mean(main < threshold):.1%}, others {np.mean(others < threshold):.1%}"
+            f" (same sex {np.mean(same_sex < threshold):.1%}){mark}"
+        )
+
+
+# ---------- splitting long recordings: how many speakers, and who said what ----------
+
+
+def _embed_file(path):
+    _low_priority()
+    from echo_voice import identity
+
+    y = load(path)
+    return str(path), identity.embed(y), len(y) / SR
+
+
+def validate_speakers(vcc: Path, workers: int, trials: int = 60) -> None:
+    """Recordings of 1 to 4 VCC2018 speakers (all from one studio): a main
+    speaker with 20 sentences and the others with 4 to 12 each, shuffled. Each
+    sentence stands for one line. Reported per threshold: how often the number
+    of speakers found is right, and how many lines go to the right speaker
+    (after matching found speakers to real ones), to the wrong one, or to none."""
+    import random
+
+    from echo_voice.sources import SPEAKER_SIMILARITY, find_speakers
+
+    files = {}
+    for folder in ("vcc2018_evaluation", "vcc2018_reference"):
+        for d in sorted((vcc / folder).iterdir()):
+            if d.is_dir():
+                files[d.name] = sorted(d.glob("*.wav"))
+    paths = [p for ps in files.values() for p in ps]
+    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
+        done = {p: (e, s) for p, e, s in pool.map(_embed_file, paths, chunksize=8)}
+    rng = random.Random(1)
+    recordings = []
+    for k in (1, 2, 3, 4):
+        for _ in range(trials):
+            who = rng.sample(sorted(files), k)
+            plan = [(who[0], f) for f in rng.sample(files[who[0]], 20)]
+            for name in who[1:]:
+                plan += [(name, f) for f in rng.sample(files[name], rng.randint(4, 12))]
+            rng.shuffle(plan)
+            recordings.append((k, plan))
+    print(f"{len(recordings)} recordings, {trials} each with 1 to 4 speakers")
+    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
+        right_count = defaultdict(int)
+        right = wrong = unsure = total = 0
+        main_right = 0
+        for k, plan in recordings:
+            rows, emb = [], {}
+            for i, (name, f) in enumerate(plan):
+                e, seconds = done[str(f)]
+                rows.append({"start": 0.0, "end": max(seconds, 1.6), "pitch": None, "voiced": 0.5, "confidence": 0.9, "who": name})
+                emb[i] = e
+            found = find_speakers(rows, emb, threshold)
+            right_count[k] += len(found) == k
+            # Match each found speaker to the real one most of its lines belong to.
+            truth = {s["speaker"]: max(set(r["who"] for r in rows if r["speaker"] == s["speaker"]),
+                                       key=lambda n: sum(1 for r in rows if r["speaker"] == s["speaker"] and r["who"] == n))
+                     for s in found}
+            main_right += bool(found) and truth.get(0) == plan_main(plan)
+            for r in rows:
+                total += 1
+                if r["speaker"] is None:
+                    unsure += 1
+                elif truth[r["speaker"]] == r["who"]:
+                    right += 1
+                else:
+                    wrong += 1
+        mark = "  <- used" if threshold == SPEAKER_SIMILARITY else ""
+        counts = ", ".join(f"{k}: {right_count[k] / trials:.0%}" for k in (1, 2, 3, 4))
+        print(
+            f"threshold {threshold}: speaker count right ({counts}); main speaker right {main_right / len(recordings):.0%}; "
+            f"lines right {right / total:.1%}, wrong {wrong / total:.1%}, unsure {unsure / total:.1%}{mark}"
+        )
+
+
+def validate_speakers_wild(vox: Path, workers: int, trials: int = 30) -> None:
+    """The same test on VoxCeleb1: interviews from YouTube, in real rooms,
+    with real microphones and background noise. Each speaker's sentences
+    come from one of their videos, as they would in a single video."""
+    import os
+    import random
+
+    from echo_voice.sources import SPEAKER_SIMILARITY, find_speakers
+
+    rng = random.Random(2)
+    videos = {}  # speaker -> [clips of their best-stocked video]
+    for speaker in sorted(os.listdir(vox)):
+        best = []
+        if not speaker.startswith("id"):
+            continue
+        for video in os.scandir(vox / speaker):
+            if video.is_dir():
+                clips = sorted(Path(video.path).glob("*.wav"))
+                if len(clips) > len(best):
+                    best = clips
+        if len(best) >= 6:
+            videos[speaker] = best
+    main_pool = [s for s, clips in videos.items() if len(clips) >= 12]
+    recordings = []
+    for k in (1, 2, 3):
+        for _ in range(trials):
+            main = rng.choice(main_pool)
+            others = rng.sample([s for s in videos if s != main], k - 1)
+            plan = [(main, f) for f in videos[main][:20]]
+            for name in others:
+                plan += [(name, f) for f in rng.sample(videos[name], 6)]
+            rng.shuffle(plan)
+            recordings.append((k, plan))
+    paths = sorted({str(f) for _, plan in recordings for _, f in plan})
+    print(f"VoxCeleb1: {len(videos)} speakers with a video of 6+ clips; embedding {len(paths)} clips")
+    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
+        done = {p: (e, s) for p, e, s in pool.map(_embed_file, paths, chunksize=8)}
+    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
+        right_count = defaultdict(int)
+        right = wrong = unsure = total = 0
+        for k, plan in recordings:
+            rows, emb = [], {}
+            for i, (name, f) in enumerate(plan):
+                e, seconds = done[str(f)]
+                rows.append({"start": 0.0, "end": seconds, "pitch": None, "voiced": 0.5, "confidence": 0.9, "who": name})
+                emb[i] = e
+            found = find_speakers(rows, emb, threshold)
+            right_count[k] += len(found) == k
+            truth = {s["speaker"]: max(set(r["who"] for r in rows if r["speaker"] == s["speaker"]),
+                                       key=lambda n: sum(1 for r in rows if r["speaker"] == s["speaker"] and r["who"] == n))
+                     for s in found}
+            for r in rows:
+                total += 1
+                if r["speaker"] is None:
+                    unsure += 1
+                elif truth[r["speaker"]] == r["who"]:
+                    right += 1
+                else:
+                    wrong += 1
+        mark = "  <- used" if threshold == SPEAKER_SIMILARITY else ""
+        counts = ", ".join(f"{k}: {right_count[k] / trials:.0%}" for k in (1, 2, 3))
+        print(f"threshold {threshold}: speaker count right ({counts}); lines right {right / total:.1%}, wrong {wrong / total:.1%}, unsure {unsure / total:.1%}{mark}")
+
+
+def plan_main(plan):
+    """The speaker with the most sentences in a simulated recording."""
+    names = [name for name, _ in plan]
+    return max(set(names), key=names.count)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1093,10 +1310,22 @@ def main() -> None:
     ve = sub.add_parser("voxsim")
     ve.add_argument("--voxsim", type=Path, required=True)
     ve.add_argument("--audio", type=Path, required=True)
-    for s in (p, f, fl, v, vf, ve, li, cl):
+    ov = sub.add_parser("other-voice")
+    ov.add_argument("--vcc", type=Path, required=True)
+    ov.add_argument("--rounds", type=int, default=3, help="recordings per speaker, each with fresh random picks")
+    sp = sub.add_parser("speakers")
+    sp.add_argument("--vcc", type=Path, required=True)
+    sp.add_argument("--voxceleb", type=Path, help="also test on VoxCeleb1 interviews (cache/voxceleb1)")
+    for s in (p, f, fl, v, vf, ve, li, cl, ov, sp):
         s.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    if args.command == "pitch":
+    if args.command == "speakers":
+        validate_speakers(args.vcc, args.workers)
+        if args.voxceleb:
+            validate_speakers_wild(args.voxceleb, args.workers)
+    elif args.command == "other-voice":
+        validate_other_voice(args.vcc, args.rounds, args.workers)
+    elif args.command == "pitch":
         validate_pitch(args.ptdb, args.workers)
     elif args.command == "formants":
         validate_formants(args.h95, args.workers)

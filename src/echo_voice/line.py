@@ -18,6 +18,12 @@ from difflib import SequenceMatcher
 import numpy as np
 
 MODEL = "base.en"
+# Beam search at temperature 0 only. faster-whisper's default
+# retries an unsure pass with random sampling at rising temperatures, which
+# made the same audio come back differently from run to run (4 transcripts in
+# 6 runs of one test recording: "Steels", "steals", "et cetera"). With 0 alone
+# all 6 matched. A measuring tool should give the same answer twice.
+TEMPERATURE = 0.0
 _lock = threading.Lock()
 _model = None
 
@@ -38,12 +44,84 @@ def transcribe(y: np.ndarray) -> list[str]:
     with _lock:
         segments, _ = model.transcribe(
             np.ascontiguousarray(y, dtype=np.float32), language="en", beam_size=5,
-            condition_on_previous_text=False, vad_filter=False,
+            condition_on_previous_text=False, vad_filter=False, temperature=TEMPERATURE,
         )
         text = " ".join(s.text for s in segments)
     # Whisper sometimes writes a cut-off word as a run of block characters;
     # anything without a letter or digit isn't a word.
     return [w for w in text.split() if normalise(w)]
+
+
+def transcribe_timed(y: np.ndarray) -> list[dict]:
+    """Like `transcribe`, with where each word starts and ends in seconds.
+    Used for targets, so a take can be compared word by word."""
+    model = _get_model()
+    with _lock:
+        segments, _ = model.transcribe(
+            np.ascontiguousarray(y, dtype=np.float32), language="en", beam_size=5,
+            condition_on_previous_text=False, vad_filter=False, word_timestamps=True, temperature=TEMPERATURE,
+        )
+        words = [
+            {"text": w.word.strip(), "start": round(float(w.start), 2), "end": round(float(w.end), 2)}
+            for s in segments
+            for w in s.words or []
+        ]
+    return refine_word_times(y, [w for w in words if normalise(w["text"]) and w["end"] > w["start"]])
+
+
+def refine_word_times(y: np.ndarray, words: list[dict], sr: int = 16000) -> list[dict]:
+    """Move word edges onto the audio. Whisper's word times are approximate,
+    and it often ends a word early, which cuts the word off when it's played
+    on its own. Between two words the edge goes to the quietest point between
+    them; the first word starts, and the last ends, where the sound does.
+    Each word is marked `refined`, so stored timings are only moved once."""
+    import librosa
+
+    if not words or all(w.get("refined") for w in words):
+        return words
+    hop = 160
+    rms = librosa.feature.rms(y=np.asarray(y, dtype=np.float32), frame_length=400, hop_length=hop)[0]
+    db = 20 * np.log10(np.maximum(rms, 1e-6))
+    floor, peak = float(np.percentile(db, 10)), float(db.max())
+    quiet = floor + max(6.0, 0.2 * (peak - floor))  # near the noise floor: the sound has stopped
+    frame = lambda t: int(np.clip(round(t * sr / hop), 0, len(db) - 1))  # noqa: E731
+    time = lambda f: round(f * hop / sr, 2)  # noqa: E731
+    duration = len(y) / sr
+    out = [dict(w) for w in words]
+    for i in range(len(out) - 1):
+        # The valley between this word and the next, searched a little past
+        # where Whisper put each edge.
+        a = frame(min(out[i]["end"], out[i + 1]["start"]) - 0.08)
+        b = frame(max(out[i]["end"], out[i + 1]["start"]) + 0.25)
+        b = max(a + 1, min(b, frame(out[i + 1]["end"]) - 1))
+        valley = a + int(np.argmin(db[a : b + 1]))
+        if db[valley] < quiet:
+            # A real pause: end this word where it falls quiet, start the next where it rises.
+            lo = valley
+            while lo > a and db[lo - 1] < quiet:
+                lo -= 1
+            hi = valley
+            while hi < b and db[hi + 1] < quiet:
+                hi += 1
+            out[i]["end"], out[i + 1]["start"] = time(lo + 2), time(max(lo + 2, hi - 1))
+        else:
+            out[i]["end"] = out[i + 1]["start"] = time(valley)
+    # The last word runs until the sound stops (within half a second).
+    last = frame(out[-1]["end"])
+    stop = frame(min(duration, out[-1]["end"] + 0.5))
+    while last < stop and db[last] >= quiet:
+        last += 1
+    out[-1]["end"] = max(out[-1]["end"], time(min(last + 3, len(db) - 1)))
+    # The first word starts where the sound does (within a quarter second).
+    first = frame(out[0]["start"])
+    start = frame(max(0.0, out[0]["start"] - 0.25))
+    while first > start and db[first - 1] >= quiet:
+        first -= 1
+    out[0]["start"] = min(out[0]["start"], time(max(0, first - 2)))
+    for w in out:
+        w["refined"] = True
+        w["end"] = max(w["end"], round(w["start"] + 0.05, 2))
+    return out
 
 
 def normalise(word: str) -> str:

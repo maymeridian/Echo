@@ -1,0 +1,20 @@
+{
+  "source": "logistic regression on pitch and resonance; RAVDESS, VCC2018, PTDB-TUG (tools/train_gender.py)",
+  "features": [
+    "median f0, semitones re 100 Hz",
+    "mean F2-F3 shift, semitones re 1500/2500 Hz"
+  ],
+  "mean": [
+    8.8724,
+    0.5955
+  ],
+  "scale": [
+    6.629,
+    1.8391
+  ],
+  "weights": [
+    1.6898,
+    2.6563
+  ],
+  "bias": -0.016
+}
