@@ -689,6 +689,8 @@ button.brand:hover h1 { color: var(--accent); }
 .mic-row .meter { min-width: 40px; }
 #mic-level { height: 100%; width: 0; background: var(--accent); }
 .mic-box .fine { margin: 0; }
+.mic-box label.auto-stop { display: flex; align-items: flex-start; gap: 7px; font-size: 13px; text-transform: none; letter-spacing: 0; color: var(--text); cursor: pointer; }
+.mic-box label.auto-stop input { margin: 2px 0 0; accent-color: var(--accent); }
 .mic-box.attention select { border-color: var(--accent); }
 .mic-box.attention #mic-note { color: var(--accent); font-weight: 600; }
 

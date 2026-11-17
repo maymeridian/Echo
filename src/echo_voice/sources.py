@@ -665,7 +665,15 @@ def run(folder: Path, report=lambda step, share: None) -> int:
                 if meta.pop("joined", False):  # a new video for a voice that has lines: some of its own
                     have = sum(1 for t in store.list_targets() if t.get("voice_id") == meta["voice_id"])
                     want = max(autopick.CHECK_LINES, have + 3)
-                autopick.pick(store, meta["voice_id"], want or autopick.CHECK_LINES, report=lambda d, n: status("picking", d / n))
+
+                def picked(done, total):
+                    # Picking notes the lines it had to skip in this file. Keep them: `meta` is written whole.
+                    skipped = store.source_meta(folder.name).get("skipped")
+                    if skipped:
+                        meta["skipped"] = skipped
+                    status("picking", done / total)
+
+                autopick.pick(store, meta["voice_id"], want or autopick.CHECK_LINES, report=picked)
             except Exception as exc:  # noqa: BLE001 (the lines are found either way; picking is a bonus)
                 print(f"Couldn't pick lines: {exc!r}", file=sys.stderr, flush=True)
         status("ready", None, force=True)

@@ -266,10 +266,12 @@ export function typical(readings, least = 8) {
 }
 
 // How much brighter (+) or darker (-) `mine` is than `target`, in percent: the
-// mean F1-F3 shift between two sets of typical formants, as the scorer measures it.
+// mean shift of F2 and F3 between two sets of typical formants, as the scorer
+// measures it. F1 is left out: on a breathy or high voice the tracker takes
+// the first harmonic for it as often as not.
 export function shift(mine, target) {
   if (!mine || !target) return null;
-  const semitones = [0, 1, 2].reduce((sum, k) => sum + 12 * Math.log2(mine[k] / target[k]), 0) / 3;
+  const semitones = [1, 2].reduce((sum, k) => sum + 12 * Math.log2(mine[k] / target[k]), 0) / 2;
   return (2 ** (semitones / 12) - 1) * 100;
 }
 
@@ -344,6 +346,6 @@ export function alignedShift(mine, target, { open = false, most = 240 } = {}) {
     } else if (up <= left) i--;
     else j--;
   }
-  const semitones = gaps.reduce((sum, g) => sum + median(g), 0) / 3;
+  const semitones = (median(gaps[1]) + median(gaps[2])) / 2; // F2 and F3, as the scorer reads Resonance
   return (2 ** (semitones / 12) - 1) * 100;
 }

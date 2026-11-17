@@ -7,7 +7,7 @@ be indexed with the same frame numbers after time alignment.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 
@@ -16,7 +16,7 @@ import numpy as np
 import parselmouth
 import soundfile as sf
 
-from . import identity
+from . import identity, line
 
 SR = 16000
 HOP = 160  # 10 ms
@@ -24,6 +24,8 @@ N_FFT = 400  # 25 ms
 MAX_SECONDS = 30.0
 MIN_SECONDS = 0.3
 MIN_VOICED_FRAMES = 20  # 0.2 s of voiced sound before pitch is trusted
+STRAY = 0.15  # s: a sound shorter than this, on its own at either end, is not part of the line
+APART = 0.4  # s of quiet between it and the rest
 
 PITCH_FLOOR = 60.0
 PITCH_CEILING = 600.0
@@ -57,8 +59,37 @@ class Voice:
     formants: np.ndarray  # (3, frames) F1-F3 in Hz, NaN where unvoiced
     formant_ceiling: float  # Hz, the one this recording picks for itself (or was given)
     mfcc: np.ndarray  # (12, frames), mean-normalised, energy dropped
-    steady: np.ndarray | None = None  # F1-F3 tracked at the speaker's ceiling (steadied)
+    steady: np.ndarray | None = None  # F1-F3 tracked at the ceiling Resonance reads at (steadied)
     steady_ceiling: float | None = None
+    tracks: dict = field(default_factory=dict, repr=False, compare=False)  # F1-F3 at other ceilings (at)
+
+    def at(self, ceiling: float) -> np.ndarray:
+        """F1-F3 tracked at `ceiling` on the voiced frames, worked out once."""
+        ceiling = float(ceiling)
+        if ceiling == self.formant_ceiling:
+            return self.formants
+        if ceiling not in self.tracks:
+            snd = parselmouth.Sound(self.y.astype(np.float64), sampling_frequency=SR)
+            self.tracks[ceiling] = _tracks_at(snd, self.times, np.flatnonzero(self.voiced), ceiling)
+        return self.tracks[ceiling]
+
+    @cached_property
+    def sounds(self) -> np.ndarray:
+        """What a speech recogniser hears, one frame every 20 ms (line.sounds):
+        what recordings are lined up by, and what Articulation compares."""
+        return line.sounds(self.y)
+
+    @cached_property
+    def sound(self) -> np.ndarray:
+        """For each of those frames: is there sound, within 40 dB of the
+        loudest? Pauses, a silent lead-in or tail, and a gated microphone's
+        gaps are left out of what is compared."""
+        hop = int(line.SOUND_STEP * SR)
+        rms = librosa.feature.rms(y=self.y, frame_length=2 * hop, hop_length=hop)[0]
+        db = 20 * np.log10(np.maximum(rms, 1e-10))
+        on = db > db.max() - 40
+        n = len(self.sounds)
+        return on[:n] if len(on) >= n else np.concatenate([on, np.zeros(n - len(on), dtype=bool)])
 
     @property
     def duration(self) -> float:
@@ -83,11 +114,20 @@ class Voice:
     def spoken(self) -> slice:
         """Frames from the first to the last voiced sound, plus 50 ms either side
         for unvoiced consonants. Leaves out breaths, sighs and clicks at the
-        edges, which differ from take to take but aren't part of the line."""
+        edges, which differ from take to take but aren't part of the line. A
+        voiced blip on its own at either end (under 50 ms, with more than
+        APART seconds between it and the rest) is left out too: a click or a
+        breath can read as voiced for a frame or two."""
         idx = np.flatnonzero(self.voiced)
         if idx.size < MIN_VOICED_FRAMES:
             return slice(0, len(self.times))
-        return slice(max(0, idx[0] - 5), min(len(self.times), idx[-1] + 6))
+        runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
+        apart = APART * SR / HOP
+        while len(runs) > 1 and len(runs[-1]) < 5 and runs[-1][0] - runs[-2][-1] > apart:
+            runs.pop()
+        while len(runs) > 1 and len(runs[0]) < 5 and runs[1][0] - runs[0][-1] > apart:
+            runs.pop(0)
+        return slice(max(0, runs[0][0] - 5), min(len(self.times), runs[-1][-1] + 6))
 
     @property
     def spoken_duration(self) -> float:
@@ -174,6 +214,13 @@ def _trim(y: np.ndarray, pad: float = 0.05) -> np.ndarray:
     A fixed "40 dB below the peak" rule never fires in a room with audible
     noise, and then a second of hiss at each end skews timing, alignment and
     the speaker embedding. So the cut-off sits above the measured noise floor.
+
+    A short sound on its own at either end is cut too: the click on Stop lands
+    a second after the last word, and with it in, the quiet before it was
+    lined up against the end of the target (on the saved takes, appending a
+    second of silence and a click moved Rhythm by 49 points for one take in
+    ten). It goes when it lasts under STRAY seconds and more than APART
+    seconds of quiet lie between it and the rest.
     """
     rms = librosa.feature.rms(y=y, frame_length=N_FFT, hop_length=HOP)[0]
     db = 20 * np.log10(np.maximum(rms, 1e-10))
@@ -182,9 +229,15 @@ def _trim(y: np.ndarray, pad: float = 0.05) -> np.ndarray:
     loud = np.flatnonzero(db > threshold)
     if loud.size == 0:
         return y
+    runs = np.split(loud, np.flatnonzero(np.diff(loud) > 1) + 1)
+    seconds = HOP / SR
+    while len(runs) > 1 and len(runs[-1]) * seconds < STRAY and (runs[-1][0] - runs[-2][-1]) * seconds > APART:
+        runs.pop()
+    while len(runs) > 1 and len(runs[0]) * seconds < STRAY and (runs[1][0] - runs[0][-1]) * seconds > APART:
+        runs.pop(0)
     margin = int(pad * SR)
-    start = max(0, loud[0] * HOP - margin)
-    end = min(len(y), (loud[-1] + 1) * HOP + N_FFT // 2 + margin)
+    start = max(0, runs[0][0] * HOP - margin)
+    end = min(len(y), (runs[-1][-1] + 1) * HOP + N_FFT // 2 + margin)
     return y[start:end]
 
 
@@ -248,18 +301,25 @@ def speaker_ceiling(picks) -> float | None:
     return float(min(FORMANT_CEILINGS, key=lambda c: abs(c - middle)))
 
 
+def shared_ceiling(a: float | None, b: float | None) -> float | None:
+    """One formant ceiling for a pair of recordings: the middle of the two
+    speakers' ceilings, on the grid. Read at different ceilings, the same audio
+    is not level with itself (a copy of a line read at 4750 against 5250 Hz
+    scored 3 to 24 on four of five lines), so both sides are read at one."""
+    picks = [float(c) for c in (a, b) if c]
+    if not picks:
+        return None
+    return float(min(FORMANT_CEILINGS, key=lambda c: (abs(c - sum(picks) / len(picks)), c)))
+
+
 def steadied(voice: Voice, ceiling: float | None) -> Voice:
-    """The recording with F1-F3 also tracked at its speaker's ceiling, for
-    Resonance. Everything else (typical formants, the listener model, gender
+    """The recording with F1-F3 also tracked at the ceiling Resonance reads
+    it at. Everything else (typical formants, the listener model, gender
     read) keeps the tracks the recording picked for itself, as those were fitted."""
     if ceiling is None or ceiling == voice.steady_ceiling:
         return voice
-    if ceiling == voice.formant_ceiling:
-        tracks = voice.formants
-    else:
-        snd = parselmouth.Sound(voice.y.astype(np.float64), sampling_frequency=SR)
-        tracks = _tracks_at(snd, voice.times, np.flatnonzero(voice.voiced), float(ceiling))
-    out = replace(voice, steady=tracks, steady_ceiling=float(ceiling))
-    if "embedding" in voice.__dict__:  # already worked out; no need to run the model again
-        out.__dict__["embedding"] = voice.__dict__["embedding"]
+    out = replace(voice, steady=voice.at(ceiling), steady_ceiling=float(ceiling))
+    for name in ("embedding", "sounds", "sound"):  # already worked out; no need to run the models again
+        if name in voice.__dict__:
+            out.__dict__[name] = voice.__dict__[name]
     return out

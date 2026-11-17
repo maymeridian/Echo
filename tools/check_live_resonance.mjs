@@ -5,12 +5,13 @@
 //   node tools/check_live_resonance.mjs cache/live_resonance_ref.json
 //
 // The reference has 12 VCC2018 speakers reading the same 12 sentences, each
-// with its speaker's formant ceiling. The tracker sees each recording as the
-// page would, at the file's own rate, and is compared on:
+// with its speaker's formant ceiling, and for every pair the one ceiling the
+// app reads both at. The tracker sees each recording as the page would, at
+// the file's own rate, and is compared on:
 //
 //   typical F1-F3   against Praat's at the same ceiling
 //   the gap between two speakers on one sentence, in percent brighter or
-//   darker, two ways:
+//   darker (from F2 and F3, both read at the pair's ceiling), two ways:
 //     the trainer's live ring (typical formants) against the trainer's measure
 //     the line page's live meter (the two lined up first, formants.alignedShift)
 //     against a take's Resonance, which the app measures along its own alignment
@@ -95,10 +96,21 @@ for (const k of [0, 1, 2]) {
   console.log(`  F${k + 1}  median ${median(errors).toFixed(1)}% apart, over 5% in ${share(errors, (e) => e > 5)}, over 10% in ${share(errors, (e) => e > 10)}`);
 }
 
+// A recording as the tracker reads it at a pair's ceiling, worked out once.
+const at = new Map();
+function read(i, ceiling) {
+  const key = `${i}@${ceiling}`;
+  if (!at.has(key)) {
+    const { rate, samples } = readWav(ref.files[i].path);
+    const frames = track(samples, rate, ceiling).map((f) => f.f);
+    at.set(key, { frames, typical: typical(frames) });
+  }
+  return at.get(key);
+}
 const WAYS = [
-  ["typical", "the trainer's live ring against the trainer's measure (typical formants)", (p) => shift(live[p.take], live[p.target])],
-  ["aligned", "the line page's live meter against a take's Resonance (both lined up)", (p) => alignedShift(readings[p.take], readings[p.target], { open: true })],
-  ["aligned", "the same without lining up, as the meter first was", (p) => shift(live[p.take], live[p.target])],
+  ["typical", "the trainer's live ring against the trainer's measure (typical formants)", (p) => shift(read(p.take, p.ceiling).typical, read(p.target, p.ceiling).typical)],
+  ["aligned", "the line page's live meter against a take's Resonance (both lined up)", (p) => alignedShift(read(p.take, p.ceiling).frames, read(p.target, p.ceiling).frames, { open: true })],
+  ["aligned", "the same without lining up, as the meter first was", (p) => shift(read(p.take, p.ceiling).typical, read(p.target, p.ceiling).typical)],
 ];
 for (const [key, label, read] of WAYS) {
   const rows = ref.pairs

@@ -359,6 +359,30 @@ class Store:
         )
         return record
 
+    def take_records(self, target_id: str) -> list[dict]:
+        """Every take on a line, whole, oldest first."""
+        return _listed(sorted((self._target_dir(target_id) / "takes").glob("*.json")))
+
+    def replace_take(self, target_id: str, record: dict) -> None:
+        """Write a take's record again (scored anew), and the line's summary with it."""
+        takes = self._target_dir(target_id) / "takes"
+        _write(takes / f"{record['id']}.json", json.dumps(record))
+        records = sorted(_listed(takes.glob("*.json")), key=lambda r: r["created"])
+        self.update_target(
+            target_id,
+            takes=len(records),
+            best=max(r["overall"] for r in records),
+            last=records[-1]["created"],
+            last_score=records[-1]["overall"],
+        )
+
+    def replace_drill(self, target_id: str, record: dict) -> None:
+        """Write a trainer attempt's record again (measured anew)."""
+        _write(self._target_dir(target_id) / "drills" / f"{record['id']}.json", json.dumps(record))
+
+    def replace_check(self, voice_id: str, record: dict) -> None:
+        _write(self.voice_dir(voice_id) / "checks" / f"{record['id']}.json", json.dumps(record))
+
     def takes_for_voice(self, voice_id: str, limit: int = 10) -> list[dict]:
         """The latest takes on any of a voice's lines, newest last."""
         records = []

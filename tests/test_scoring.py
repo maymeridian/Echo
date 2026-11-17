@@ -115,7 +115,7 @@ def test_the_coach_picks_what_costs_most_and_sticks_with_it_until_it_is_good():
     assert first["coach"]["progress"] is None
 
     # Better, and resonance is now worse, but not by enough to switch.
-    second_scores = base | {"pitch": 70, "resonance": 60}
+    second_scores = base | {"pitch": 70, "resonance": 65}
     second = parts(**second_scores) | {"coach": coach(parts(**second_scores), first)}
     assert second["coach"]["focus"] == "pitch" and second["coach"]["why"] == "keep"
     assert second["coach"]["progress"] == {"key": "pitch", "label": "Pitch", "before": 40, "after": 70}
@@ -211,17 +211,25 @@ def test_gender_read_follows_pitch_and_resonance():
     assert gender.describe(85) == "female" and gender.describe(50) == "in between" and gender.describe(10) == "male"
 
 
-def test_resonance_reads_formants_at_one_ceiling_per_speaker():
+def test_resonance_reads_both_recordings_at_one_ceiling_from_f2_and_f3():
     import numpy as np
 
-    from echo_voice.analysis import FORMANT_CEILINGS, speaker_ceiling, steadied
-    from echo_voice.scoring import measure
+    from echo_voice.analysis import (
+        FORMANT_CEILINGS,
+        shared_ceiling,
+        speaker_ceiling,
+        steadied,
+    )
+    from echo_voice.scoring import RESONANCE_FRAMES, measure, resonance_ceilings
 
     # The middle of what the recordings of a speaker pick, on the grid; nothing with nothing to go by.
     assert speaker_ceiling([4500, 5000, 6000]) == 5000.0
     assert speaker_ceiling([4500, 5000]) == 4750.0
     assert speaker_ceiling([None, 5500.0]) == 5500.0
     assert speaker_ceiling([]) is None
+    # A pair is read at the middle of its two speakers' ceilings, on the grid.
+    assert shared_ceiling(4750, 5250) == 5000.0 and shared_ceiling(5000, 5250) == 5000.0
+    assert shared_ceiling(None, 5500) == 5500.0 and shared_ceiling(None, None) is None
 
     target = analyze(voice())
     other = next(c for c in FORMANT_CEILINGS if c != target.formant_ceiling and c >= 6000)
@@ -233,7 +241,17 @@ def test_resonance_reads_formants_at_one_ceiling_per_speaker():
     assert steadied(target, None) is target and steadied(steady, other) is steady
     assert np.array_equal(steadied(target, target.formant_ceiling).resonance_formants, target.formants, equal_nan=True)
 
-    # A recording against itself at one ceiling is still a perfect match, whatever that ceiling is.
+    # A recording against itself is a perfect match whatever ceiling each side was last read at:
+    # both are read at one, and at four more around it.
     assert measure(steady, steady).resonance == 0
-    # Measured at two different ceilings, the same voice no longer reads as identical.
-    assert measure(target, steady).resonance > 0
+    assert measure(target, steady).resonance == 0
+    middle, around = resonance_ceilings(steady, steady)
+    assert middle == other and around == [c for c in (other - 500, other - 250, other, other + 250, other + 500) if c <= 7000]
+    assert np.array_equal(target.at(other), steady.resonance_formants, equal_nan=True)
+
+    # A vocal tract 10% shorter reads 1.65 semitones brighter, from F2 and F3.
+    brighter = measure(target, analyze(voice(formant_scale=1.1)))
+    assert brighter.resonance == pytest.approx(1.65, abs=0.1) and brighter.resonance_shift == pytest.approx(1.65, abs=0.1)
+    # Too little voiced sound in common, and it is not read at all.
+    short = analyze(voice(vowel_seconds=0.1))
+    assert short.voiced.sum() < RESONANCE_FRAMES and measure(short, short).resonance is None

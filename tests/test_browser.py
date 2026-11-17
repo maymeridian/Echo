@@ -87,7 +87,9 @@ def record(page, button: str, seconds: float = 2.5, check_live: bool = False, fr
     if fresh and page.is_visible("#mic-off"):
         # The microphone stays open between takes, and the fake one keeps looping its file.
         # Turning it off first starts the file again, so two takes hear the same thing.
+        # The browser needs a moment to let go of the device, or it carries on where it was.
         page.click("#mic-off")
+        page.wait_for_timeout(1500)
     page.click(button)
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Recording')")
     page.wait_for_timeout(seconds * 1000)
@@ -594,3 +596,108 @@ def test_a_microphone_that_hears_nothing_is_called_out(server, silent_page, tmp_
     page.wait_for_function("document.querySelector('#mic-note').textContent.startsWith('No sound came from')")
     assert "attention" in page.get_attribute("#mic-box", "class")
     assert page.errors == []
+
+
+@pytest.fixture
+def pausing_page(tmp_path):
+    # Someone who says the line and then says nothing: half a second of quiet, the voice, six seconds of quiet.
+    quiet = np.zeros(SR // 2, dtype=np.float32)
+    yield from open_page(tmp_path, np.concatenate([quiet, voice(f0=140), np.tile(quiet, 12)]))
+
+
+def test_a_take_stops_by_itself_when_the_line_has_been_said(server, pausing_page, tmp_path):
+    page = pausing_page
+    a_line(server, tmp_path)
+    open_the_line(page, server)
+    assert page.is_checked("#auto-stop") and "it stops when you finish" in page.inner_text(".recorder .keys")
+    page.click("#record")
+    page.wait_for_function("document.querySelector('#status').textContent.startsWith('Recording')")
+    assert "It stops when you finish" in page.text_content("#status")
+    # No second click: the take ends about a second after the voice does, long before the 30 s limit.
+    page.wait_for_selector("#result:not([hidden])", timeout=20000)
+    assert page.text_content("#record-label") == "Record a take"
+    line = httpx.get(f"{server}/api/targets").json()[0]
+    assert line["takes"] == 1
+
+    # Switched off in the sidebar, a take runs until it is stopped by hand. The choice is remembered.
+    page.uncheck("#auto-stop")
+    assert page.evaluate("localStorage.getItem('echo.autostop')") == "off"
+    assert "starts and stops" in page.inner_text(".recorder .keys")
+    page.click("#mic-off")  # start the microphone's file again: the voice, then the quiet
+    page.wait_for_timeout(1500)
+    page.click("#record")
+    page.wait_for_function("document.querySelector('#status').textContent.startsWith('Recording')")
+    page.wait_for_timeout(6000)  # the voice ended more than three seconds ago
+    assert page.text_content("#record-label") == "Stop" and "It stops" not in page.text_content("#status")
+    page.click("#record")
+    page.wait_for_function("document.querySelector('#record-label').textContent === 'Record a take'")
+    for _ in range(100):
+        if httpx.get(f"{server}/api/targets").json()[0]["takes"] == 2:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("the take stopped by hand was not scored")
+    page.reload()
+    page.wait_for_selector("#practice:not([hidden])")
+    assert not page.is_checked("#auto-stop")
+    assert page.errors == []
+
+
+def test_a_trainer_attempt_stops_by_itself(server, pausing_page):
+    page = pausing_page
+    made = httpx.post(f"{server}/api/voices", json={"name": "Real"}).json()
+    clip = ARCTIC / "bdl_arctic_a0001.wav"
+    line = httpx.post(
+        f"{server}/api/targets", params={"name": "clip", "voice": made["id"]}, content=clip.read_bytes(), timeout=180
+    ).json()
+    open_the_line(page, server)
+    page.click("#record")
+    page.wait_for_selector("#result:not([hidden])", timeout=30000)
+    page.click("#components li:has-text('Resonance') .train-btn")
+    page.wait_for_selector("#train:not([hidden])")
+    page.click("#mic-off")
+    page.wait_for_timeout(1500)
+    page.click("#train-say")
+    page.wait_for_function("document.querySelector('#train-say-label').textContent === 'Stop'")
+    # The voice lasts 1.8 s. The attempt ends well before the 6 s it is allowed.
+    page.wait_for_function("document.querySelector('#train-say-label').textContent === 'Say it'", timeout=4500)
+    page.wait_for_selector("#train-attempts li", timeout=20000)
+    assert len(httpx.get(f"{server}/api/targets/{line['id']}/drills").json()) == 1
+    assert page.errors == []
+
+
+def test_hearing_the_end_of_a_line(server, page):
+    """ending.js on made-up levels: speech at one level, a room at another, sixty readings a second."""
+    page.goto(server)
+    run = """async ({ lead, speech, room, voice, wait, enough }) => {
+        const { Ending, waitFor, spoken } = await import('/ending.js');
+        const ending = new Ending({ wait, enough });
+        let t = 0;
+        const hear = (seconds, level) => {
+            for (let i = 0; i < seconds * 60; i++) {
+                t += 1 / 60;
+                if (ending.hear(level * (0.7 + 0.6 * ((i * 7919) % 13) / 13), t)) return true;
+            }
+            return false;
+        };
+        const early = hear(lead, room) || hear(speech, voice);
+        const from = t;
+        const over = hear(6, room);
+        const words = [{ start: 0, end: 1 }, { start: 1.4, end: 2 }, { start: 2.1, end: 3 }];
+        return { early, after: over ? t - from : null, wait: waitFor(words), none: waitFor([]), spoken: spoken(words) };
+    }"""
+    # The whole line, in a quiet room and in a noisy one: it ends after the quiet it was told to wait for.
+    for room in (0.0, 0.0005, 0.01):
+        heard = page.evaluate(run, {"lead": 0.5, "speech": 2.0, "room": room, "voice": 0.1, "wait": 1.0, "enough": 1.0})
+        assert not heard["early"] and 1.0 <= heard["after"] < 1.15, (room, heard)
+    # Speaking from the first moment, with no quiet before it to measure the room by.
+    heard = page.evaluate(run, {"lead": 0, "speech": 2.0, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.0})
+    assert not heard["early"] and 1.0 <= heard["after"] < 1.15, heard
+    # A false start: half a second of a three-second line. It waits longer before giving up.
+    heard = page.evaluate(run, {"lead": 0.5, "speech": 0.5, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.5})
+    assert not heard["early"] and 2.5 <= heard["after"] < 2.65, heard
+    # A click is not speech: nothing ends on it.
+    heard = page.evaluate(run, {"lead": 0.5, "speech": 0.1, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 0})
+    assert not heard["early"] and heard["after"] is None, heard
+    # The quiet to wait for comes from the line: a little more than its longest pause, within limits.
+    assert heard["wait"] == pytest.approx(1.3) and heard["none"] == pytest.approx(0.9) and heard["spoken"] == pytest.approx(2.5)

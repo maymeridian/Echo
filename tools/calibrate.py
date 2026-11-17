@@ -16,17 +16,31 @@ component's weight in the overall score is how much better than chance it tells
 a retake from a stranger (AUC - 0.5). The weighted mean then goes through one
 more curve with the same two anchors, so the headline means the same thing.
 
+Articulation is the exception. It compares the sounds, as a speech recogniser
+hears them, and a stranger reading the same line makes nearly the same sounds:
+anchored at the stranger, the whole scale would sit inside the difference
+between two microphones. Its 20 is another line altogether:
+
+  other_line  the same speaker saying a different sentence (VCC2018, which has
+              35 sentences from each of 8 speakers; RAVDESS has two sentences
+              that share four of their six words)
+
+So Articulation reads how much of the line's sounds were matched: about 90 for
+the real person again, lower for a stranger reading it their own way, 20 for
+different words. Its weight is still how well it tells a retake from a stranger.
+
 The target is always the clean studio file. The take goes through a simulated
 microphone and room (band limit, reverb, noise), because in real use the
 target comes from a clip and the take from your own mic.
 
-Resonance reads formants at one ceiling per speaker (analysis.steadied). The
-app has about five lines of a voice and a few takes of yours to choose it
-from, so here each recording is tracked at the middle of its own pick and the
+Resonance reads both recordings of a pair at one formant ceiling: the middle
+of the two speakers' ceilings (analysis.shared_ceiling). The app has about
+five lines of a voice and a few takes of yours to choose each speaker's from,
+so here a recording's speaker ceiling is the middle of its own pick and the
 picks of four other recordings of the same actor through the same channel.
 
     python tools/calibrate.py cohort-mean               # writes speaker_mean.json
-    python tools/calibrate.py collect --ravdess cache/ravdess --out cache/pairs.jsonl
+    python tools/calibrate.py collect --ravdess cache/ravdess --vcc cache/vcc2018/vcc2018_evaluation --out cache/pairs.jsonl
     python tools/calibrate.py fit cache/pairs.jsonl     # writes calibration.json
 
 Download: https://zenodo.org/records/1188976 (Audio_Speech_Actors_01-24.zip).
@@ -48,14 +62,16 @@ import numpy as np
 from scipy.signal import butter, fftconvolve, sosfilt
 
 from echo_voice.analysis import (
+    FORMANT_CEILINGS,
     SR,
     AnalysisError,
     analyze,
     load,
+    shared_ceiling,
     speaker_ceiling,
     steadied,
 )
-from echo_voice.scoring import component_scores, measure, overall, weighted
+from echo_voice.scoring import component_scores, curve, measure, overall, weighted
 
 CALIBRATION = Path(__file__).parents[1] / "src" / "echo_voice" / "calibration.json"
 
@@ -121,12 +137,28 @@ def analyse_file(path: Path):
             voice = analyze(audio)
         except AnalysisError:
             return path.stem, None
-        _ = voice.embedding  # compute in the worker
+        _ = voice.embedding, voice.sound  # compute in the worker: the models, and what the recogniser hears
+        for ceiling in (4000.0, 4250.0, *FORMANT_CEILINGS):  # every ceiling a pair may be read at
+            voice.at(ceiling)
         out[kind] = voice
     return path.stem, out
 
 
-def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
+def heard_file(path: Path):
+    """A recording as the recogniser hears it, clean and through a microphone: all Articulation needs."""
+    y = load(path)
+    out = {}
+    for kind, audio in (("clean", y), ("mic", channel(y, zlib.crc32(str(path).encode())))):
+        try:
+            voice = analyze(audio)
+        except AnalysisError:
+            return str(path), None
+        _ = voice.sound
+        out[kind] = voice
+    return str(path), out
+
+
+def collect(ravdess: Path, out: Path, workers: int, seed: int, vcc: Path | None = None) -> None:
     files = sorted(ravdess.glob("Actor_*/03-01-*.wav"))
     meta = {p.stem: parse(p) for p in files}
     print(f"analysing {len(files)} files twice (clean and through a mic)…", file=sys.stderr)
@@ -149,10 +181,6 @@ def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
             for stem in stems:
                 others = ceiling_rng.sample([s for s in stems if s != stem], 4)
                 ceilings[(stem, kind)] = speaker_ceiling(voices[s][kind].formant_ceiling for s in (stem, *others))
-    for i, ((stem, kind), ceiling) in enumerate(ceilings.items(), 1):
-        voices[stem][kind] = steadied(voices[stem][kind], ceiling)
-        if i % 500 == 0:
-            print(f"  formants at the speaker ceiling: {i}/{len(ceilings)}", file=sys.stderr)
 
     by_key = {}
     for stem, m in meta.items():
@@ -191,12 +219,40 @@ def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
             if t not in voices or k not in voices:
                 continue
             take_kind = "clean" if kind.endswith("_clean") else "mic"
-            m = measure(voices[t]["clean"], voices[k][take_kind])
+            ceiling = shared_ceiling(ceilings[(t, "clean")], ceilings[(k, take_kind)])
+            m = measure(steadied(voices[t]["clean"], ceiling), steadied(voices[k][take_kind], ceiling))
             row = {"kind": kind, "target": t, "take": k, **m.distances()}
             row.update(pitch_signed=m.pitch, resonance_signed=m.resonance_shift, tempo_signed=m.tempo)
             row.update(cosine=m.identity, listener=m.listener)
             f.write(json.dumps(row) + "\n")
-    print(f"wrote {len(pairs)} pairs to {out}", file=sys.stderr)
+        far = other_lines(vcc, workers, seed) if vcc else []
+        for row in far:
+            f.write(json.dumps(row) + "\n")
+    print(f"wrote {len(pairs)} pairs and {len(far)} other-line pairs to {out}", file=sys.stderr)
+
+
+def other_lines(vcc: Path, workers: int, seed: int, per_speaker: int = 40) -> list[dict]:
+    """The far anchor for Articulation: one speaker saying two different
+    sentences, the second through a microphone."""
+    files = sorted(vcc.glob("VCC2S*/3*.wav"))
+    print(f"hearing {len(files)} VCC2018 files twice…", file=sys.stderr)
+    heard = {}
+    with ProcessPoolExecutor(workers, initializer=low_priority) as pool:
+        for name, v in pool.map(heard_file, files, chunksize=8):
+            if v is not None:
+                heard[name] = v
+    rng = random.Random(seed + 2)
+    by_speaker = defaultdict(list)
+    for f in files:
+        if str(f) in heard:
+            by_speaker[f.parent.name].append(str(f))
+    rows = []
+    for speaker, names in sorted(by_speaker.items()):
+        for _ in range(per_speaker):
+            a, b = rng.sample(names, 2)
+            m = measure(heard[a]["clean"], heard[b]["mic"])
+            rows.append({"kind": "other_line", "target": f"{speaker}/{Path(a).stem}", "take": f"{speaker}/{Path(b).stem}", "articulation": m.articulation})
+    return rows
 
 
 # ---------- cohort mean for speaker embeddings ----------
@@ -259,6 +315,10 @@ def auc(good: np.ndarray, bad: np.ndarray) -> float:
 def fit(pairs_path: Path, write: bool) -> None:
     with open(pairs_path, encoding="utf-8") as f:
         rows = [json.loads(line) for line in f]
+    far = [r["articulation"] for r in rows if r["kind"] == "other_line"]
+    if not far:
+        sys.exit("No other_line pairs: Articulation needs them for its far anchor. Collect with --vcc.")
+    rows = [r for r in rows if r["kind"] != "other_line"]
     by_kind = defaultdict(lambda: defaultdict(list))
     for r in rows:
         for k in KEYS:
@@ -267,18 +327,28 @@ def fit(pairs_path: Path, write: bool) -> None:
     kinds = ["retake_clean", "retake", "delivery", "words", "stranger", "same_sex", "cross_sex"]
     print(f"{'median distance':14s}" + "".join(f"{k:>13s}" for k in kinds) + "   AUC")
     curves, aucs = {}, {}
+    med_art = {}
     for key in KEYS:
         med = {kind: float(np.median(by_kind[kind][key])) for kind in kinds}
+        if key == "articulation":
+            med_art = med
         aucs[key] = auc(np.array(by_kind["retake"][key]), np.array(by_kind["stranger"][key]))
         print(f"{key:14s}" + "".join(f"{med[k]:13.3f}" for k in kinds) + f"   {aucs[key]:.2f}")
         curves[key] = {"at90": round(med["retake"], 4), "at20": round(med["stranger"], 4)}
+    # Articulation: 20 is another line altogether (see the top of this file).
+    curves["articulation"]["at20"] = round(float(np.median(far)), 4)
+    print(f"articulation, another line by the same speaker ({len(far)} pairs): {np.median(far):.3f}")
+    for kind in kinds:
+        print(f"  articulation scores a median {kind} pair {curve(med_art[kind], **curves['articulation']):.0f}")
 
     raw = {k: max(0.02, aucs[k] - 0.5) for k in KEYS}
+    # Rhythm is tempo and timing, each counted by how well it tells a retake from a stranger.
+    rhythm = {k: round(raw[k] / (raw["tempo"] + raw["timing"]), 3) for k in ("tempo", "timing")}
     raw["rhythm"] = raw.pop("tempo") + raw.pop("timing")
     weights = {k: round(v / sum(raw.values()), 3) for k, v in raw.items()}
-    print("\nweights", weights)
+    print("\nweights", weights, "| rhythm is", rhythm)
 
-    cal = {"curves": curves, "weights": weights}
+    cal = {"curves": curves, "weights": weights, "rhythm": rhythm}
     means = defaultdict(list)
     for r in rows:
         means[r["kind"]].append(weighted(component_scores({k: r[k] for k in KEYS}, cal), weights))
@@ -311,6 +381,7 @@ def fit(pairs_path: Path, write: bool) -> None:
             source="RAVDESS speech, 24 actors, takes through a simulated mic and room (tools/calibrate.py)",
             curves=curves,
             weights=weights,
+            rhythm=rhythm,
             overall=cal["overall"],
             identity_accept=round(accept, 4),
             auc={k: round(v, 3) for k, v in aucs.items()},
@@ -324,6 +395,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     c = sub.add_parser("collect")
     c.add_argument("--ravdess", type=Path, required=True)
+    c.add_argument("--vcc", type=Path, help="VCC2018 evaluation folder, for Articulation's far anchor")
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--workers", type=int, default=8)
     c.add_argument("--seed", type=int, default=0)
@@ -335,7 +407,7 @@ def main() -> None:
     f.add_argument("--dry-run", action="store_true", help="print, don't write calibration.json")
     args = parser.parse_args()
     if args.command == "collect":
-        collect(args.ravdess, args.out, args.workers, args.seed)
+        collect(args.ravdess, args.out, args.workers, args.seed, args.vcc)
     elif args.command == "cohort-mean":
         cohort_mean(args.cache, args.workers)
     else:

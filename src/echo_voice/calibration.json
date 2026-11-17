@@ -2,54 +2,58 @@
   "source": "RAVDESS speech, 24 actors, takes through a simulated mic and room (tools/calibrate.py)",
   "curves": {
     "identity": {
-      "at90": 2.0317,
-      "at20": 4.1064
+      "at90": 2.0301,
+      "at20": 4.0994
     },
     "pitch": {
       "at90": 1.3069,
       "at20": 4.8992
     },
     "melody": {
-      "at90": 1.2246,
-      "at20": 2.0401
+      "at90": 1.1873,
+      "at20": 2.0098
     },
     "resonance": {
-      "at90": 0.5447,
-      "at20": 1.2935
+      "at90": 0.29,
+      "at20": 0.8283
     },
     "articulation": {
-      "at90": 0.2476,
-      "at20": 0.3638
+      "at90": 0.1116,
+      "at20": 0.5452
     },
     "tempo": {
-      "at90": 0.0961,
-      "at20": 0.2553
+      "at90": 0.0958,
+      "at20": 0.2527
     },
     "timing": {
-      "at90": 0.0541,
-      "at20": 0.0698
+      "at90": 0.0234,
+      "at20": 0.0445
     }
   },
   "weights": {
-    "identity": 0.233,
-    "pitch": 0.145,
-    "melody": 0.117,
-    "resonance": 0.165,
-    "articulation": 0.189,
-    "rhythm": 0.151
+    "identity": 0.228,
+    "pitch": 0.142,
+    "melody": 0.113,
+    "resonance": 0.184,
+    "articulation": 0.127,
+    "rhythm": 0.206
   },
   "overall": {
-    "at90": 20.112,
-    "at20": 68.505
+    "at90": 19.332,
+    "at20": 62.973
   },
-  "identity_accept": 0.4124,
+  "identity_accept": 0.4073,
   "auc": {
     "identity": 0.989,
-    "pitch": 0.805,
-    "melody": 0.745,
-    "resonance": 0.846,
-    "articulation": 0.896,
+    "pitch": 0.804,
+    "melody": 0.742,
+    "resonance": 0.893,
+    "articulation": 0.772,
     "tempo": 0.729,
-    "timing": 0.587
+    "timing": 0.713
+  },
+  "rhythm": {
+    "tempo": 0.518,
+    "timing": 0.482
   }
 }

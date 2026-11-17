@@ -226,3 +226,57 @@ def test_a_links_voice_is_named_after_its_channel_and_a_second_video_joins_it(tm
 
     third, meta = pasted(None, "Ellie - All Voice Lines | The Last of Us Part II")  # no channel known
     assert store.voice_meta(third["id"])["name"] == "Ellie" and store.voice_meta(third["id"])["named_from"] == "title"
+
+
+def test_a_line_that_starts_mid_sentence_is_widened_or_left_out(tmp_path, monkeypatch):
+    """The recording's transcript can miss a sentence's first words. The cut, read by itself, shows it."""
+    from synth import voice
+
+    from echo_voice import autopick
+
+    store = Store(tmp_path)
+    owner = store.new_voice("Someone")
+    meta, folder = store.new_source("a recording", status="ready")
+    store.update_source(meta["id"], voice_id=owner["id"])
+    sf.write(folder / sources.AUDIO, np.tile(voice(), 6), SR, format="FLAC")
+    row = lambda text, start, end: {
+        "text": text, "start": start, "end": end, "flags": [], "pitch": 120, "voiced": 0.6, "confidence": 0.9, "same_voice": 0.9, "speaker": 0,
+    }
+    rows = [
+        row("So there is that.", 0.2, 1.4),
+        row("Boats came back before dark.", 3.0, 5.5),  # "Most of the" was missed, 0.5 s before it
+        row("Than me, at least.", 5.5, 7.6),  # the same breath: no room to look back
+    ]
+    (folder / sources.LINES).write_text(json.dumps(rows), "utf-8")
+    recording = store.source_meta(meta["id"])
+    monkeypatch.setattr(autopick.clean, "vocals", lambda y: y)
+
+    def heard(y):
+        seconds = len(y) / SR
+        said = {
+            2.5: "the boats came back before dark.",  # the cut as the recording gave it
+            3.3: "Most of the boats came back before dark.",  # looked 0.8 s further back
+            1.2: "So there is that.",
+        }.get(round(seconds, 1), "then me, at least.")
+        return [{"text": w, "start": i * 0.2, "end": i * 0.2 + 0.2} for i, w in enumerate(said.split())]
+
+    monkeypatch.setattr(autopick.line, "transcribe_timed", lambda y: heard(y))
+    monkeypatch.setattr(autopick, "analyze", lambda y: type("V", (), {"y": y, "duration": len(y) / SR, "median_f0": 120.0, "formant_ceiling": 5000.0})())
+    monkeypatch.setattr(store, "add_target", lambda name, cleaned, words, original, **more: {"id": f"line{len(words)}", "name": name, "words": words, "seconds": len(original) / SR, **more})
+    monkeypatch.setattr(store, "tick_line", lambda *a: None)
+
+    # A line that starts where its sentence does is cut as the recording says.
+    whole = autopick.add_from_recording(store, recording, rows[0], auto=True)
+    assert whole["name"] == "So there is that." and whole["seconds"] == pytest.approx(1.2, abs=0.01)
+    # One that starts mid-sentence is widened back to the sentence's start, and named as it is heard.
+    widened = autopick.add_from_recording(store, recording, rows[1], auto=True)
+    assert widened["words"][:3] == ["Most", "of", "the"] and widened["seconds"] == pytest.approx(3.3, abs=0.01)
+    assert widened["name"].startswith("Most of the boats") and widened["line_start"] == 3.0
+    # With no room to look back, auto-pick leaves it out and remembers, so it isn't suggested again.
+    assert autopick.add_from_recording(store, recording, rows[2], auto=True) is None
+    assert store.source_meta(meta["id"])["skipped"] == [5.5]
+    monkeypatch.setattr(autopick.sources, "rank", lambda rows, speaker=0: [(3.0, 2), (2.0, 0)])
+    assert [s["text"] for s in autopick.suggestions(store, owner["id"])] == ["So there is that."]
+    # Picked by hand it is still added, as heard.
+    by_hand = autopick.add_from_recording(store, recording, rows[2])
+    assert by_hand["name"] == "then me, at least." and by_hand["auto"] is False

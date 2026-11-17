@@ -53,6 +53,25 @@ this decision") asks once. It turns off after 15 minutes unused, or with
 **Turn off**. If nothing at all is coming from it, the page says so while you
 record.
 
+**A take stops by itself.** Once you've said the line, the take ends about a
+second after your last word. The page listens to the microphone's level and
+waits for a quiet a little longer than the longest pause between the line's
+own words (0.9 to 2 seconds). What counts as speaking is judged against the
+room, 10 dB above its noise floor, so a soft voice still counts and a fan
+doesn't. If you've said less than half the line it waits longer (2.5 s), so a
+false start or a breath doesn't end the take. A scored attempt in the trainer
+stops the same way. Warming up and "Try it live" run until you stop them, and
+the button and Space still stop a take at any moment. Untick **Stop a take
+when I finish speaking** under the microphone list to stop by hand.
+
+Played back to the detector with room noise put in, none of 62 saved takes
+was ended while the line was still being said, and a take ended a median
+1.3 s after its last word (9 in 10 within 2.1 s):
+
+```powershell
+node tools\check_ending.mjs data
+```
+
 To score two files without the app:
 
 ```powershell
@@ -191,6 +210,12 @@ The sidebar lists voices, and nothing else. A voice's page has:
     suggested before, at 98–99 Hz against her typical 191.
 
   "Pick by hand" opens the recording's whole list.
+
+  A line is read again by itself when it is added. If its first word isn't
+  the one the recording's transcript starts it with, the transcript missed
+  the start of the sentence (on a 25-minute video, the fifth-best line began three words into its sentence). The cut is then widened
+  back by up to 0.8 s, never into the line before. Auto-pick leaves out a
+  line that still starts mid-sentence, and it isn't suggested again.
 - **Add lines.** Paste a link, upload a file (over a minute long, it's split
   into lines; shorter, it becomes one line), or record a clip.
 - **Recordings.** Each one, with how many lines were found and how many you've
@@ -275,7 +300,8 @@ say what to do next at every point.
   trend across all your takes on the line.
 - **Warm up.** This records with the live guide but saves nothing: use it to
   find the target's pitch before a scored take.
-- **Space** starts and stops a take.
+- **Space** starts a take. It stops by itself when you've finished; Space or
+  the button stops it sooner.
 
 The word-by-word numbers are the line's own measures restricted to one word,
 scored on the line's curves:
@@ -284,8 +310,8 @@ scored on the line's curves:
 | --- | --- |
 | Pitch | Gap between the two medians |
 | Melody | That gap minus the typical gap over the line |
-| Resonance | Mean F1–F3 shift |
-| Articulation | MFCC distance along the alignment |
+| Resonance | Mean shift of F2 and F3 |
+| Articulation | Distance between what a speech recogniser hears in each, along the alignment |
 
 Rhythm isn't scored per word, because the alignment moves word edges by a
 frame or two. On a synthetic voice shifted 3.9 semitones, every word reads
@@ -425,7 +451,28 @@ always an octave error on a creaky or breathy stretch.
 
 **About 90:** what the real person scores saying the line again on a different
 microphone. **About 20:** a stranger of the same sex saying the same line their
-own way. Each part of the breakdown uses the same scale.
+own way. Each part of the breakdown uses the same scale, with one exception.
+
+**Articulation** compares the sounds themselves, as a speech recogniser hears
+them, whoever is speaking. A stranger reading the same line makes nearly the
+same sounds, so its 20 is not the stranger: it is a different sentence
+altogether. About 90 is the real person saying the line again, a stranger
+reading it their own way scores around 77, and saying other words scores 20.
+It tells you how closely you shape the line's sounds, not whose voice it is.
+
+**Vocal fry** is shown beside the parts and not counted: how much of the
+target's voiced sound drops into a low creak (more than 7 semitones under the
+voice's usual pitch), and how much of yours. A line that is mostly fry reads
+an octave low, which is why some lines can't be scored on Pitch; this row
+says so in plain terms. Ordinary speech reads 2-13%, so only a gap against
+the target means anything.
+
+**Scores from an earlier version** are worked out again. Each result is
+stamped with the scoring it came from (`scoring.SCORING`). When that changes,
+the app scores every saved take again from its own audio the next time it
+starts, in the background, measures the trainer's saved attempts again, and
+works the voice checks out again from the takes, so a best, a trend or the
+trainer's map never mixes two scales.
 
 The Voice part also says, in words, what listeners would likely answer if asked
 whether the two recordings are the same speaker. For example: "probably the
@@ -466,18 +513,23 @@ correct take (see Validation).
 
 ## How it works
 
-The take is time-aligned to the target (dynamic time warping over MFCCs), so
-most measurements compare the same moment of the line in both recordings. That
-part needs **both recordings to say the same words**.
+The take is time-aligned to the target, so most measurements compare the same
+moment of the line in both recordings. That part needs **both recordings to
+say the same words**. The alignment is dynamic time warping over what a speech
+recogniser hears in each recording: the frames of Whisper's encoder, one every
+20 ms (`line.sounds`). It was over MFCCs until 1.1.0. MFCCs carry the voice as
+much as the words, and the recogniser's frames put a line's words nearer to
+where the take's own transcript has them (a median 50 ms off against 80 ms,
+and over 200 ms off for 6% of words against 16%, on 30 real takes).
 
 | Part | Weight | What is compared |
 | --- | --- | --- |
-| Voice | 23.3% | The rating listeners would likely give the pair; doesn't depend on the words |
-| Pitch | 14.5% | Median pitch, in semitones |
-| Melody | 11.7% | Shape of the pitch contour once the level difference is removed |
-| Resonance | 16.5% | Formants F1–F3 on aligned voiced frames (brighter or darker), at one formant ceiling per speaker |
-| Articulation | 18.9% | MFCC distance along the alignment (how the sounds are shaped) |
-| Rhythm | 15.1% | Length from first to last voiced sound, and timing within the line |
+| Voice | 22.8% | The rating listeners would likely give the pair; doesn't depend on the words |
+| Pitch | 14.2% | Median pitch, in semitones |
+| Melody | 11.3% | Shape of the pitch contour once the level difference is removed |
+| Resonance | 18.4% | Formants F2 and F3 on aligned voiced frames (brighter or darker), both recordings read at one formant ceiling |
+| Articulation | 12.7% | Distance between what the recogniser hears in each, where both have sound (how the sounds are shaped) |
+| Rhythm | 20.6% | Pace: length from first to last voiced sound. Timing: how unevenly the take is stretched against the target between those |
 
 Voice is a small model trained on human ratings (VoxSim, below). It predicts
 the listener rating from three things:
@@ -492,9 +544,13 @@ It's constrained so that more similarity can only raise the rating and bigger
 gaps can only lower it.
 Pitch and formants come from Praat (via parselmouth). Each recording gets its
 own formant ceiling: the one, from 4500 to 7000 Hz, whose tracks jump least from
-frame to frame. Resonance reads formants at one ceiling per speaker instead,
-the middle of what that speaker's recordings pick (see Formants, below). MFCCs
-and alignment come from librosa.
+frame to frame. Resonance reads both recordings at one ceiling instead, the
+middle of the two speakers' (see Formants, below). The alignment itself comes
+from librosa.
+
+Before anything is measured a recording is trimmed to its sound, and a short
+sound on its own at either end is cut with the quiet around it: the click on
+Stop lands a second after the last word.
 
 ### Calibration
 
@@ -507,8 +563,16 @@ the target is a clip and the take comes from your own mic.
 - **Curves:** each measure's curve puts 90 at the median distance between an
   actor and their own retake, and 20 at the median distance to a same-sex
   stranger.
-- **Weights:** each part counts in proportion to how well it tells those two
-  apart (AUC − 0.5).
+- **Articulation's 20** is another sentence altogether: the same speaker
+  saying a different line (320 pairs from VCC2018, which has 35 sentences
+  from each of 8 speakers; RAVDESS's two sentences share four of their six
+  words). On that curve a median stranger reading the right line scores 77,
+  an actor's own other sentence 64, and an actor of the other sex 79: it
+  doesn't hear whose voice it is.
+- **Weights:** each part counts in proportion to how well it tells a retake
+  from a stranger (AUC − 0.5): Voice 0.99, Resonance 0.89, Pitch 0.80,
+  Articulation 0.77, Melody 0.74, pace 0.73, timing 0.71. Rhythm is pace and
+  timing mixed in the same proportion (52% and 48%).
 - **Headline:** the weighted mean goes through one more curve with the same
   anchors.
 
@@ -516,25 +580,30 @@ Headline scores on the calibration pairs (10th / 50th / 90th percentile):
 
 | Pair | Score |
 | --- | --- |
-| Same actor, same line, clean | 67 / 98 / 100 |
-| Same actor, same line, through a mic | 42 / 90 / 100 |
-| Same actor, different emotion | 28 / 71 / 97 |
-| Same actor, other sentence | 27 / 58 / 83 |
-| Same-sex stranger, same line | 11 / 20 / 43 |
-| Other-sex stranger, same line, same emotion | 10 / 14 / 24 |
+| Same actor, same line, clean | 57 / 96 / 100 |
+| Same actor, same line, through a mic | 43 / 90 / 100 |
+| Same actor, different emotion | 24 / 58 / 95 |
+| Same actor, other sentence | 28 / 65 / 93 |
+| Same-sex stranger, same line | 11 / 20 / 42 |
+| Other-sex stranger, same line, same emotion | 10 / 15 / 26 |
 
-Resonance is measured as the app measures it, at one formant ceiling per
-speaker. The app has about five lines of a voice and a few of your takes to
-choose that from, so `collect` tracks each recording at the middle of its own
-pick and the picks of four other recordings of the same actor through the same
-channel.
+The headline tells an actor's retake from a stranger at AUC 0.964 (0.962
+before 1.1.0), so rebuilding three of its parts did not cost it anything
+there. "Same actor, other sentence" rose from 58 because Articulation now
+scores two sentences that share four words of six as mostly the same sounds.
+
+Resonance is measured as the app measures it: both recordings of a pair at
+the middle of their two speakers' formant ceilings. The app has about five
+lines of a voice and a few of your takes to choose each speaker's from, so
+`collect` gives a recording the middle of its own pick and the picks of four
+other recordings of the same actor through the same channel.
 
 To re-run it, download `Audio_Speech_Actors_01-24.zip` from Zenodo and unzip
 it into `cache/ravdess`, then:
 
 ```powershell
 .\.venv\Scripts\python tools\calibrate.py cohort-mean
-.\.venv\Scripts\python tools\calibrate.py collect --ravdess cache\ravdess --out cache\pairs.jsonl
+.\.venv\Scripts\python tools\calibrate.py collect --ravdess cache\ravdess --vcc cache\vcc2018\vcc2018_evaluation --out cache\pairs.jsonl
 .\.venv\Scripts\python tools\calibrate.py fit cache\pairs.jsonl
 ```
 
@@ -549,9 +618,9 @@ agrees with the scale:
 
 | ARCTIC pair | Score |
 | --- | --- |
-| Another man, same line | 30 |
-| A woman, same line | 26 |
-| Same man, other sentence (passes the speaker check) | 74 |
+| Another man, same line | 28 (Articulation 92) |
+| A woman, same line | 30 (Articulation 96) |
+| Same man, other sentence (passes the speaker check) | 72 (Articulation 24) |
 | Same man, through a simulated mic | above 85 |
 
 ### Things that were wrong and are now tested
@@ -575,12 +644,98 @@ agrees with the scale:
   formants. Resonance now uses one ceiling per speaker (see Formants).
   A trainer attempt on one word chose its own ceiling too, and a word is too
   short for that; it now uses yours.
+- **Articulation heard the voice:** it was the MFCC distance along the
+  alignment, and MFCCs carry the speaker as much as the sounds. On RAVDESS a
+  stranger saying the right line (0.364) was as far as the right actor saying
+  the other sentence (0.368), and a real take against a breathy voice sat past
+  both, so it read 0 whatever was said. It now compares what a speech
+  recogniser hears (see How it works).
+- **The first formant on breathy and high voices:** near 190 Hz Praat's F1
+  flips between the first harmonic and the formant. Across takes of one line
+  its shift varied by 0.7 to 2.4 semitones, and the whole Resonance curve
+  from 90 to 20 was 0.75 wide. Resonance now reads F2 and F3.
+- **Two ceilings for one comparison:** the line was read at its voice's
+  formant ceiling and the take at its speaker's. Read at 4750 Hz against 5250, a
+  copy of a line scored 3 to 24 against itself on four of five lines. Both
+  are now read at one ceiling, and at four more around it, and the middle
+  reading counts.
+- **The click on Stop:** it lands a second after the last word, the trim kept
+  it, and the quiet before it was lined up against the end of the target.
+  The trim now drops a short sound on its own at either end.
+- **Timing was half of Rhythm:** it told a retake from a stranger at AUC 0.59
+  and its curve from 90 to 20 spanned 0.054 to 0.070, so any wobble in the
+  alignment moved Rhythm. It is now read at ten stretches of the line, between
+  each recording's first and last voiced sound, and tells the two apart at
+  0.71. Pace is still the length from first to last voiced sound, now without
+  a voiced blip on its own at either end. Reading pace from the alignment
+  (the span of everything with sound) was tried and dropped: a breath after
+  the last word has sound, and takes read up to 50% slow.
+- **A suggested line that started mid-sentence:** see Suggested lines.
 
 ## Validation
 
 `tools/validate.py` checks each measurement against data with known answers.
 The data goes in the ignored `cache/`. Each command's docstring says where to
 download it.
+
+### The audit behind 1.1.0
+
+Every part was put through two tests in November 2026. The scripts are in the
+ignored `cache/experiments/audit/`, `articulation/` and `resonance_check/`.
+
+**Known answers.** The calibration pairs come in kinds whose right answer is
+known. A part should score a stranger low, and should not care which of two
+people says the wrong words. Median score of each kind of pair, before and
+after:
+
+| Part | Same actor, other sentence | Same-sex stranger, same line | Other sex, same line |
+| --- | --- | --- | --- |
+| Voice | 88, 88 | 20, 20 | 11, 11 |
+| Pitch | 87, 87 | 20, 20 | 5, 5 |
+| Melody | 69, 75 | 20, 20 | 36, 33 |
+| Resonance | 84, 66 | 20, 20 | 1, 4 |
+| Articulation | 18, 64 | 20, 77 | 11, 79 |
+
+Articulation was the one that failed: it scored a stranger saying the right
+line (20) the same as the right actor saying the other sentence (18), and it
+told those two apart at AUC 0.51, a coin toss. It now does at 0.81, and an
+actor of the other sex reading the right line scores what a same-sex stranger
+does. Resonance now reads a different sentence as a difference (66 from 84):
+it compares the vowels the two recordings line up on, and those are other
+vowels.
+
+**Changes that should not matter.** 70 real practice takes against a breathy
+voice were each scored, changed in a way nobody would hear as a different
+performance, and scored again. Points the score moved, as median / 9 takes in
+10 within, before and after:
+
+| Change | Voice | Melody | Resonance | Articulation | Rhythm | Headline |
+| --- | --- | --- | --- | --- | --- | --- |
+| A second of silence and a click after the take | 0.7 / 5.8, 0.0 / 1.0 | 0.5 / 12.8, 0.0 / 1.5 | 1.5 / 38.0, 0.0 / 6.1 | 4.1 / 19.1, 0.0 / 0.2 | 9.9 / 48.9, 0.0 / 1.4 | 2.6 / 11.1, 0.0 / 1.5 |
+| A quarter second of faint room tone either side | 0.5 / 5.8, 0.0 / 2.7 | 0.1 / 6.1, 0.0 / 1.7 | 0.2 / 9.2, 0.0 / 9.2 | 0.2 / 1.2, 0.0 / 1.5 | 1.3 / 7.9, 0.0 / 1.3 | 0.3 / 4.3, 0.0 / 2.5 |
+| 30 ms cut off each end | 0.8 / 5.9, 0.3 / 4.1 | 0.0 / 6.9, 0.2 / 10.0 | 0.3 / 6.2, 3.3 / 18.7 | 0.7 / 4.6, 0.9 / 3.1 | 1.5 / 37.6, 0.3 / 4.1 | 0.6 / 7.2, 1.3 / 5.6 |
+| Hiss 40 dB under the speech | 2.5 / 9.4, 2.2 / 7.9 | 0.6 / 9.5, 0.1 / 9.6 | 2.5 / 24.8, 8.1 / 42.3 | 1.6 / 11.3, 0.9 / 5.6 | 0.6 / 31.3, 0.1 / 1.6 | 1.6 / 9.4, 2.1 / 9.7 |
+
+Pitch moved by 0.0 / 0.2 or less in every row, before and after. The click
+on Stop is dealt with, and Rhythm now holds still: one take in ten used to
+move 31 to 49 points, and now moves 1 to 4. Resonance looks worse in the last
+two rows, and
+that needs reading with care: before, these takes scored a median 13 on
+Resonance, on the flat floor of its curve, where a score cannot move. They
+now score a median 33, on its slope. In semitones the new reading moves by a
+median 0.053 for the cut and 0.058 for the hiss (43 of the takes); read from
+all three formants the same way it moves 0.072 and 0.065, and tells a retake
+from a stranger worse (AUC 0.84 against 0.89 on 260 pairs). But the slope is
+steep: the curve runs from 90 to 20 over half a semitone. **Resonance on one
+short take is a rough reading: small things move it 3 to 8 points for a
+typical take and 19 to 42 for one in ten. Judge it over several takes.** From
+the third take on a line, the Resonance row says where your last three takes
+sit together (the middle of their shifts), which is steadier than any one.
+
+**The same takes, scored again.** Articulation went from a median 8 (1 to 28
+across the takes) to 65 (44 to 75). Scored against the voice's other lines,
+the wrong words, the same takes get a median 21, and the right line scores
+higher for 96% of them. Melody went from 14 to 31 (the takes are lined up better), Rhythm from 50 to 57, and the headline from a median 28 to 29.
 
 ### Against human judgments
 
@@ -592,17 +747,32 @@ from 1 (different, sure) to 4 (same, sure). Each converted clip is, in effect,
 a machine's impression of the target voice. That makes this the closest public
 test of what the app measures.
 
-| Measure | Per pair | Per system |
-| --- | --- | --- |
-| **Headline** | **0.53** | **0.94** |
-| Voice | 0.56 | 0.95 |
-| Pitch | 0.47 | 0.78 |
-| Resonance | 0.42 | 0.91 |
-| Articulation | 0.21 | 0.33 |
+| Measure | Per pair, 1.0.0 | Per system, 1.0.0 | Per pair, 1.1.0 | Per system, 1.1.0 |
+| --- | --- | --- | --- | --- |
+| **Headline** | **0.53** | **0.94** | **0.48** | **0.90** |
+| Voice | 0.56 | 0.95 | 0.55 | 0.94 |
+| Pitch | 0.47 | 0.78 | 0.48 | 0.78 |
+| Resonance | 0.42 | 0.91 | 0.39 | 0.91 |
+| Articulation | 0.21 | 0.33 | −0.11 | −0.49 |
 
 The table shows Pearson correlation with the mean listener rating. The
 per-system column averages over 72 groups (system × compared-with × task),
 each with many ratings.
+
+**The headline agrees less with these listeners since 1.1.0, and that is the
+price of Articulation meaning what it says.** The listeners were asked one
+thing: is this the same speaker? A converted clip is its source speaker's
+recording with the voice swapped, so it keeps the source's sounds and timing.
+The old Articulation rose with the listeners' ratings (0.21) because it heard
+the voice. The new one hears the sounds, which in this test belong to the
+source speaker, so it falls with them (−0.11), as Melody (−0.05) and Rhythm
+(−0.13) always have here. Voice, the part that answers the listeners'
+question, is where it was. This test cannot say whether a headline that
+counts delivery is a better measure of an impression: nobody in it was
+imitating anyone's delivery. A listening test of real impressions would, and
+there isn't a public one. If the headline should track "same speaker?" above
+all, the remedy is to weigh Voice more, not to make Articulation hear voices
+again. Run on 2026-11-17: `tools/validate.py vcc2018`, 21,343 pairs.
 
 Rechecked on 2026-11-16 after Resonance was recalibrated for one ceiling per
 speaker: the headline is unchanged at 0.528 per pair and 0.939 per system
@@ -722,8 +892,9 @@ Praat's Burg tracker step by step: 50 ms frames, resampled to twice the
 speaker's formant ceiling, pre-emphasis from 50 Hz, Praat's Gaussian window,
 ten coefficients, and the three lowest roots between 50 Hz and 50 Hz under the
 ceiling. The page reads the target's audio and the microphone with the same
-code and the same per-speaker ceilings the scorer uses, so a gap between them
-is a gap between the voices.
+code, at the one ceiling the scorer reads both at, and says brighter or
+darker from F2 and F3 as the scorer does, so a gap between them is a gap
+between the voices.
 
 On the same audio and the same frames it lands a median 1.1% (F1), 0.8% (F2)
 and 0.7% (F3) from Praat, with no lean either way. Which frames count matters
@@ -735,15 +906,19 @@ as the loudest frame so far, which finds 93% of Praat's voiced frames with 6%
 extra. That test was chosen on two sentences; the check below uses ten others.
 
 Checked on 120 recordings (12 VCC2018 speakers, the same 10 sentences each),
-against what the app measures:
+against what the app measures. These are the numbers since 1.1.0, when
+Resonance went to F2 and F3 at a shared ceiling and to the new alignment.
+Before, with all three formants, the two meters agreed with the app at
+correlations 0.983 and 0.987: the meter lines sounds up by their formants and
+the scorer now by what a recogniser hears, so the two differ a little more.
 
 | | Result |
 | --- | --- |
 | Typical F1 / F2 / F3 against Praat at the same ceiling | 2.2% / 1.2% / 0.6% apart (median) |
-| The gap between two speakers on a sentence, against the trainer's measure (660 pairs) | correlation 0.983; a median 1.5 points apart; within 3 points in 81% |
-| Says the right way, brighter or darker, when the app puts them 3% or more apart | 99% of 559 pairs |
-| The line page's meter, lined up first, against a take's Resonance (660 pairs) | correlation 0.987; a median 1.5 points apart; within 3 points in 81%; right way in 100% |
-| The same without lining up, as the meter first was | correlation 0.962; a median 2.4 points apart; within 3 points in 60% |
+| The gap between two speakers on a sentence, against the trainer's measure (660 pairs) | correlation 0.933; a median 1.4 points apart; within 3 points in 77% |
+| Says the right way, brighter or darker, when the app puts them 3% or more apart | 98% of 467 pairs |
+| The line page's meter, lined up first, against a take's Resonance (557 pairs it could be read on) | correlation 0.903; a median 1.7 points apart; within 3 points in 70%; right way in 95% |
+| The same without lining up, as the meter first was | correlation 0.736; a median 3.2 points apart; within 3 points in 47% |
 | The pitch gap between two speakers, the live tracker on both sides against Praat on both | correlation 0.982; a median 0.31 semitones apart; over 1 semitone in 11% |
 
 **Lining up.** Typical formants over a whole line depend on how long each
@@ -834,6 +1009,26 @@ recording's own pick, because that is how they were fitted (VoxSim pairs are
 single clips with no other recordings of the speaker). The experiment is in
 `cache/experiments/ceiling/` (`ceiling_exp.py`, `boot.py`, `user_takes.py`).
 
+**One ceiling for both sides, and F2 and F3 only (1.1.0).** Two ceilings in
+one comparison turned out to be a fault of their own: formants read at 4750 Hz
+sit a little lower than the same audio read at 5250, so a line was not level
+with a copy of itself. And on a breathy voice near 190 Hz the first formant
+could not be read at all steadily: Praat's F1 flipped between the first
+harmonic (about 250 Hz) and the formant (about 430). So Resonance now:
+
+- reads both recordings at one ceiling, the middle of the voice's and yours
+  (`analysis.shared_ceiling`), and at 250 and 500 Hz either side of it, and
+  takes the middle of the five readings;
+- reads F2 and F3 only;
+- isn't read with fewer than 60 aligned voiced frames (two takes with 31 and
+  40 gave junk, one of them +8.4 semitones).
+
+On the calibration pairs its AUC went from 0.846 to 0.89, and its curve is
+wider: 90 at 0.29 semitones and 20 at 0.83, where it was 0.54 and 1.29. It is
+unread on 1.4% of retakes and 2.8% of strangers, RAVDESS lines being short.
+The live meter and the trainer read F2 and F3 at the same shared ceiling. The
+experiments are in `cache/experiments/resonance_check/`.
+
 ### Clip cleaning
 
 48 clean sentences (CMU ARCTIC, RAVDESS, VCC2018 targets) were mixed with
@@ -845,16 +1040,22 @@ match. The table shows medians, with the worst 10% in brackets:
 | Music level | Uncleaned | Vocal separation (used) | DPDFNet denoiser | GTCRN denoiser |
 | --- | --- | --- | --- | --- |
 | None | 100 | 100 | 100 | 100 |
-| 10 dB below the voice | 99 (79) | 100 (100) | 100 | 100 |
-| 5 dB below | 86 (50) | 100 (99) | 100 | 100 |
-| As loud as the voice | 51 (23) | 100 (99) | 100 | 100 |
+| 10 dB below the voice | 100 (90) | 100 (100) | 100 | 100 |
+| 5 dB below | 92 (69) | 100 (100) | 100 | 100 |
+| As loud as the voice | 65 (27) | 100 (99) | 100 | 100 |
 
 The headline hides how far the parts drift. With music as loud as the voice,
-uncleaned pitch is 1.9 semitones off and formants 2.4. After separation they
-are 0.07 and 0.34, and SI-SDR rises from 0 dB to 15.6 dB, against 12.2 dB for
-DPDFNet and 6.7 dB for GTCRN. On clean speech separation changes almost
+uncleaned pitch is 2.0 semitones off and formants 2.4. After separation they
+are 0.07 and 0.36, and SI-SDR rises from 0 dB to 15.6 dB, against 12.2 dB for
+DPDFNet and 6.6 dB for GTCRN. On clean speech separation changes almost
 nothing (SI-SDR 37 dB), which is why every target is cleaned.
 `tools/validate.py cleaning` reproduces the numbers.
+
+These are for the 1.1.0 scoring. Uncleaned clips scored lower before it (99,
+86 and 51, with 79, 50 and 23 for the worst tenth): music under a clip used to
+throw the alignment, Articulation and Rhythm as well as the pitch. The parts
+that now go by what a speech recogniser hears hold up under music, and Pitch
+and Melody still don't, so a clip still has to be cleaned.
 
 ### The word check
 
@@ -968,7 +1169,7 @@ src/echo_voice/
   identity.py        speaker embeddings (model download, features, ONNX)
   scoring.py         target + take -> distances -> calibrated scores, hints, chart, words, coach; voice checks; word drills
   gender.py          how female or male a voice reads, 0-100 (gender_model.json from tools/train_gender.py)
-  line.py            speech recognition and the word-by-word comparison
+  line.py            speech recognition, what the recogniser hears (for alignment and Articulation), and the word-by-word comparison
   clean.py           vocal separation for target clips
   models.py          model downloads, checked against pinned hashes
   similarity.py      the listener-similarity model behind Voice
@@ -980,12 +1181,13 @@ src/echo_voice/
   store.py           voices and their checks, targets (lines), takes and recordings on disk
   server.py          FastAPI app; runs the recordings' jobs
   cli.py             `echo-voice serve`, `echo-voice score`, `echo-voice import`
-  static/            the page: records, trims, recordings' lines, live pitch (pitch.js) and resonance (formants.js), shows results
+  static/            the page: records, trims, recordings' lines, live pitch (pitch.js) and resonance (formants.js), the end of a take (ending.js), shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
 tools/validate.py    checks pitch, formants, cleaning, the word check and the whole score against reference data
 tools/train_similarity.py  trains similarity_model.json on VoxSim ratings
 tools/check_live_pitch.mjs  checks the page's live pitch tracker against PTDB-TUG
 tools/live_resonance_ref.py, check_live_resonance.mjs  check the page's live formant tracker against the app's own measurements
+tools/check_ending.mjs  checks the page's end-of-take detector on saved takes
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
 

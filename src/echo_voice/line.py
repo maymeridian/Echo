@@ -38,6 +38,28 @@ def _get_model():
         return _model
 
 
+SOUND_STEP = 0.02  # s between the recogniser's frames
+
+
+def sounds(y: np.ndarray) -> np.ndarray:
+    """What the recogniser hears in a 16 kHz mono clip: the frames of its
+    encoder, (frames, 512), one every 20 ms.
+
+    The encoder is trained to turn any voice into the same words. Two people
+    saying one line come out close and one person saying two lines comes out
+    far, which is what lining two recordings up and comparing their *sounds*
+    needs. MFCCs give the opposite: on RAVDESS a stranger saying the right line
+    is as far as the right actor saying the other sentence (scoring.measure).
+    Clips are scored up to 30 s, which is the encoder's window."""
+    from faster_whisper.audio import pad_or_trim
+
+    model = _get_model()
+    with _lock:
+        features = pad_or_trim(model.feature_extractor(np.ascontiguousarray(y, dtype=np.float32)))
+        out = np.asarray(model.encode(features))[0]
+    return out[: max(2, math.ceil(len(y) / 16000 / SOUND_STEP))].astype(np.float32)
+
+
 def transcribe(y: np.ndarray) -> list[str]:
     """Words spoken in a 16 kHz mono recording, as written (with punctuation)."""
     model = _get_model()

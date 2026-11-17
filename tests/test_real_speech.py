@@ -46,8 +46,16 @@ def test_same_voice_through_a_mic_scores_high_and_strangers_low(clip):
 def test_different_words_are_flagged(clip):
     result = compare(clip("bdl_arctic_a0001"), clip("bdl_arctic_a0002"))
     scores = {c["key"]: c["score"] for c in result["components"]}
-    assert min(scores, key=scores.get) == "articulation"
+    assert scores["articulation"] < 35  # another sentence: the sounds are not the line's
     assert any("same words" in hint for hint in result["hints"])
+
+
+def test_articulation_hears_the_sounds_and_not_the_voice(clip):
+    """A stranger saying the line scores well above the same man saying another sentence."""
+    target = clip("bdl_arctic_a0001")
+    part = lambda take: next(c["score"] for c in compare(target, take)["components"] if c["key"] == "articulation")
+    same_line = [part(clip("rms_arctic_a0001")), part(clip("slt_arctic_a0001"))]  # another man, and a woman
+    assert min(same_line) > 60 and part(clip("bdl_arctic_a0002")) < 35
 
 
 def test_noise_gated_clip_keeps_its_voice(clip):
@@ -79,7 +87,12 @@ def test_cleaning_recovers_a_target_with_music_under_it(clip):
     music = beat(len(speech), seed=1)
     mix = speech + music * np.sqrt(np.mean(speech**2) / np.mean(music**2))  # music as loud as the voice
     reference = analyze(speech)
-    assert compare(reference, analyze(mix))["overall"] < 80
+    # With music under it the pitch tracker follows the music: Pitch and Melody are lost, and
+    # 20 points of the headline with them. (The parts that go by what a recogniser hears, and
+    # Resonance, hold up.)
+    dirty = compare(reference, analyze(mix))
+    parts = {c["key"]: c["score"] for c in dirty["components"]}
+    assert dirty["overall"] < 85 and parts["pitch"] < 20 and parts["melody"] < 20
     assert compare(reference, analyze(clean.vocals(mix)))["overall"] > 95
 
 

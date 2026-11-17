@@ -1,6 +1,6 @@
 """Practise a voice impression and measure how close you get."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .analysis import AnalysisError, Voice, analyze, decode, load
 from .scoring import compare

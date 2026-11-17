@@ -36,6 +36,7 @@
           <button id="mic-off" class="btn" type="button" title="Let go of the microphone now" hidden>Turn off</button>
         </div>
         <p id="mic-note" class="fine" role="status"></p>
+        <label class="auto-stop" title="A take ends about a second after your last word. The button and Space still stop it at any moment."><input id="auto-stop" type="checkbox" checked> Stop a take when I finish speaking</label>
       </div>
       <p class="fine sidebar-foot">A voice is one person or character: the lines you practise, the recordings they came from, and your voice score across them. <span id="version" class="version"></span></p>
     </aside>
@@ -256,7 +257,7 @@
               </button>
               <button id="warmup" class="btn warmup" type="button" title="Live pitch and resonance, nothing saved">Warm up</button>
               <div class="meter" aria-hidden="true"><div id="level"></div></div>
-              <span class="fine keys"><kbd>Space</kbd> starts and stops</span>
+              <span class="fine keys"><kbd>Space</kbd> <span class="manual-note" hidden>starts and stops</span><span class="auto-note">starts · it stops when you finish</span></span>
             </div>
             <div id="live" class="live" hidden>
               <p id="live-text" class="live-text"></p>
@@ -359,7 +360,7 @@
               <button id="train-say" class="record" type="button"><span class="dot"></span><span id="train-say-label">Say it</span></button>
               <button id="train-mine" class="pill" type="button" disabled><span class="icon">▶</span> You</button>
               <button id="train-try" class="pill" type="button" title="Watch your pitch and resonance move as you speak. Nothing is scored or kept."><span class="icon">◎</span> <span id="train-try-label">Try it live</span></button>
-              <span class="fine keys"><kbd>Space</kbd> starts and stops</span>
+              <span class="fine keys"><kbd>Space</kbd> <span class="manual-note" hidden>starts and stops</span><span class="auto-note">starts · it stops when you finish</span></span>
             </div>
             <p id="train-live" class="live-text" hidden></p>
             <div id="train-meter" class="drill-meter" hidden></div>

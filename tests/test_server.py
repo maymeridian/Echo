@@ -359,10 +359,10 @@ def test_trainer_attempts_are_kept_and_progress_gathers_every_take(tmp_path):
     assert created == sorted(created)  # oldest first
 
 
-def test_the_trainer_measures_a_word_with_the_ceiling_your_takes_settle_on(tmp_path):
+def test_the_trainer_measures_a_word_at_the_ceiling_the_voice_and_your_takes_settle_on(tmp_path):
     import json as json_
 
-    from echo_voice.analysis import FORMANT_CEILINGS, analyze
+    from echo_voice.analysis import FORMANT_CEILINGS, analyze, shared_ceiling
 
     # analyze() uses a given ceiling as it is, and picks one when there is none.
     assert analyze(voice(), 6500).formant_ceiling == 6500.0
@@ -381,9 +381,9 @@ def test_the_trainer_measures_a_word_with_the_ceiling_your_takes_settle_on(tmp_p
     def drill():
         return client.post(f"/api/targets/{line_id}/drill", params={"word": 0}, content=piece).json()
 
-    # With no takes to go by, the attempt picks its own ceiling.
+    # With no takes to go by, the attempt is read at the voice's ceiling: what its line picks.
     alone = drill()["ceiling"]
-    assert alone in FORMANT_CEILINGS
+    assert alone == client.get("/api/targets").json()[0]["ceiling"]
 
     # Every take keeps the ceiling it was measured with.
     for f0 in (118, 122, 126):
@@ -392,25 +392,27 @@ def test_the_trainer_measures_a_word_with_the_ceiling_your_takes_settle_on(tmp_p
     files = sorted((tmp_path / "targets" / line_id / "takes").glob("*.json"))
     assert len(files) == 3
 
-    # The trainer then uses the middle one of your takes, whatever the word alone would pick.
+    # The trainer then reads both at the middle of the voice's ceiling and yours (the middle one
+    # of your takes), whatever the word alone would pick.
     for path, ceiling in zip(files, (6500.0, 6500.0, 7000.0), strict=True):
         record = json_.loads(path.read_text("utf-8"))
         record["measures"]["ceiling"] = ceiling
         path.write_text(json_.dumps(record), "utf-8")
-    assert alone != 6500.0 and drill()["ceiling"] == 6500.0
+    both = shared_ceiling(alone, 6500.0)
+    assert alone != 6500.0 and drill()["ceiling"] == both
 
     # A take from before ceilings were kept is measured once, and the result written back.
     record = json_.loads(files[0].read_text("utf-8"))
     del record["measures"]["ceiling"]
     files[0].write_text(json_.dumps(record), "utf-8")
-    assert drill()["ceiling"] == 6500.0  # the middle of its own pick, 6500 and 7000
+    assert drill()["ceiling"] == both  # yours is still 6500: the middle of its own pick, 6500 and 7000
     assert json_.loads(files[0].read_text("utf-8"))["measures"]["ceiling"] in FORMANT_CEILINGS
 
 
-def test_takes_are_measured_at_one_ceiling_per_speaker(tmp_path):
+def test_a_line_and_a_take_are_read_at_one_ceiling(tmp_path):
     import json as json_
 
-    from echo_voice.analysis import FORMANT_CEILINGS, speaker_ceiling
+    from echo_voice.analysis import FORMANT_CEILINGS, shared_ceiling, speaker_ceiling
 
     client = TestClient(create_app(tmp_path))
     voice_id = client.post("/api/voices", json={"name": "Synth"}).json()["id"]
@@ -426,8 +428,14 @@ def test_takes_are_measured_at_one_ceiling_per_speaker(tmp_path):
     for f0 in (120, 124, 128):
         take = client.post(f"/api/targets/{first}/takes", content=wav(voice(f0=f0))).json()
         picks.append(take["measures"]["ceiling"])
-        # Its own pick is kept, and Resonance used the middle of the picks so far.
-        assert take["measures"]["ceiling_used"] == speaker_ceiling(picks)
+        # Its own pick is kept. Resonance read both sides at the middle of the voice's ceiling
+        # (the middle of its lines' picks) and yours (the middle of your picks so far).
+        theirs = speaker_ceiling(line["ceiling"] for line in lines)
+        assert take["measures"]["ceiling_used"] == shared_ceiling(theirs, speaker_ceiling(picks))
+    # One take is a rough reading of Resonance, so from the third take on the row also says
+    # where the last three sit together.
+    resonance = next(c for c in take["components"] if c["key"] == "resonance")
+    assert "your last 3 takes together: " in resonance["detail"] and take["measures"]["resonance_3"] is not None
 
     # A line from before its pick was kept gets it on first use.
     meta_path = tmp_path / "targets" / lines[1]["id"] / "meta.json"
@@ -484,3 +492,68 @@ def test_a_damaged_file_is_left_out_and_files_are_written_whole(tmp_path):
     store_module._write(meta_path, before.replace("Synth", "Synth 2"))
     assert client.get(f"/api/voices/{voice_id}").json()["name"] == "Synth 2"
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_takes_from_an_earlier_scoring_are_scored_again(tmp_path):
+    """When the scoring changes, saved takes and voice checks are worked out again from the takes' audio."""
+    import json as json_
+    import time
+
+    from echo_voice.scoring import SCORING
+
+    client = TestClient(create_app(tmp_path))
+    voice_id = client.post("/api/voices", json={"name": "V"}).json()["id"]
+    lines = [
+        client.post("/api/targets", params={"name": f"line {f0}", "voice": voice_id}, content=wav(voice(f0=f0))).json()
+        for f0 in (120, 125, 130)
+    ]
+    takes = [client.post(f"/api/targets/{line['id']}/takes", content=wav(voice(f0=150))).json() for line in lines]
+    assert all(t["scoring"] == SCORING for t in takes)
+    # A trainer attempt at the first line's first word.
+    first = tmp_path / "targets" / lines[0]["id"]
+    client.patch(f"/api/targets/{lines[0]['id']}", json={"line": "ah ee oo eh"})
+    meta = json_.loads((first / "meta.json").read_text("utf-8"))
+    meta["word_times"] = [{"text": "ah", "start": 0.0, "end": 0.4, "refined": True}]
+    (first / "meta.json").write_text(json_.dumps(meta), "utf-8")
+    attempt = client.post(f"/api/targets/{lines[0]['id']}/drill", params={"word": 0}, content=wav(voice(f0=150)[: int(0.45 * SR)])).json()
+    assert attempt["scoring"] == SCORING and attempt["pitch"] is not None
+    picked = [{"target": line["id"], "take": t["id"]} for line, t in zip(lines, takes, strict=True)]
+    check = client.post(f"/api/voices/{voice_id}/checks", json={"takes": picked}).json()
+    assert check["scoring"] == SCORING
+
+    # As an earlier scoring left them: no stamp, and numbers from another scale.
+    for line, take in zip(lines, takes, strict=True):
+        path = tmp_path / "targets" / line["id"] / "takes" / f"{take['id']}.json"
+        old = json_.loads(path.read_text("utf-8"))
+        del old["scoring"]
+        old |= {"overall": 1.0, "components": [c | {"score": 1.0} for c in old["components"]], "coach": {"focus": "pitch", "kept": True}}
+        path.write_text(json_.dumps(old), "utf-8")
+    drill_path = first / "drills" / f"{attempt['id']}.json"
+    old = json_.loads(drill_path.read_text("utf-8")) | {"pitch": 99.0}
+    del old["scoring"]
+    drill_path.write_text(json_.dumps(old), "utf-8")
+    check_path = tmp_path / "voices" / voice_id / "checks" / f"{check['id']}.json"
+    stale = json_.loads(check_path.read_text("utf-8")) | {"average": 1.0}
+    del stale["scoring"]
+    check_path.write_text(json_.dumps(stale), "utf-8")
+
+    # The next start scores them again, in the background.
+    client = TestClient(create_app(tmp_path))
+    for _ in range(300):
+        again = [client.get(f"/api/targets/{p['target']}/takes/{p['take']}").json() for p in picked]
+        redone = client.get(f"/api/voices/{voice_id}/checks/{check['id']}").json()
+        drills = client.get(f"/api/targets/{lines[0]['id']}/drills").json()
+        if all(a.get("scoring") == SCORING for a in again) and redone.get("scoring") == SCORING and drills[0].get("scoring") == SCORING:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("the takes were not scored again")
+    for before, after in zip(takes, again, strict=True):
+        assert (after["id"], after["created"]) == (before["id"], before["created"])
+        assert after["overall"] == pytest.approx(before["overall"], abs=0.5)  # the same audio under the same scoring
+        assert after["coach"] == {"focus": "pitch", "kept": True}  # the advice given then stays as it was
+    assert redone["id"] == check["id"] and redone["average"] == pytest.approx(check["average"], abs=0.5)
+    # The trainer's attempt was measured again too, and is still the same attempt.
+    assert drills[0]["id"] == attempt["id"] and drills[0]["pitch"] == pytest.approx(attempt["pitch"], abs=0.1) and drills[0]["word"] == 0
+    best = {t["id"]: t["best"] for t in client.get("/api/targets").json()}
+    assert all(best[p["target"]] == pytest.approx(a["overall"]) for p, a in zip(picked, again, strict=True))

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -27,12 +28,14 @@ from .analysis import (
     analyze,
     decode,
     load,
+    shared_ceiling,
     speaker_ceiling,
     steadied,
 )
 from .scoring import (
     CHECK_LINES,
     MIN_CHECK_LINES,
+    SCORING,
     coach,
     compare,
     voice_check,
@@ -85,6 +88,66 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         return meta
 
     store.migrate()  # data from before voices existed
+
+    def rescore() -> int:
+        """Score again every saved take that an earlier scoring scored, from
+        its own audio, measure the trainer's saved attempts again the same
+        way, and work the voice checks out again from the takes. A take keeps
+        its id, its time and the coaching it was given. Returns how many takes
+        were scored."""
+        done = 0
+        for meta in store.list_targets():
+            for record in store.take_records(meta["id"]):
+                if record.get("scoring") == SCORING:
+                    continue
+                try:
+                    take = analyze(load(store.take_audio(meta["id"], record["id"])))
+                    ceiling = pair_ceiling(meta["id"], take.formant_ceiling)
+                    target = steady_target(meta["id"], ceiling)
+                    said, timed = target_words(meta["id"], target)
+                    heard = (record.get("line") or {}).get("take")
+                    words = heard.split() if heard else transcript.transcribe(take.y)
+                    usual = (typical_pitch(meta.get("voice_id")), my_pitch(meta.get("voice_id"), take.median_f0))
+                    result = compare(target, steadied(take, ceiling), said, words, timed, pitch_suspect(meta), usual)
+                except (AnalysisError, OSError, ValueError, KeyError) as exc:
+                    print(f"Couldn't score take {record.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
+                    continue
+                store.replace_take(meta["id"], record | result)
+                done += 1
+            for record in store.list_drills(meta["id"]):
+                if record.get("scoring") == SCORING:
+                    continue
+                try:
+                    ceiling = pair_ceiling(meta["id"])
+                    target = steady_target(meta["id"], ceiling)
+                    _, timed = target_words(meta["id"], target)
+                    # The word it was an attempt at: by where it starts, should the words have been regrouped since.
+                    word = next((w for w in timed if abs(w["start"] - record.get("start", -1)) < 0.02), None) or timed[record["word"]]
+                    attempt = analyze(load(store.drill_audio(meta["id"], record["id"])), ceiling)
+                    result = word_drill(target, word, attempt)
+                except (AnalysisError, NotFound, OSError, ValueError, KeyError, IndexError) as exc:
+                    print(f"Couldn't measure trainer attempt {record.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
+                    continue
+                store.replace_drill(meta["id"], record | result | {"ceiling": attempt.formant_ceiling})
+        for voice in store.list_voices():
+            for check in store.list_checks(voice["id"]):
+                if check.get("scoring") == SCORING:
+                    continue
+                rows = []
+                for row in check.get("lines", []):
+                    try:
+                        take = store.take(row["target"], row["take"])
+                    except (NotFound, OSError, ValueError):
+                        rows.append(row)  # its line is gone: as it was
+                        continue
+                    rows.append(row | {
+                        "overall": take["overall"],
+                        "parts": {c["key"]: c["score"] for c in take["components"]},
+                        "measures": take.get("measures"),
+                    })
+                if rows:
+                    store.replace_check(voice["id"], check | voice_check(rows) | {"scoring": SCORING})
+        return done
 
     # Pick up recordings that were still being processed when the app last stopped.
     for meta in store.list_sources():
@@ -144,18 +207,24 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 picks.append(meta["ceiling"])
         return speaker_ceiling(picks)
 
-    def steady_target(target_id: str) -> Voice:
-        """The line for scoring. Resonance reads its formants at its voice's
-        ceiling, and a take's at the ceiling of whoever is practising, so a
-        reading moves when a voice does, not when the tracker changes its mind
-        (analysis.steadied)."""
+    def steady_target(target_id: str, ceiling: float | None) -> Voice:
+        """The line for scoring, with its formants also read at `ceiling`, the
+        one a take against it is read at (analysis.steadied)."""
         voice = target_voice(target_id)
-        ceiling = voice_ceiling(store.target_meta(target_id).get("voice_id") or "")
         if ceiling is None:
             return voice
         if (target_id, ceiling) not in steady:
             steady[(target_id, ceiling)] = steadied(voice, ceiling)
         return steady[(target_id, ceiling)]
+
+    def pair_ceiling(target_id: str, own: float | None = None) -> float | None:
+        """The one formant ceiling Resonance reads a line and a take against
+        it at: the middle of the voice's ceiling and that of whoever is
+        practising it. Each of those is the middle of what several recordings
+        pick, so the reading moves when a voice does, not when the tracker
+        changes its mind."""
+        voice_id = store.target_meta(target_id).get("voice_id") or ""
+        return shared_ceiling(voice_ceiling(voice_id) or target_voice(target_id).formant_ceiling, my_ceiling(target_id, own))
 
     def my_ceiling(target_id: str, own: float | None = None) -> float | None:
         """The ceiling for whoever is practising a voice: the middle of what
@@ -264,8 +333,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             "high": None,
             # For the live resonance meter (static/formants.js): the formant
             # ceilings Resonance uses for this voice and for whoever practises it.
-            "ceiling": voice_ceiling(store.target_meta(target_id).get("voice_id") or "") or voice.formant_ceiling,
-            "my_ceiling": my_ceiling(target_id),
+            "ceiling": pair_ceiling(target_id),
+            "my_ceiling": pair_ceiling(target_id),
         }
         if f0.size >= 20:
             low, median, high = np.percentile(f0, [10, 50, 90])
@@ -283,13 +352,17 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     @app.post("/api/targets/{target_id}/takes", status_code=201)
     async def add_take(target_id: str, request: Request, focus: str = "") -> dict:
         """Score a take and say what to work on next (`focus` picks it by hand)."""
-        target = await run_in_threadpool(steady_target, target_id)
         take = await uploaded_voice(request)
-        take = await run_in_threadpool(steadied, take, await run_in_threadpool(my_ceiling, target_id, take.formant_ceiling))
+        ceiling = await run_in_threadpool(pair_ceiling, target_id, take.formant_ceiling)
+        target = await run_in_threadpool(steady_target, target_id, ceiling)
+        take = await run_in_threadpool(steadied, take, ceiling)
         said, timed = await run_in_threadpool(target_words, target_id, target)
         words = await run_in_threadpool(transcript.transcribe, take.y)
         suspect = pitch_suspect(store.target_meta(target_id))
-        result = await run_in_threadpool(compare, target, take, said, words, timed, suspect)
+        voice_id = store.target_meta(target_id).get("voice_id")
+        usual = (typical_pitch(voice_id), my_pitch(voice_id, take.median_f0))
+        result = await run_in_threadpool(compare, target, take, said, words, timed, suspect, usual)
+        over_takes(result, store.take_records(target_id)[-2:])
         earlier = store.list_takes(target_id)
         history = [t["overall"] for t in earlier]
         parts = {k: [t["parts"].get(k) for t in earlier] for k in ("pitch", "melody", "resonance", "articulation", "rhythm")}
@@ -300,15 +373,16 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     async def drill(target_id: str, request: Request, word: int) -> dict:
         """An attempt at one word of the line, measured against that word, to
         train one part at a time. The attempt is kept, with its audio."""
-        target = await run_in_threadpool(steady_target, target_id)
+        # A single word is too short to pick its own formant ceiling
+        # dependably, so it's measured at the one your full takes on this
+        # voice and the voice's lines settle on, as the line is: readings then
+        # move only when your voice does.
+        ceiling = await run_in_threadpool(pair_ceiling, target_id)
+        target = await run_in_threadpool(steady_target, target_id, ceiling)
         _, timed = await run_in_threadpool(target_words, target_id, target)
         if not 0 <= word < len(timed):
             raise HTTPException(404, "That word isn't in the line.")
-        # A single word is too short to pick its own formant ceiling
-        # dependably, so it's measured with the one your full takes on this
-        # voice settle on: readings then move only when your voice does.
         y = await uploaded_audio(request)
-        ceiling = await run_in_threadpool(my_ceiling, target_id)
         try:
             attempt = await run_in_threadpool(analyze, y, ceiling)
         except AnalysisError as exc:
@@ -339,6 +413,35 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             return float(np.median([r["pitch"] for r in rows]))
         others = [t["median_f0"] for t in store.list_targets() if t.get("voice_id") == voice_id and t["id"] != but and t.get("median_f0")]
         return float(np.median(others)) if len(others) >= 3 else None
+
+    def over_takes(result: dict, before: list[dict]) -> None:
+        """Resonance on one short take is a rough reading: small things move
+        it by 3 to 8 points, and by 19 to 42 for one take in ten (README, the
+        audit). Three takes together are steadier, so once this take and the
+        two before it on the line all have a reading, the row also says where
+        the three sit: the middle of their shifts."""
+        shifts = [(r.get("measures") or {}).get("resonance") for r in before if r.get("scoring") == SCORING]
+        shifts.append(result["measures"]["resonance"])
+        if len(shifts) < 3 or None in shifts:
+            return
+        middle = float(np.median(shifts))
+        percent = (2 ** (middle / 12) - 1) * 100
+        where = "level with the target" if abs(percent) < 2 else f"about {abs(percent):.0f}% {'brighter' if percent > 0 else 'darker'}"
+        result["measures"]["resonance_3"] = round(middle, 2)
+        for part in result["components"]:
+            if part["key"] == "resonance":
+                part["detail"] += f"; your last 3 takes together: {where}"
+
+    def my_pitch(voice_id: str | None, own: float | None) -> float | None:
+        """The usual pitch of whoever is practising a voice: the middle of
+        their latest takes on it, with this take (`own`) among them. One or
+        two takes aren't enough to tell fry from a low take, so then it is
+        this take's own."""
+        if not voice_id:
+            return own
+        earlier = [(r.get("measures") or {}).get("take_f0") for r in store.takes_for_voice(voice_id, 15)]
+        values = [v for v in (*earlier, own) if v]
+        return float(np.median(values)) if len(values) >= 3 else own
 
     def pitch_suspect(line: dict) -> bool:
         """A line whose pitch sits far from its voice's usual: creaky voice, or
@@ -723,7 +826,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             })
         if len({r["target"] for r in rows}) < MIN_CHECK_LINES:
             raise HTTPException(422, f"A voice check needs at least {MIN_CHECK_LINES} different lines.")
-        return store.add_check(voice_id, voice_check(rows))
+        return store.add_check(voice_id, voice_check(rows) | {"scoring": SCORING})
 
     @app.get("/api/voices/{voice_id}/checks/{check_id}")
     def get_check(voice_id: str, check_id: str) -> dict:
@@ -734,4 +837,6 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         return {"sample_rate": SR, "version": __version__}
 
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
+    # Takes from before the scoring last changed are scored again in the background: the app is usable meanwhile.
+    threading.Thread(target=rescore, daemon=True, name="rescore").start()
     return app

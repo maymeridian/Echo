@@ -1,5 +1,85 @@
 # Changelog
 
+## 1.1.0 (2026-11-17)
+
+Every measurement was audited against recordings whose right answer is known
+and against 70 real takes, and the parts that failed were rebuilt. Scores from
+1.0.0 and 1.1.0 are on different scales, so saved takes and voice checks are
+scored again the first time 1.1.0 starts.
+
+### What the audit found
+
+- **Articulation heard the voice, not the sounds.** On the calibration
+  recordings a stranger saying the right line scored the same as the right
+  person saying another sentence. A take against a breathy voice read 0
+  whatever was said.
+- **Resonance could not be trusted on a breathy or high voice.** The tracker
+  took the first harmonic for the first formant as often as not. The line was
+  read at one formant ceiling and the take at another, and read that way a
+  line was not level with a copy of itself. Real takes against a breathy
+  voice sat near zero whatever was done (a median 13).
+- **Rhythm and Resonance moved with the click on Stop.** A second of silence
+  and a click after the last word changed Rhythm by 49 points and Resonance
+  by 38 for one take in ten. Half of Rhythm was a measure that barely told a
+  retake from a stranger.
+- **Pitch and Voice held up.** The same changes moved Pitch by nothing and
+  Voice by under 1 point for a typical take.
+
+### Scoring
+
+- Takes are lined up with the target by what a speech recogniser hears in
+  each, not by their spectra. A line's words land a median 50 ms from where
+  the take's own transcript puts them, against 80 ms before, and over 200 ms
+  off for 6% of words against 16%.
+- **Articulation** compares those sounds, whoever is speaking. About 90 is
+  the real person saying the line again, a stranger reading the same line
+  scores around 80, and a different sentence about 20.
+- **Resonance** is read from the second and third formants, with both
+  recordings at one formant ceiling and at four more around it.
+- **Rhythm:** pace is still the length from first to last voiced sound, now
+  without a stray blip at either end. Timing inside the line is read at ten
+  stretches of it, and tells a retake from a stranger far better than it did
+  (0.71 from 0.59, where 0.5 is a coin toss).
+- A short sound on its own at either end of a recording, such as the click on
+  Stop, is cut before anything is measured.
+- From the third take on a line, the Resonance row also says where your last
+  three takes sit together, which is steadier than one take's reading.
+- **Vocal fry** is a new read beside the parts, not counted in the score: how
+  much of the target's voiced sound drops into a low creak, and how much of
+  yours. It explains lines that used to defeat Pitch.
+
+### Recording
+
+- **A take stops by itself** about a second after your last word. The quiet
+  it waits for comes from the line's own pauses, and the button and Space
+  still stop it at any moment. A scored attempt in the trainer stops the same
+  way. Switch it off under the microphone list if you want to stop by hand.
+
+### Lines
+
+- A suggested line that starts in the middle of a sentence is widened back to
+  the sentence's start when it is added. Auto-pick leaves out one it can't
+  repair.
+
+### Fixed
+
+- The live ring's tail in the trainer no longer starts with a line from the
+  middle of the map. It begins once both pitch and resonance have a reading.
+
+### Known limits
+
+- Resonance on one short take is still a rough reading. Now that takes are
+  no longer pinned near zero, small things move it: cutting 30 ms off a take
+  moves it 3 points for a typical take and 19 for one in ten, and faint hiss
+  8 and 42. Judge it over several takes.
+- On the VCC 2018 listening test the headline now agrees less with
+  listeners: 0.48 per pair and 0.90 per system, from 0.53 and 0.94. Those
+  listeners judged only whether two clips were the same speaker, and
+  Articulation no longer hears the speaker. The Voice part, which answers
+  that question, is unchanged at 0.55 and 0.94. The README has the detail.
+- The calibration's microphone is still simulated, and the vocal-fry read and
+  the new Articulation have not been checked against listeners.
+
 ## 1.0.0 (2026-11-16)
 
 The first release. Echo is a local web app for practising a voice impression:

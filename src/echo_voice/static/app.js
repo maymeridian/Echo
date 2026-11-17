@@ -1,10 +1,12 @@
+import { Ending, spoken, waitFor } from "./ending.js";
 import { Listener, alignedShift, shift, track, typical } from "./formants.js";
 import { yin } from "./pitch.js";
 
 // The browser's jobs are capturing the microphone, playing clips, drawing, and
 // turning any clip into 16 kHz mono WAV. Everything that is scored is measured
 // on the server; the browser measures only what it shows while you speak (your
-// pitch, pitch.js, and your resonance, formants.js).
+// pitch, pitch.js, and your resonance, formants.js) and hears when you have
+// finished, so a take stops by itself (ending.js).
 //
 // The pages: home, a voice (its score, lines and recordings), a recording (its
 // lines to pick from), a line (listen, record, improve), and a voice check's
@@ -341,7 +343,7 @@ class Recorder {
       analyser.getFloatTimeDomainData(buffer);
       const peak = recent.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
       this.heard = Math.max(this.heard, peak);
-      onLevel(peak);
+      onLevel(peak, Math.sqrt(recent.reduce((sum, x) => sum + x * x, 0) / recent.length));
       if (onPitch && peak > 0) {
         const frame = recent.map((x) => x / peak);
         onPitch(yin(frame, rate)?.f0 ?? null, buffer, rate);
@@ -370,6 +372,17 @@ class Recorder {
 }
 
 const noSound = () => `No sound is coming from “${micLabel()}”. Choose your microphone in the list on the left.`;
+
+// A take, or a scored attempt in the trainer, stops by itself once you have
+// finished speaking (ending.js), unless that is switched off in the sidebar.
+// The button and Space still stop it at any moment.
+const autoStop = () => stored.get("echo.autostop") !== "off";
+
+function renderAutoStop() {
+  $("#auto-stop").checked = autoStop();
+  for (const note of document.querySelectorAll(".auto-note")) note.hidden = !autoStop();
+  for (const note of document.querySelectorAll(".manual-note")) note.hidden = autoStop();
+}
 
 // The sidebar's microphone box: which one, a level to see that it hears you, and what's going on.
 function renderMic() {
@@ -2739,12 +2752,16 @@ function renderDrillLive() {
   const seen = pitch != null || percent != null;
   if (mapLive) {
     mapLive.ring.style.display = seen ? "" : "none";
+    if (!seen) drillLive.trail.length = 0;
     if (seen) {
       const point = [mapLive.x(pitch ?? 0), mapLive.y(percent ?? 0)];
       mapLive.ring.setAttribute("cx", point[0]);
       mapLive.ring.setAttribute("cy", point[1]);
-      // A short tail, so the direction you're moving in shows.
-      if (drillLive.ticks++ % 3 === 0) {
+      // A short tail, so the direction you're moving in shows. It starts over
+      // whenever one of the two readings is missing: the ring then sits on an
+      // axis, which isn't somewhere your voice has been.
+      if (pitch == null || percent == null) drillLive.trail.length = 0;
+      else if (drillLive.ticks++ % 3 === 0) {
         drillLive.trail.push(point);
         if (drillLive.trail.length > 40) drillLive.trail.shift();
       }
@@ -2767,11 +2784,15 @@ async function startDrill(free) {
   const index = training.order[training.at];
   const word = profile.words[index];
   const mine = { listener: null, points: [], started: performance.now(), unit: null, pitch: wordPitch(index) ?? profile.median_f0 ?? null, trail: [], ticks: 0 };
+  // A scored attempt ends when the phrase has been said; looking live goes on until it is stopped.
+  const ending = !free && autoStop() ? new Ending({ wait: 0.7, enough: 0.5 * (word.end - word.start), patient: 2 }) : null;
   $("#train-live").hidden = false;
   $("#train-live").textContent = free ? "Say it, hold it, slide it: the ring follows your voice." : "Say it…";
   try {
     await recorder.start(
-      () => {},
+      (peak, rms) => {
+        if (ending?.hear(rms, (performance.now() - mine.started) / 1000) && drillRec?.recorder === recorder) stopDrill();
+      },
       (f0, frame, rate) => {
         if (drillLive !== mine) return;
         const f = mine.listener ? mine.listener.hear(frame, rate) : null;
@@ -2872,9 +2893,17 @@ async function startRecording(kind) {
     } catch {}
   }
   if (withLive) startLive();
+  // A take ends when the line has been said: the quiet that ends it is a little
+  // longer than the longest pause between the line's own words. Warming up and
+  // recording a clip go on until they are stopped.
+  const ending = kind === "take" && autoStop() ? new Ending({ wait: waitFor(profile?.words), enough: 0.5 * spoken(profile?.words) }) : null;
+  const opened = performance.now();
   try {
     await recorder.start(
-      (peak) => ($("#level").style.width = `${Math.min(100, peak * 140)}%`),
+      (peak, rms) => {
+        $("#level").style.width = `${Math.min(100, peak * 140)}%`;
+        if (ending?.hear(rms, (performance.now() - opened) / 1000) && session?.recorder === recorder) stopRecording();
+      },
       withLive ? onLivePitch : null,
     );
   } catch (err) {
@@ -2885,14 +2914,15 @@ async function startRecording(kind) {
   const started = performance.now();
   const limit = kind === "warmup" ? WARMUP_SECONDS : MAX_SECONDS;
   const label = kind === "warmup" ? "Warming up, not scored" : "Recording";
+  const until = ending ? ". It stops when you finish" : "";
   const timer = setInterval(() => {
     const seconds = (performance.now() - started) / 1000;
     const dead = seconds > 1.5 && recorder.silent;
-    setStatus(dead ? `${label}… ${seconds.toFixed(0)} s. ${noSound()}` : `${label}… ${seconds.toFixed(0)} s`, dead);
+    setStatus(dead ? `${label}… ${seconds.toFixed(0)} s. ${noSound()}` : `${label}… ${seconds.toFixed(0)} s${until}`, dead);
     if (seconds >= limit) stopRecording();
   }, 250);
   session = { kind, recorder, timer };
-  setStatus(`${label}…`);
+  setStatus(`${label}…${until}`);
   renderControls();
   renderMic();
 }
@@ -3092,7 +3122,7 @@ function renderResult() {
       const change = c.score != null && before != null ? Math.round(c.score - before) : null;
       return el(
         "li",
-        { className: `${c.key === focus ? "focus" : ""}${c.key === "gender" ? " extra" : ""}` },
+        { className: `${c.key === focus ? "focus" : ""}${READS.has(c.key) ? " extra" : ""}` },
         el("span", { className: "label", textContent: c.label }),
         bar(c.score),
         el("span", { className: "num", textContent: c.score == null ? "–" : Math.round(c.score) }),
@@ -3102,7 +3132,7 @@ function renderResult() {
           title: change == null ? "" : "Change since your last take",
         }),
         trainButton(c.key),
-        el("span", { className: "detail", textContent: c.key === "gender" ? `${c.detail}. Not counted in the score.` : c.detail }),
+        el("span", { className: "detail", textContent: READS.has(c.key) ? `${c.detail}. Not counted in the score.` : c.detail }),
       );
     }),
   );
@@ -3116,7 +3146,7 @@ function renderResult() {
 
 // "Train ›" on each part a person can work on directly (not Voice: it follows from the rest).
 function trainButton(key) {
-  if (key === "identity") return el("span");
+  if (key === "identity" || key === "fry") return el("span");
   const button = el("button", { type: "button", className: "train-btn", textContent: "Train ›" });
   if (key === "gender") {
     // Gender read is pitch and resonance, so that's what moves it.
@@ -3128,6 +3158,9 @@ function trainButton(key) {
   button.onclick = () => openTrainer(key);
   return button;
 }
+
+// Shown beside the parts and not counted in the score.
+const READS = new Set(["gender", "fry"]);
 
 const genderWord = (v) => (v >= 80 ? "female" : v >= 60 ? "leans female" : v > 40 ? "in between" : v > 20 ? "leans male" : "male");
 
@@ -3394,6 +3427,11 @@ $("#train-say").onclick = toggleDrill;
 $("#mic-select").onchange = (e) => chooseMic(e.target.value);
 $("#mic-test").onclick = testMic;
 $("#mic-off").onclick = closeMic;
+$("#auto-stop").onchange = (e) => {
+  stored.set("echo.autostop", e.target.checked ? "on" : "off");
+  renderAutoStop();
+};
+renderAutoStop();
 navigator.mediaDevices?.addEventListener?.("devicechange", listMics);
 api("/api/config")
   .then((config) => ($("#version").textContent = `Echo ${config.version}`))

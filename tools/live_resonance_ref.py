@@ -7,10 +7,11 @@ recordings, for that tracker to be checked against: 12 speakers of VCC2018
 
 For every recording: its speaker's formant ceiling (the middle of what the
 speaker's recordings pick, as the app chooses it) and the typical F1-F3 Praat
-finds at that ceiling. For every pair of speakers on one sentence: how much
-brighter or darker one is than the other, both as the trainer measures it (the
-gap between typical formants) and as a take's Resonance does (along the
-alignment).
+finds at that ceiling. For every pair of speakers on one sentence: the one
+ceiling the app reads both at (the middle of the two speakers'), and how much
+brighter or darker one is than the other there, from F2 and F3: both as the
+trainer measures it (the gap between typical formants) and as a take's
+Resonance does (along the alignment).
 
     python tools/live_resonance_ref.py --vcc cache/vcc2018 --out cache/live_resonance_ref.json
     node tools/check_live_resonance.mjs cache/live_resonance_ref.json
@@ -25,10 +26,17 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import librosa
 import numpy as np
 
-from echo_voice.analysis import AnalysisError, analyze, load, speaker_ceiling, steadied
+from echo_voice.analysis import (
+    AnalysisError,
+    analyze,
+    load,
+    shared_ceiling,
+    speaker_ceiling,
+    steadied,
+)
+from echo_voice.scoring import align, on_grid, read_resonance
 
 SENTENCES = range(30001, 30013)
 
@@ -45,18 +53,14 @@ def job(path: str):
         voice = analyze(load(path))
     except AnalysisError:
         return path, None
+    _ = voice.sound  # what the recogniser hears, for the alignment: worked out here, in the worker
     return path, voice
 
 
 def aligned_shift(a, b) -> float | None:
     """scoring.measure's signed Resonance, without the parts that need a speaker model."""
-    _, path = librosa.sequence.dtw(X=a.mfcc, Y=b.mfcc, metric="cosine")
-    ti, ki = path[::-1][:, 0], path[::-1][:, 1]
-    fa, fb = a.resonance_formants[:, ti], b.resonance_formants[:, ki]
-    ok = np.isfinite(fa).all(axis=0) & np.isfinite(fb).all(axis=0)
-    if ok.sum() < 20:
-        return None
-    return float(np.median(12 * np.log2(fb[:, ok] / fa[:, ok]), axis=1).mean())
+    si, sj, _ = align(a, b)
+    return read_resonance(a, b, *on_grid(a, b, si, sj))[2]
 
 
 def main() -> None:
@@ -74,13 +78,12 @@ def main() -> None:
             if voice is not None:
                 voices[path] = voice
 
-    files, steady = [], {}
+    files = []
     for folder in folders:
         mine = [p for p in voices if Path(p).parent == folder]
         ceiling = speaker_ceiling(voices[p].formant_ceiling for p in mine)
         for p in mine:
             v = steadied(voices[p], ceiling)
-            steady[p] = v
             typical = np.nanmedian(v.resonance_formants[:, v.voiced], axis=1)
             files.append({
                 "path": p,
@@ -96,12 +99,15 @@ def main() -> None:
     for n in SENTENCES:
         said = [f for f in files if f["sentence"] == n]
         for a, b in itertools.combinations(said, 2):
-            va, vb = steady[a["path"]], steady[b["path"]]
-            typical = float(np.mean(12 * np.log2(np.array(b["formants"]) / np.array(a["formants"]))))
+            ceiling = shared_ceiling(a["ceiling"], b["ceiling"])
+            va, vb = steadied(voices[a["path"]], ceiling), steadied(voices[b["path"]], ceiling)
+            fa, fb = (np.nanmedian(v.resonance_formants[1:, v.voiced], axis=1) for v in (va, vb))
+            typical = float(np.mean(12 * np.log2(fb / fa)))
             pairs.append({
                 "target": index[a["path"]],
                 "take": index[b["path"]],
-                "typical": round(typical, 3),  # semitones, the take against the target, from typical formants
+                "ceiling": ceiling,  # the one both are read at
+                "typical": round(typical, 3),  # semitones, the take against the target, from typical F2 and F3
                 "aligned": aligned_shift(va, vb),  # the same along the alignment, as a take is scored
             })
     args.out.write_text(json.dumps({"files": files, "pairs": pairs}, indent=1), "utf-8")
