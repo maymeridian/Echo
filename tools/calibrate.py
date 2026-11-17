@@ -20,6 +20,11 @@ The target is always the clean studio file. The take goes through a simulated
 microphone and room (band limit, reverb, noise), because in real use the
 target comes from a clip and the take from your own mic.
 
+Resonance reads formants at one ceiling per speaker (analysis.steadied). The
+app has about five lines of a voice and a few takes of yours to choose it
+from, so here each recording is tracked at the middle of its own pick and the
+picks of four other recordings of the same actor through the same channel.
+
     python tools/calibrate.py cohort-mean               # writes speaker_mean.json
     python tools/calibrate.py collect --ravdess cache/ravdess --out cache/pairs.jsonl
     python tools/calibrate.py fit cache/pairs.jsonl     # writes calibration.json
@@ -42,7 +47,14 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import butter, fftconvolve, sosfilt
 
-from echo_voice.analysis import SR, AnalysisError, analyze, load
+from echo_voice.analysis import (
+    SR,
+    AnalysisError,
+    analyze,
+    load,
+    speaker_ceiling,
+    steadied,
+)
 from echo_voice.scoring import component_scores, measure, overall, weighted
 
 CALIBRATION = Path(__file__).parents[1] / "src" / "echo_voice" / "calibration.json"
@@ -125,6 +137,22 @@ def collect(ravdess: Path, out: Path, workers: int, seed: int) -> None:
                 voices[stem] = v
             if i % 200 == 0:
                 print(f"  {i}/{len(files)}", file=sys.stderr)
+
+    # One formant ceiling per speaker for Resonance, chosen from five recordings.
+    by_actor = defaultdict(list)
+    for stem in sorted(voices):
+        by_actor[meta[stem]["actor"]].append(stem)
+    ceiling_rng = random.Random(seed + 1)  # its own stream, so the pairs drawn below stay the same
+    ceilings = {}
+    for stems in by_actor.values():
+        for kind in ("clean", "mic"):
+            for stem in stems:
+                others = ceiling_rng.sample([s for s in stems if s != stem], 4)
+                ceilings[(stem, kind)] = speaker_ceiling(voices[s][kind].formant_ceiling for s in (stem, *others))
+    for i, ((stem, kind), ceiling) in enumerate(ceilings.items(), 1):
+        voices[stem][kind] = steadied(voices[stem][kind], ceiling)
+        if i % 500 == 0:
+            print(f"  formants at the speaker ceiling: {i}/{len(ceilings)}", file=sys.stderr)
 
     by_key = {}
     for stem, m in meta.items():

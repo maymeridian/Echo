@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from . import autopick, clean, gender, line, sources
-from .analysis import MAX_SECONDS, SR, AnalysisError, Voice, analyze, decode, load
+from .analysis import MAX_SECONDS, SR, AnalysisError, Voice, analyze, decode, load, speaker_ceiling, steadied
 from .scoring import CHECK_LINES, MIN_CHECK_LINES, coach, compare, voice_check, word_drill
 from .store import NotFound, Store
 
@@ -34,6 +34,7 @@ STATIC = Path(__file__).parent / "static"
 def create_app(data_dir: str | Path | None = None) -> FastAPI:
     store = Store(Path(data_dir or os.environ.get("ECHO_DATA", "data")))
     targets: dict[str, Voice] = {}  # analysed targets, so each take only analyses itself
+    steady: dict[tuple[str, float], Voice] = {}  # the same, with formants at their voice's ceiling
     jobs: dict[str, subprocess.Popen] = {}  # source id -> the job processing it
     app = FastAPI(title="Echo")
 
@@ -114,6 +115,35 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         if target_id not in targets:
             targets[target_id] = analyze(load(store.target_audio(target_id)))
         return targets[target_id]
+
+    def voice_ceiling(voice_id: str) -> float | None:
+        """One formant ceiling for a voice: the middle of what its lines pick."""
+        picks = []
+        for meta in store.list_targets():
+            if voice_id and meta.get("voice_id") == voice_id:
+                if meta.get("ceiling") is None:  # a line from before its pick was kept
+                    meta = store.update_target(meta["id"], ceiling=target_voice(meta["id"]).formant_ceiling)
+                picks.append(meta["ceiling"])
+        return speaker_ceiling(picks)
+
+    def steady_target(target_id: str) -> Voice:
+        """The line for scoring. Resonance reads its formants at its voice's
+        ceiling, and a take's at the ceiling of whoever is practising, so a
+        reading moves when a voice does, not when the tracker changes its mind
+        (analysis.steadied)."""
+        voice = target_voice(target_id)
+        ceiling = voice_ceiling(store.target_meta(target_id).get("voice_id") or "")
+        if ceiling is None:
+            return voice
+        if (target_id, ceiling) not in steady:
+            steady[(target_id, ceiling)] = steadied(voice, ceiling)
+        return steady[(target_id, ceiling)]
+
+    def my_ceiling(target_id: str, own: float | None = None) -> float | None:
+        """The ceiling for whoever is practising a voice: the middle of what
+        their latest takes on it picked, with this take's pick (`own`) among them."""
+        picks = store.take_ceilings(store.target_meta(target_id).get("voice_id") or "", 14 if own else 15)
+        return speaker_ceiling([*picks, own])
 
     @app.get("/api/targets")
     def list_targets() -> list[dict]:
@@ -231,8 +261,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     @app.post("/api/targets/{target_id}/takes", status_code=201)
     async def add_take(target_id: str, request: Request, focus: str = "") -> dict:
         """Score a take and say what to work on next (`focus` picks it by hand)."""
-        target = await run_in_threadpool(target_voice, target_id)
+        target = await run_in_threadpool(steady_target, target_id)
         take = await uploaded_voice(request)
+        take = await run_in_threadpool(steadied, take, await run_in_threadpool(my_ceiling, target_id, take.formant_ceiling))
         said, timed = await run_in_threadpool(target_words, target_id, target)
         words = await run_in_threadpool(line.transcribe, take.y)
         suspect = pitch_suspect(store.target_meta(target_id))
@@ -246,13 +277,22 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     @app.post("/api/targets/{target_id}/drill")
     async def drill(target_id: str, request: Request, word: int) -> dict:
         """An attempt at one word of the line, measured against that word, to
-        train one part at a time. Nothing is saved."""
-        target = await run_in_threadpool(target_voice, target_id)
+        train one part at a time. The attempt is kept, with its audio."""
+        target = await run_in_threadpool(steady_target, target_id)
         _, timed = await run_in_threadpool(target_words, target_id, target)
         if not 0 <= word < len(timed):
             raise HTTPException(404, "That word isn't in the line.")
-        attempt = await uploaded_voice(request)
+        # A single word is too short to pick its own formant ceiling
+        # dependably, so it's measured with the one your full takes on this
+        # voice settle on: readings then move only when your voice does.
+        y = await uploaded_audio(request)
+        ceiling = await run_in_threadpool(my_ceiling, target_id)
+        try:
+            attempt = await run_in_threadpool(analyze, y, ceiling)
+        except AnalysisError as exc:
+            raise HTTPException(422, str(exc)) from exc
         result = await run_in_threadpool(word_drill, target, timed[word], attempt)
+        result["ceiling"] = attempt.formant_ceiling
         # Kept, with its audio, so training builds up across sessions.
         return store.add_drill(target_id, attempt, result | {"word": word, "start": timed[word]["start"]})
 

@@ -209,3 +209,31 @@ def test_gender_read_follows_pitch_and_resonance():
     result = compare(low, raised)
     assert result["gender"]["take"] > result["gender"]["target"]
     assert gender.describe(85) == "female" and gender.describe(50) == "in between" and gender.describe(10) == "male"
+
+
+def test_resonance_reads_formants_at_one_ceiling_per_speaker():
+    import numpy as np
+
+    from echo_voice.analysis import FORMANT_CEILINGS, speaker_ceiling, steadied
+    from echo_voice.scoring import measure
+
+    # The middle of what the recordings of a speaker pick, on the grid; nothing with nothing to go by.
+    assert speaker_ceiling([4500, 5000, 6000]) == 5000.0
+    assert speaker_ceiling([4500, 5000]) == 4750.0
+    assert speaker_ceiling([None, 5500.0]) == 5500.0
+    assert speaker_ceiling([]) is None
+
+    target = analyze(voice())
+    other = next(c for c in FORMANT_CEILINGS if c != target.formant_ceiling and c >= 6000)
+    steady = steadied(target, other)
+    # The pick of the recording and its own tracks stay; Resonance gets the tracks at the given ceiling.
+    assert steady.formant_ceiling == target.formant_ceiling and steady.steady_ceiling == other
+    assert np.array_equal(steady.formants, target.formants, equal_nan=True)
+    assert not np.array_equal(steady.resonance_formants, target.formants, equal_nan=True)
+    assert steadied(target, None) is target and steadied(steady, other) is steady
+    assert np.array_equal(steadied(target, target.formant_ceiling).resonance_formants, target.formants, equal_nan=True)
+
+    # A recording against itself at one ceiling is still a perfect match, whatever that ceiling is.
+    assert measure(steady, steady).resonance == 0
+    # Measured at two different ceilings, the same voice no longer reads as identical.
+    assert measure(target, steady).resonance > 0

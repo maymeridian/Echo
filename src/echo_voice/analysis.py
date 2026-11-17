@@ -7,7 +7,7 @@ be indexed with the same frame numbers after time alignment.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
 
@@ -33,6 +33,14 @@ PITCH_CEILING = 600.0
 # ceiling makes the tracker hop between resonances. Against Hillenbrand et al.
 # (1995) this cuts F2/F3 errors over 15% from 5.6%/6.9% to 1.5%/2.8% compared
 # with a fixed 5500 Hz (tools/validate.py formant-lines).
+#
+# That pick is steady enough for typical values, but it changes from one recording
+# of a person to the next (on RAVDESS an actor gets 5.4 different ceilings over 60
+# recordings), and each change moves the formants a little. Resonance compares
+# formants frame by frame, so it uses one ceiling per speaker instead: the middle
+# of what their recordings pick (speaker_ceiling, steadied). On RAVDESS that takes
+# Resonance from AUC 0.825 to 0.848 at telling a retake from a stranger, with five
+# recordings to go by (cache/experiments/ceiling, 2026-11).
 FORMANT_CEILINGS = tuple(range(4500, 7001, 250))
 FALLBACK_CEILING = 5500.0
 
@@ -47,8 +55,10 @@ class Voice:
     times: np.ndarray  # frame centres in seconds
     f0: np.ndarray  # Hz per frame, NaN where unvoiced
     formants: np.ndarray  # (3, frames) F1-F3 in Hz, NaN where unvoiced
-    formant_ceiling: float  # Hz, chosen for this voice
+    formant_ceiling: float  # Hz, the one this recording picks for itself (or was given)
     mfcc: np.ndarray  # (12, frames), mean-normalised, energy dropped
+    steady: np.ndarray | None = None  # F1-F3 tracked at the speaker's ceiling (steadied)
+    steady_ceiling: float | None = None
 
     @property
     def duration(self) -> float:
@@ -57,6 +67,12 @@ class Voice:
     @property
     def voiced(self) -> np.ndarray:
         return np.isfinite(self.f0)
+
+    @property
+    def resonance_formants(self) -> np.ndarray:
+        """The tracks Resonance compares: at the speaker's ceiling when that is
+        known, so two recordings of one person are measured the same way."""
+        return self.formants if self.steady is None else self.steady
 
     @cached_property
     def embedding(self) -> np.ndarray:
@@ -114,7 +130,11 @@ def decode(data: bytes) -> np.ndarray:
     return y
 
 
-def analyze(y: np.ndarray) -> Voice:
+def analyze(y: np.ndarray, ceiling: float | None = None) -> Voice:
+    """`ceiling`: the formant ceiling to use, when the speaker's is already
+    known. Without it the recording picks its own (formant_tracks), which is
+    only dependable on a whole line: a single word picked the same ceiling
+    as its line 23% of the time, and its formants then read a median 5.9% off."""
     y = _prepare(y)
     mfcc = librosa.feature.mfcc(
         y=y, sr=SR, n_mfcc=13, n_fft=N_FFT, hop_length=HOP, n_mels=40
@@ -126,8 +146,11 @@ def analyze(y: np.ndarray) -> Voice:
 
     snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
     f0 = _pitch(snd, times)
-    formants, ceiling = formant_tracks(snd, times, f0)
-    return Voice(y=y, times=times, f0=f0, formants=formants, formant_ceiling=ceiling, mfcc=mfcc)
+    if ceiling is None:
+        formants, ceiling = formant_tracks(snd, times, f0)
+    else:
+        formants = _tracks_at(snd, times, np.flatnonzero(np.isfinite(f0)), float(ceiling))
+    return Voice(y=y, times=times, f0=f0, formants=formants, formant_ceiling=float(ceiling), mfcc=mfcc)
 
 
 def _prepare(y: np.ndarray) -> np.ndarray:
@@ -212,4 +235,31 @@ def _tracks_at(snd: parselmouth.Sound, times: np.ndarray, frames: np.ndarray, ce
     for i in frames:
         for k in range(3):
             out[k, i] = formant.get_value_at_time(k + 1, float(times[i]))
+    return out
+
+
+def speaker_ceiling(picks) -> float | None:
+    """One formant ceiling for a speaker: the middle of the ceilings their
+    recordings pick for themselves, on the grid. None with nothing to go by."""
+    picks = [float(p) for p in picks if p]
+    if not picks:
+        return None
+    middle = float(np.median(picks))
+    return float(min(FORMANT_CEILINGS, key=lambda c: abs(c - middle)))
+
+
+def steadied(voice: Voice, ceiling: float | None) -> Voice:
+    """The recording with F1-F3 also tracked at its speaker's ceiling, for
+    Resonance. Everything else (typical formants, the listener model, gender
+    read) keeps the tracks the recording picked for itself, as those were fitted."""
+    if ceiling is None or ceiling == voice.steady_ceiling:
+        return voice
+    if ceiling == voice.formant_ceiling:
+        tracks = voice.formants
+    else:
+        snd = parselmouth.Sound(voice.y.astype(np.float64), sampling_frequency=SR)
+        tracks = _tracks_at(snd, voice.times, np.flatnonzero(voice.voiced), float(ceiling))
+    out = replace(voice, steady=tracks, steady_ceiling=float(ceiling))
+    if "embedding" in voice.__dict__:  # already worked out; no need to run the model again
+        out.__dict__["embedding"] = voice.__dict__["embedding"]
     return out

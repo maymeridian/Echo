@@ -14,8 +14,8 @@
       "at20": 2.0401
     },
     "resonance": {
-      "at90": 0.561,
-      "at20": 1.2924
+      "at90": 0.5447,
+      "at20": 1.2935
     },
     "articulation": {
       "at90": 0.2476,
@@ -31,23 +31,23 @@
     }
   },
   "weights": {
-    "identity": 0.235,
-    "pitch": 0.147,
-    "melody": 0.118,
-    "resonance": 0.157,
-    "articulation": 0.191,
-    "rhythm": 0.152
+    "identity": 0.233,
+    "pitch": 0.145,
+    "melody": 0.117,
+    "resonance": 0.165,
+    "articulation": 0.189,
+    "rhythm": 0.151
   },
   "overall": {
-    "at90": 19.815,
-    "at20": 68.474
+    "at90": 20.112,
+    "at20": 68.505
   },
   "identity_accept": 0.4124,
   "auc": {
     "identity": 0.989,
     "pitch": 0.805,
     "melody": 0.745,
-    "resonance": 0.825,
+    "resonance": 0.846,
     "articulation": 0.896,
     "tempo": 0.729,
     "timing": 0.587

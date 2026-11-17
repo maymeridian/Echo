@@ -359,3 +359,82 @@ def test_trainer_attempts_are_kept_and_progress_gathers_every_take(tmp_path):
     assert all("parts" in t and t["line"] for t in progress["takes"])
     created = [t["created"] for t in progress["takes"]]
     assert created == sorted(created)  # oldest first
+
+
+def test_the_trainer_measures_a_word_with_the_ceiling_your_takes_settle_on(tmp_path):
+    import json as json_
+
+    from echo_voice.analysis import FORMANT_CEILINGS, analyze
+
+    # analyze() uses a given ceiling as it is, and picks one when there is none.
+    assert analyze(voice(), 6500).formant_ceiling == 6500.0
+    assert analyze(voice()).formant_ceiling in FORMANT_CEILINGS
+
+    client = TestClient(create_app(tmp_path))
+    voice_id = client.post("/api/voices", json={"name": "Synth"}).json()["id"]
+    line_id = client.post("/api/targets", params={"name": "line", "voice": voice_id}, content=wav(voice())).json()["id"]
+    client.patch(f"/api/targets/{line_id}", json={"line": "ah ee oo eh"})
+    meta_path = tmp_path / "targets" / line_id / "meta.json"
+    meta = json_.loads(meta_path.read_text("utf-8"))
+    meta["word_times"] = [{"text": "ah", "start": 0.0, "end": 0.4, "refined": True}]
+    meta_path.write_text(json_.dumps(meta), "utf-8")
+    piece = wav(voice()[: int(0.45 * SR)])
+
+    def drill():
+        return client.post(f"/api/targets/{line_id}/drill", params={"word": 0}, content=piece).json()
+
+    # With no takes to go by, the attempt picks its own ceiling.
+    alone = drill()["ceiling"]
+    assert alone in FORMANT_CEILINGS
+
+    # Every take keeps the ceiling it was measured with.
+    for f0 in (118, 122, 126):
+        take = client.post(f"/api/targets/{line_id}/takes", content=wav(voice(f0=f0))).json()
+        assert take["measures"]["ceiling"] in FORMANT_CEILINGS
+    files = sorted((tmp_path / "targets" / line_id / "takes").glob("*.json"))
+    assert len(files) == 3
+
+    # The trainer then uses the middle one of your takes, whatever the word alone would pick.
+    for path, ceiling in zip(files, (6500.0, 6500.0, 7000.0), strict=True):
+        record = json_.loads(path.read_text("utf-8"))
+        record["measures"]["ceiling"] = ceiling
+        path.write_text(json_.dumps(record), "utf-8")
+    assert alone != 6500.0 and drill()["ceiling"] == 6500.0
+
+    # A take from before ceilings were kept is measured once, and the result written back.
+    record = json_.loads(files[0].read_text("utf-8"))
+    del record["measures"]["ceiling"]
+    files[0].write_text(json_.dumps(record), "utf-8")
+    assert drill()["ceiling"] == 6500.0  # the middle of its own pick, 6500 and 7000
+    assert json_.loads(files[0].read_text("utf-8"))["measures"]["ceiling"] in FORMANT_CEILINGS
+
+
+def test_takes_are_measured_at_one_ceiling_per_speaker(tmp_path):
+    import json as json_
+
+    from echo_voice.analysis import FORMANT_CEILINGS, speaker_ceiling
+
+    client = TestClient(create_app(tmp_path))
+    voice_id = client.post("/api/voices", json={"name": "Synth"}).json()["id"]
+    lines = [
+        client.post("/api/targets", params={"name": f"line {i}", "voice": voice_id}, content=wav(voice(f0=f0))).json()
+        for i, f0 in enumerate((118, 122))
+    ]
+    # Each line keeps the ceiling it picks for itself.
+    assert all(line["ceiling"] in FORMANT_CEILINGS for line in lines)
+
+    first, second = lines[0]["id"], lines[1]["id"]
+    picks = []
+    for f0 in (120, 124, 128):
+        take = client.post(f"/api/targets/{first}/takes", content=wav(voice(f0=f0))).json()
+        picks.append(take["measures"]["ceiling"])
+        # Its own pick is kept, and Resonance used the middle of the picks so far.
+        assert take["measures"]["ceiling_used"] == speaker_ceiling(picks)
+
+    # A line from before its pick was kept gets it on first use.
+    meta_path = tmp_path / "targets" / lines[1]["id"] / "meta.json"
+    meta = json_.loads(meta_path.read_text("utf-8"))
+    del meta["ceiling"]
+    meta_path.write_text(json_.dumps(meta), "utf-8")
+    assert client.post(f"/api/targets/{second}/takes", content=wav(voice())).status_code == 201
+    assert json_.loads(meta_path.read_text("utf-8"))["ceiling"] == lines[1]["ceiling"]

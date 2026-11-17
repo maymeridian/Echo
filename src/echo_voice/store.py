@@ -284,6 +284,7 @@ class Store:
             "auto": auto,
             "median_f0": None if voice.median_f0 is None else round(voice.median_f0, 1),
             "gender": gender.score(voice),
+            "ceiling": voice.formant_ceiling,  # the formant ceiling this line picks for itself
             "takes": 0,
             "best": None,
         }
@@ -369,6 +370,31 @@ class Store:
         if not _ID.match(drill_id) or not path.is_file():
             raise NotFound(drill_id)
         return path
+
+    def take_ceilings(self, voice_id: str, limit: int = 15) -> list[float]:
+        """The formant ceilings picked for the latest takes on a voice's lines.
+        Oldest first, each the take's own pick. Takes from before the ceiling
+        was kept are analysed once and updated."""
+        from .analysis import AnalysisError, analyze, load
+
+        files = []
+        for meta in self.list_targets():
+            if meta.get("voice_id") == voice_id:
+                files += list((self.root / meta["id"] / "takes").glob("*.json"))
+        out = []
+        for path in sorted(files, key=lambda p: p.name)[-limit:]:
+            record = json.loads(path.read_text("utf-8"))
+            measures = record.get("measures") or {}
+            if "ceiling" not in measures:
+                try:
+                    measures["ceiling"] = analyze(load(path.with_suffix(".wav"))).formant_ceiling
+                except (AnalysisError, OSError):
+                    measures["ceiling"] = None
+                record["measures"] = measures
+                path.write_text(json.dumps(record), "utf-8")
+            if measures["ceiling"]:
+                out.append(float(measures["ceiling"]))
+        return out
 
     def last_take(self, target_id: str) -> dict | None:
         paths = sorted((self._target_dir(target_id) / "takes").glob("*.json"))

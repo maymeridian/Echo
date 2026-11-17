@@ -299,8 +299,16 @@ it left off; **▶ You** replays your last attempt.
 restricted to one word against the same word. Formants on single words are
 what Hillenbrand et al. (1995) measured, and where the per-recording ceiling
 was validated. On synthetic vowels with formants moved ±10% it reads +9.2%
-and −9.9%. The target's own word scores 100. Another man saying the same word
-reads 11.5% darker and 6 semitones lower, matching his whole-line result.
+and −9.9%. Another man saying the same word reads 11.5% darker and 6
+semitones lower, matching his whole-line result.
+
+An attempt is measured at your formant ceiling, the middle of what your
+recent takes on the voice picked. It doesn't pick one for itself, because a
+word or a phrase is too short to choose well. On 182 phrases from two VCC2018
+speakers, a phrase cut from its line and scored against that line picked the
+line's ceiling 20% of the time, and its resonance read more than 3% off in
+36% of cases (median 1.7%). Measured at the line's ceiling, that's 13% of
+cases (median 0.7%). `cache/experiments/ceiling/self_units.py` runs it.
 
 **Word edges.** Whisper's word times are approximate and often end a word
 early, so a word played on its own was cut off. Word edges are moved onto the
@@ -427,12 +435,12 @@ part needs **both recordings to say the same words**.
 
 | Part | Weight | What is compared |
 | --- | --- | --- |
-| Voice | 24% | The rating listeners would likely give the pair; doesn't depend on the words |
-| Pitch | 15% | Median pitch, in semitones |
-| Melody | 12% | Shape of the pitch contour once the level difference is removed |
-| Resonance | 16% | Formants F1–F3 on aligned voiced frames (brighter or darker) |
-| Articulation | 19% | MFCC distance along the alignment (how the sounds are shaped) |
-| Rhythm | 15% | Length from first to last voiced sound, and timing within the line |
+| Voice | 23.3% | The rating listeners would likely give the pair; doesn't depend on the words |
+| Pitch | 14.5% | Median pitch, in semitones |
+| Melody | 11.7% | Shape of the pitch contour once the level difference is removed |
+| Resonance | 16.5% | Formants F1–F3 on aligned voiced frames (brighter or darker), at one formant ceiling per speaker |
+| Articulation | 18.9% | MFCC distance along the alignment (how the sounds are shaped) |
+| Rhythm | 15.1% | Length from first to last voiced sound, and timing within the line |
 
 Voice is a small model trained on human ratings (VoxSim, below). It predicts
 the listener rating from three things:
@@ -447,7 +455,9 @@ It's constrained so that more similarity can only raise the rating and bigger
 gaps can only lower it.
 Pitch and formants come from Praat (via parselmouth). Each recording gets its
 own formant ceiling: the one, from 4500 to 7000 Hz, whose tracks jump least from
-frame to frame. MFCCs and alignment come from librosa.
+frame to frame. Resonance reads formants at one ceiling per speaker instead,
+the middle of what that speaker's recordings pick (see Formants, below). MFCCs
+and alignment come from librosa.
 
 ### Calibration
 
@@ -469,12 +479,18 @@ Headline scores on the calibration pairs (10th / 50th / 90th percentile):
 
 | Pair | Score |
 | --- | --- |
-| Same actor, same line, clean | 71 / 98 / 100 |
-| Same actor, same line, through a mic | 46 / 90 / 100 |
-| Same actor, different emotion | 33 / 72 / 97 |
-| Same actor, other sentence | 28 / 58 / 83 |
-| Same-sex stranger, same line | 12 / 20 / 40 |
-| Other-sex stranger, same line, same emotion | 11 / 15 / 24 |
+| Same actor, same line, clean | 67 / 98 / 100 |
+| Same actor, same line, through a mic | 42 / 90 / 100 |
+| Same actor, different emotion | 28 / 71 / 97 |
+| Same actor, other sentence | 27 / 58 / 83 |
+| Same-sex stranger, same line | 11 / 20 / 43 |
+| Other-sex stranger, same line, same emotion | 10 / 14 / 24 |
+
+Resonance is measured as the app measures it, at one formant ceiling per
+speaker. The app has about five lines of a voice and a few of your takes to
+choose that from, so `collect` tracks each recording at the middle of its own
+pick and the picks of four other recordings of the same actor through the same
+channel.
 
 To re-run it, download `Audio_Speech_Actors_01-24.zip` from Zenodo and unzip
 it into `cache/ravdess`, then:
@@ -497,9 +513,9 @@ four CMU ARCTIC clips agrees with the scale:
 
 | ARCTIC pair | Score |
 | --- | --- |
-| Another man, same line | 31 |
-| A woman, same line | 27 |
-| Same man, other sentence (passes the speaker check) | 76 |
+| Another man, same line | 30 |
+| A woman, same line | 26 |
+| Same man, other sentence (passes the speaker check) | 74 |
 | Same man, through a simulated mic | above 85 |
 
 ### Things that were wrong and are now tested
@@ -518,6 +534,11 @@ four CMU ARCTIC clips agrees with the scale:
 - **Formant ceiling:** a fixed 5500 Hz ceiling mis-tracked women's and
   children's F2 and F3 (see Validation). The ceiling is now chosen per
   recording.
+- **Resonance moved when the voice hadn't:** the same person got a different
+  ceiling from one recording to the next, and each switch shifted the
+  formants. Resonance now uses one ceiling per speaker (see Formants).
+  A trainer attempt on one word chose its own ceiling too, and a word is too
+  short for that; it now uses yours.
 
 ## Validation
 
@@ -546,6 +567,11 @@ test of what the app measures.
 The table shows Pearson correlation with the mean listener rating. The
 per-system column averages over 72 groups (system × compared-with × task),
 each with many ratings.
+
+Rechecked on 2026-11-16 after Resonance was recalibrated for one ceiling per
+speaker: the headline is unchanged at 0.528 per pair and 0.939 per system
+(`cache/vcc_recheck.py`, from cached features). Resonance in this test still
+uses a ceiling per recording; it wasn't rerun with one per speaker.
 
 Each pair has only 1.4 ratings on average, so listener noise caps the per-pair
 numbers. For comparison, Ahn et al. (2024,
@@ -670,6 +696,39 @@ measurements more than 15% off:
 Median errors are 1–2% throughout. The chosen ceilings come out where
 phonetics puts them without being told: 5000 Hz for men, 5750 for women and
 6000 for children.
+
+**One ceiling per speaker for Resonance.** The per-recording pick is right on
+average but not steady. Over an actor's 60 RAVDESS recordings it lands on 5.4
+different ceilings, and each change moves the formants a little, so Resonance
+moved between takes when the voice hadn't. Resonance compares formants frame
+by frame, so it now reads both sides at one ceiling per speaker
+(`analysis.speaker_ceiling`, `analysis.steadied`):
+
+- **The voice:** the middle of what its lines pick.
+- **You:** the middle of what your last 15 takes on that voice picked, the
+  new one included.
+
+On the RAVDESS calibration pairs, telling an actor's retake from a same-sex
+stranger by Resonance alone (AUC; the bar set before the run was +0.02 with
+the median retake no further off):
+
+| Ceiling | AUC | Median retake | Worst 10% of retakes |
+| --- | --- | --- | --- |
+| Per recording (before) | 0.825 | 0.56 st | 1.19 st |
+| Per speaker, from 5 recordings (as the app has) | 0.848 | 0.53 st | 1.07 st |
+| Per speaker, from all 60 | 0.849 | 0.53 st | 1.04 st |
+
+The gain from five recordings is +0.023 (bootstrap 95% interval +0.013 to
++0.033). On the author's own 55 practice takes, the change in Resonance from one
+take to the next fell from 1.62 to 1.40 semitones at the 90th percentile, and
+the spread across the takes of a line from 0.75 to 0.52. The calibration was
+collected again this way: Resonance's AUC in `calibration.json` is 0.846, and
+its weight went from 15.7% to 16.5%.
+
+Typical formants, the listener model and the gender read keep each
+recording's own pick, because that is how they were fitted (VoxSim pairs are
+single clips with no other recordings of the speaker). The experiment is in
+`cache/experiments/ceiling/` (`ceiling_exp.py`, `boot.py`, `user_takes.py`).
 
 ### Clip cleaning
 

@@ -88,7 +88,7 @@ def measure(target: Voice, take: Voice) -> Measures:
             float(np.percentile(b, 95) - np.percentile(b, 5)),
         )
 
-    fa, fb = target.formants[:, ti], take.formants[:, ki]
+    fa, fb = target.resonance_formants[:, ti], take.resonance_formants[:, ki]
     ok = np.isfinite(fa).all(axis=0) & np.isfinite(fb).all(axis=0)
     if ok.sum() >= MIN_VOICED_FRAMES:
         # Median per formant: single-frame tracking errors are common and large.
@@ -199,6 +199,10 @@ def compare(
             "take_f0": None if take.median_f0 is None else round(take.median_f0, 1),
             "resonance": None if m.resonance_shift is None else round(m.resonance_shift, 2),
             "tempo": round(2**m.tempo, 3),
+            # The formant ceiling the take picks for itself, and the one Resonance
+            # was measured with (the middle of your recent takes' picks).
+            "ceiling": take.formant_ceiling,
+            "ceiling_used": take.steady_ceiling or take.formant_ceiling,
         },
         "hints": (_line_hints(check) + [c.hint for c in weakest])[:3],
         "line": None if check is None else {
@@ -262,7 +266,7 @@ def word_breakdown(target: Voice, take: Voice, m: Measures, word_times: list[dic
         b = take.f0[kf][take.voiced[kf]]
         if min(a.size, b.size) >= MIN_WORD_FRAMES:
             row["pitch"] = round(float(np.median(_semitones(b)) - np.median(_semitones(a))), 2)
-        fa, fb = target.formants[:, tf], take.formants[:, kf]
+        fa, fb = target.resonance_formants[:, tf], take.resonance_formants[:, kf]
         fa, fb = fa[:, np.isfinite(fa).all(axis=0)], fb[:, np.isfinite(fb).all(axis=0)]
         if min(fa.shape[1], fb.shape[1]) >= MIN_WORD_FRAMES:
             row["resonance"] = round(float(_semitones(np.median(fb, axis=1) / np.median(fa, axis=1)).mean()), 2)
@@ -308,7 +312,7 @@ def word_drill(target: Voice, word: dict, attempt: Voice) -> dict:
     voiced = b.size >= MIN_WORD_FRAMES
     if a.size >= MIN_WORD_FRAMES and voiced:
         out["pitch"] = round(float(np.median(_semitones(b)) - np.median(_semitones(a))), 2)
-    fa, fb = target.formants[:, on], attempt.formants[:, spoken]
+    fa, fb = target.resonance_formants[:, on], attempt.resonance_formants[:, spoken]
     fa, fb = fa[:, np.isfinite(fa).all(axis=0)], fb[:, np.isfinite(fb).all(axis=0)]
     if min(fa.shape[1], fb.shape[1]) >= MIN_WORD_FRAMES:
         shift = float(_semitones(np.median(fb, axis=1) / np.median(fa, axis=1)).mean())
