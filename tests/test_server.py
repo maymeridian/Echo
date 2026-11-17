@@ -118,7 +118,7 @@ def test_takes_get_word_by_word_feedback_and_a_coach(tmp_path):
     guide = client.get(f"/api/targets/{target['id']}/profile").json()
     assert guide["duration"] > 2 and 0 <= guide["onset"] < 0.5
     assert len(guide["contour"]["t"]) == len(guide["contour"]["f0"]) > 50
-    assert [w["text"] for w in guide["words"]][:2] == ["Author", "of"]
+    assert [w["text"] for w in guide["words"]][:2] == ["Author", "of the"]  # run together, so one unit
 
     first = client.post(f"/api/targets/{target['id']}/takes", content=(ARCTIC / "rms_arctic_a0001.wav").read_bytes()).json()
     assert len(first["words"]) >= 6  # rms says the same sentence
@@ -145,7 +145,7 @@ def test_takes_get_word_by_word_feedback_and_a_coach(tmp_path):
     assert client.post(f"/api/targets/{target['id']}/drill", params={"word": 99}, content=wav(piece)).status_code == 404
 
     takes = client.get(f"/api/targets/{target['id']}/takes").json()
-    assert set(takes[0]["parts"]) == {"identity", "pitch", "melody", "resonance", "articulation", "rhythm"}
+    assert set(takes[0]["parts"]) == {"identity", "pitch", "melody", "resonance", "articulation", "rhythm", "gender"}
     assert [t["focus"] for t in takes] == [first["coach"]["focus"], "melody"]
     listed = client.get("/api/targets").json()[0]
     assert listed["takes"] == 2 and listed["best"] == max(first["overall"], second["overall"])

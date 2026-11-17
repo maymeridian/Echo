@@ -403,7 +403,15 @@ function renderHome() {
 
 // ---------- a voice: its score, lines and recordings ----------
 
-async function openVoice(id) {
+let voiceTab = "practise"; // which part of the voice's page is showing
+
+function setVoiceTab(tab) {
+  voiceTab = tab;
+  for (const b of document.querySelectorAll("#voice-tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  for (const pane of document.querySelectorAll("#voice .pane")) pane.hidden = pane.dataset.pane !== tab;
+}
+
+async function openVoice(id, tab = null) {
   leave();
   try {
     voice = await api(`/api/voices/${id}`); // a merged voice answers as the one it joined
@@ -414,6 +422,8 @@ async function openVoice(id) {
   remember(`voice:${voice.id}`);
   renderSidebar();
   renderVoice();
+  // A voice with no lines yet opens on "Add lines".
+  setVoiceTab(tab ?? (voice.lines.length ? "practise" : "add"));
   show("voice");
 }
 
@@ -581,6 +591,7 @@ async function renderProgressView() {
   if (voice?.id !== id) return;
   const all = data.takes;
   $("#progress-view").hidden = all.length < 2;
+  $("#progress-empty").hidden = all.length >= 2;
   if (all.length < 2) return;
 
   // Every take, oldest to newest, with the average of the last five.
@@ -725,10 +736,12 @@ function renderScoreCard() {
       ),
       voice.checks.length >= 2 ? el("div", { className: "check-trend", title: "Voice score at each check" }, sparkline(voice.checks.map((c) => c.average))) : null,
     ),
-    ladder(voice.score, before?.average ?? null),
-    el("p", { className: "fine" }, what),
-    need,
-    el("div", { className: "score-card-buttons" }, run, seeLast),
+    ...[
+      ladder(voice.score, before?.average ?? null),
+      el("p", { className: "fine" }, what),
+      need,
+      el("div", { className: "score-card-buttons" }, run, seeLast),
+    ].filter(Boolean),
   );
 }
 
@@ -1077,7 +1090,7 @@ async function openSource(meta) {
   remember(`source:${meta.id}`);
   const owner = voiceOf(meta.voice_id);
   $("#source-crumb").textContent = owner ? `‹ ${owner.name}` : "‹ Home";
-  $("#source-crumb").onclick = () => (owner ? openVoice(owner.id) : goHome());
+  $("#source-crumb").onclick = () => (owner ? openVoice(owner.id, "add") : goHome());
   renderSidebar();
   renderSource();
   show("source");
@@ -1713,6 +1726,7 @@ function drawGuide() {
 
   // The words along the bottom; the selected one shaded.
   const words = shownWords();
+  let labelled = -Infinity; // where the last label ended, so the next doesn't sit on it
   words.forEach((word, i) => {
     const a = x(word.start);
     const b = x(word.end);
@@ -1725,10 +1739,13 @@ function drawGuide() {
     g.moveTo(a, h - pad.bottom);
     g.lineTo(a, h - pad.bottom + 5);
     g.stroke();
-    const label = word.text.replace(/[.,!?;:"“”]+/g, "");
-    if (g.measureText(label).width < b - a + 14) {
+    let label = word.text.replace(/[.,!?;:"“”]+/g, "");
+    const room = (words[i + 1] ? x(words[i + 1].start) : w - pad.right) - a - 6;
+    while (label.length > 3 && g.measureText(label).width > room) label = `${label.slice(0, -2)}…`;
+    if (a + 2 >= labelled && g.measureText(label).width <= room) {
       g.fillStyle = i === selectedWord ? css("--text") : css("--muted");
       g.fillText(label, a + 2, h - 8);
+      labelled = a + 2 + g.measureText(label).width + 4;
     }
   });
 
@@ -1769,7 +1786,45 @@ function drawGuide() {
 
 // ---------- the words: where in the line you're furthest off ----------
 
-const shownWords = () => (shown?.words?.length ? shown.words : profile?.words ?? []);
+// A take's rows on the line's units. A take from before words said together
+// were grouped has a row per word; those are combined, unit by unit.
+let unitCache = { key: "", rows: [] };
+
+function takeUnits(take) {
+  const units = profile?.words ?? [];
+  const rows = take?.words ?? [];
+  if (!rows.length || !units.length) return rows;
+  if (rows.length === units.length && rows.every((r, i) => Math.abs(r.start - units[i].start) < 0.02)) return rows;
+  const key = `${take.id}:${units.length}:${units[0].start}`;
+  if (unitCache.key === key) return unitCache.rows;
+  const mean = (values) => {
+    const v = values.filter((x) => x != null);
+    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+  };
+  const combined = units.map((u) => {
+    const inside = rows.filter((r) => (r.start + r.end) / 2 >= u.start - 0.02 && (r.start + r.end) / 2 < u.end + 0.02);
+    if (!inside.length) return { text: u.text, start: u.start, end: u.end };
+    const scores = Object.fromEntries(WORD_PARTS.map((k) => [k, mean(inside.map((r) => r.scores?.[k]))]));
+    const scored = Object.entries(scores).filter(([, s]) => s != null);
+    return {
+      text: u.text,
+      start: u.start,
+      end: u.end,
+      take_start: Math.min(...inside.map((r) => r.take_start)),
+      take_end: Math.max(...inside.map((r) => r.take_end)),
+      pitch: mean(inside.map((r) => r.pitch)),
+      melody: mean(inside.map((r) => r.melody)),
+      resonance: mean(inside.map((r) => r.resonance)),
+      articulation: mean(inside.map((r) => r.articulation)),
+      scores,
+      worst: scored.length ? scored.reduce((a, b) => (b[1] < a[1] ? b : a))[0] : null,
+    };
+  });
+  unitCache = { key, rows: combined };
+  return combined;
+}
+
+const shownWords = () => (shown?.words?.length ? takeUnits(shown) : profile?.words ?? []);
 
 function wordScore(word, key) {
   if (!word.scores) return null;
@@ -2133,7 +2188,7 @@ async function openTrainer(part) {
     return;
   }
   const words = profile?.words ?? [];
-  const scored = shown?.words ?? [];
+  const scored = shown ? takeUnits(shown) : [];
   const score = (i) => {
     const w = scored.find((x) => x.start === words[i].start);
     return w ? modeScore(w, part) : null;
@@ -2149,7 +2204,11 @@ async function openTrainer(part) {
     try {
       const saved = await api(`/api/targets/${current.id}/drills`);
       if (!training) return;
-      for (const r of saved) (training.attempts[r.word] ??= []).push(r);
+      for (const r of saved) {
+        // By position, not number: the line's units may have been regrouped since.
+        const unit = (profile?.words ?? []).findIndex((w) => r.start >= w.start - 0.02 && r.start < w.end);
+        if (unit >= 0) (training.attempts[unit] ??= []).push(r);
+      }
       // Start at the first word not done yet.
       const next = training.order.findIndex((i) => !passedWord(training.attempts[i] ?? [], training.part));
       training.at = Math.max(0, next);
@@ -2230,7 +2289,7 @@ function renderTrainer() {
   renderDrillMap(part, tries);
   $("#train-mine").disabled = !last?.id;
   $("#train-result").className = "train-result";
-  if (!last) $("#train-result").textContent = "Play the target's word, then press Say it and say just that word.";
+  if (!last) $("#train-result").textContent = "Play the target, then press Say it and say just that.";
   else $("#train-result").replaceChildren(...drillVerdict(part, last));
   $("#train-attempts").replaceChildren(
     ...tries.map((r, k) => {
@@ -2640,14 +2699,24 @@ function renderResult() {
   }
 
   const focus = currentFocus();
-  const history = takes.slice(0, index + 1);
+  const rows = [...shown.components];
+  if (!rows.some((c) => c.key === "gender") && shown.gender?.take != null && shown.gender?.target != null) {
+    // A take from before gender read was a measurement: the same row, worked out here.
+    const { take, target } = shown.gender;
+    rows.push({
+      key: "gender",
+      label: "Gender read",
+      score: Math.max(0, 100 - Math.abs(take - target)),
+      detail: `you read ${Math.round(take)} (${genderWord(take)}), the target ${Math.round(target)} (${genderWord(target)}); 0 is male, 100 female`,
+    });
+  }
   $("#components").replaceChildren(
-    ...shown.components.map((c) => {
+    ...rows.map((c) => {
       const before = previous?.parts?.[c.key];
       const change = c.score != null && before != null ? Math.round(c.score - before) : null;
       return el(
         "li",
-        { className: c.key === focus ? "focus" : "" },
+        { className: `${c.key === focus ? "focus" : ""}${c.key === "gender" ? " extra" : ""}` },
         el("span", { className: "label", textContent: c.label }),
         bar(c.score),
         el("span", { className: "num", textContent: c.score == null ? "–" : Math.round(c.score) }),
@@ -2656,14 +2725,11 @@ function renderResult() {
           textContent: change == null ? "" : delta(c.score, before),
           title: change == null ? "" : "Change since your last take",
         }),
-        sparkline(history.map((t) => t.parts?.[c.key] ?? null)),
         trainButton(c.key),
-        el("span", { className: "detail", textContent: c.detail }),
+        el("span", { className: "detail", textContent: c.key === "gender" ? `${c.detail}. Not counted in the score.` : c.detail }),
       );
     }),
   );
-
-    renderGender();
 
   // Advice on the parts is the coach's job; here only what's left: the words.
   const partHints = new Set(shown.components.map((c) => c.hint));
@@ -2676,35 +2742,18 @@ function renderResult() {
 function trainButton(key) {
   if (key === "identity") return el("span");
   const button = el("button", { type: "button", className: "train-btn", textContent: "Train ›" });
+  if (key === "gender") {
+    // Gender read is pitch and resonance, so that's what moves it.
+    button.title = "Work on pitch and resonance together, word by word";
+    button.onclick = () => openTrainer("both");
+    return button;
+  }
   button.title = TRAIN[key] ? `Work on ${partLabel(key).toLowerCase()} word by word` : `Work on ${partLabel(key).toLowerCase()} across the line`;
   button.onclick = () => openTrainer(key);
   return button;
 }
 
 const genderWord = (v) => (v >= 80 ? "female" : v >= 60 ? "leans female" : v > 40 ? "in between" : v > 20 ? "leans male" : "male");
-
-// How female or male the take reads against the target, 0 (male) to 100 (female).
-function renderGender() {
-  const g = shown?.gender;
-  const ok = g && g.target != null && g.take != null;
-  $("#gender-read").hidden = !ok;
-  if (!ok) return;
-  const mark = (value, cls, label) => {
-    const i = el("i", { className: cls, title: `${label}: ${Math.round(value)}` });
-    i.style.left = `${value}%`;
-    return i;
-  };
-  const gap = Math.round(g.take - g.target);
-  const note =
-    Math.abs(gap) < 10
-      ? "about the same as the target"
-      : `${Math.abs(gap)} ${gap < 0 ? "more male" : "more female"} than the target; pitch and resonance move it`;
-  $("#gender-read").replaceChildren(
-    el("p", {}, el("b", { textContent: "Gender read" }), ` · you ${Math.round(g.take)} (${genderWord(g.take)}), the target ${Math.round(g.target)} (${genderWord(g.target)}): ${note}.`),
-    el("div", { className: "gender-track" }, mark(g.target, "target-mark", "Target"), mark(g.take, "take-mark", "You")),
-    el("div", { className: "gender-ends" }, el("span", { textContent: "0 male" }), el("span", { textContent: "100 female" })),
-  );
-}
 
 function renderHistory() {
   $("#history").hidden = takes.length < 2 || inCheck();
@@ -2932,6 +2981,7 @@ for (const [form, input] of [["#new-voice-form", "#new-voice-name"], ["#first-vo
   };
 }
 $("#rename-voice").onclick = renameVoice;
+for (const b of document.querySelectorAll("#voice-tabs button")) b.onclick = () => setVoiceTab(b.dataset.tab);
 $("#autopick").onclick = autoPick;
 $("#delete-voice").onclick = deleteVoice;
 $("#record").onclick = () => toggleRecording("take");

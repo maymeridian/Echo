@@ -169,6 +169,7 @@ def compare(
         _resonance(m, scores["resonance"]),
         _articulation(m, scores["articulation"]),
         _rhythm(m, scores["rhythm"], None if check is None else not check.flagged),
+        _gender(target, take),
     ]
     scored = [c for c in components if c.score is not None]
     weakest = sorted((c for c in scored if c.hint and c.score < 80), key=lambda c: c.score)
@@ -502,6 +503,19 @@ def _line_hints(check: line.LineCheck | None) -> list[str]:
     hints += [f"You left out “{_phrase(w)}”." for w in check.runs("miss")]
     hints += [f"You added “{_phrase(w)}”." for w in check.runs("extra")]
     return hints[:2]
+
+
+def _gender(target: Voice, take: Voice) -> Component:
+    """How female or male the take reads against the target (gender.py), as a
+    row among the measurements: 100 when the two read the same. It isn't
+    weighted into the headline, which already counts pitch and resonance."""
+    a, b = gender.score(target), gender.score(take)
+    if a is None or b is None:
+        return Component("gender", "Gender read", None, "not enough voiced sound to measure")
+    gap = b - a
+    how = "the same as the target" if abs(gap) < 5 else f"{abs(gap):.0f} more {'female' if gap > 0 else 'male'} than the target"
+    detail = f"you read {b:.0f} ({gender.describe(b)}), the target {a:.0f} ({gender.describe(a)}): {how}; 0 is male, 100 female"
+    return Component("gender", "Gender read", max(0.0, 100.0 - abs(gap)), detail)
 
 
 def _unreliable(key: str, label: str) -> Component:

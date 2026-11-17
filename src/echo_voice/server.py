@@ -120,9 +120,10 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         return store.list_targets()
 
     def target_words(target_id: str, voice: Voice) -> tuple[list[str], list[dict]]:
-        """The target's words, and where each one is, transcribed once and kept
-        with the clip. The words can be corrected by hand; the timings stay as
-        heard, for the word-by-word comparison."""
+        """The target's words, and its speech units: the words as they're said,
+        with ones run together as one unit (line.speech_units). Both are worked
+        out once and kept with the clip. The words can be corrected by hand;
+        the units stay as heard, for the word-by-word comparison."""
         meta = store.target_meta(target_id)
         if meta.get("word_times") is None:  # targets from before timings were kept
             timed = line.transcribe_timed(voice.y)
@@ -131,7 +132,10 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         elif meta["word_times"] and not all(w.get("refined") for w in meta["word_times"]):
             # Timings from before word edges were moved onto the audio.
             meta = store.update_target(target_id, word_times=line.refine_word_times(voice.y, meta["word_times"]))
-        return meta["words"], meta["word_times"]
+        if meta.get("units_v") != line.UNITS_VERSION:
+            units = line.speech_units(voice.y, meta["word_times"])
+            meta = store.update_target(target_id, units=units, units_v=line.UNITS_VERSION)
+        return meta["words"], meta["units"]
 
     def known_voice(voice_id: str) -> dict | None:
         try:
@@ -191,13 +195,20 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         f0 = voice.f0[voice.voiced]
         step = 2  # 20 ms is plenty for a chart
         voiced = np.flatnonzero(voice.voiced)
+        # For drawing, leave out the pitch tracker's slips: points more than 7
+        # semitones from the line's median, nearly always an octave error on a
+        # creaky or breathy stretch. They'd stretch the chart and aren't a
+        # tune anyone should follow. Scoring uses medians, which ignore them.
+        drawn = voice.f0.copy()
+        if f0.size >= 20:
+            drawn[np.abs(12 * np.log2(np.where(np.isfinite(drawn), drawn, np.median(f0)) / np.median(f0))) > 7] = np.nan
         out = {
             "pitch_suspect": pitch_suspect(store.target_meta(target_id)),
             "duration": round(voice.duration, 2),
             "onset": round(float(voice.times[voiced[0]]), 2) if voiced.size else 0.0,
             "contour": {
                 "t": [round(float(t), 2) for t in voice.times[::step]],
-                "f0": [round(float(v), 1) if np.isfinite(v) else None for v in voice.f0[::step]],
+                "f0": [round(float(v), 1) if np.isfinite(v) else None for v in drawn[::step]],
             },
             "words": timed,
             "median_f0": None,

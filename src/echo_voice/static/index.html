@@ -89,45 +89,57 @@
           </div>
         </header>
         <section id="voice-progress" class="card progress-card" hidden aria-live="polite"></section>
-        <section id="score-card" class="card score-card" aria-label="Voice score"></section>
-        <section id="progress-view" class="card progress-view" hidden aria-label="Your progress"></section>
-        <section id="voice-glance" class="card glance" hidden aria-label="The voice at a glance">
-          <div class="glance-row"><h3>The voice</h3><p id="glance-voice"></p></div>
-          <div class="glance-row"><h3>You</h3><p id="glance-you"></p></div>
-          <div id="glance-gender-row" class="glance-row" hidden><h3>Reads as</h3><p id="glance-gender"></p></div>
-        </section>
-        <section id="speakers-card" class="card speakers-card" hidden aria-label="Who's speaking"></section>
-        <section class="vlines-wrap" aria-labelledby="lines-head">
-          <div class="section-head">
-            <h3 id="lines-head">Your lines</h3>
-            <p class="fine">The lines you've added to practise. Ticked ones go in the voice check.</p>
-          </div>
-          <ol id="voice-lines" class="vlines"></ol>
-        </section>
-        <section id="suggest-wrap" class="suggest-wrap" hidden aria-labelledby="sug-head">
-          <div class="section-head">
-            <h3 id="sug-head">Suggested lines</h3>
-            <button id="autopick" class="btn primary autopick" type="button" hidden></button>
-          </div>
-          <p class="fine">The best lines from its recordings that you haven't added yet: clear, in the voice's usual pitch, and about 3 seconds long.</p>
-          <ol id="suggestions" class="vlines"></ol>
-        </section>
-        <section class="card add-card" aria-labelledby="add-head">
-          <h3 id="add-head">Add lines</h3>
-          <form id="link-form" class="row">
-            <input id="new-link" type="url" placeholder="Paste a YouTube link" aria-label="Video link">
-            <button class="btn get" type="submit">Get lines</button>
-          </form>
-          <div class="row">
-            <label class="btn"><input id="new-file" type="file" accept="audio/*,video/*" hidden>Upload a file</label>
-            <button id="new-record" class="btn" type="button">Record a clip</button>
-          </div>
-          <p class="fine">A video or recording over a minute long is split into lines to pick from. A short clip becomes one line.</p>
-        </section>
-        <section id="recordings-wrap" class="recordings-wrap" hidden aria-labelledby="rec-head">
-          <h3 id="rec-head">Recordings</h3>
-          <ul id="recordings" class="recordings"></ul>
-        </section>
+        <div id="voice-tabs" class="tabs" role="tablist" aria-label="This voice">
+          <button type="button" role="tab" data-tab="practise" aria-selected="true">Practise</button>
+          <button type="button" role="tab" data-tab="progress" aria-selected="false">Progress</button>
+          <button type="button" role="tab" data-tab="add" aria-selected="false">Add lines</button>
+        </div>
+        <div class="pane" data-pane="practise">
+          <section id="score-card" class="card score-card" aria-label="Voice score"></section>
+          <section class="vlines-wrap" aria-labelledby="lines-head">
+            <div class="section-head">
+              <h3 id="lines-head">Your lines</h3>
+              <p class="fine">The lines you've added to practise. Ticked ones go in the voice check.</p>
+            </div>
+            <ol id="voice-lines" class="vlines"></ol>
+          </section>
+        </div>
+        <div class="pane" data-pane="progress" hidden>
+          <section id="progress-view" class="card progress-view" hidden aria-label="Your progress"></section>
+          <section id="voice-glance" class="card glance" hidden aria-label="The voice at a glance">
+            <div class="glance-row"><h3>The voice</h3><p id="glance-voice"></p></div>
+            <div class="glance-row"><h3>You</h3><p id="glance-you"></p></div>
+            <div id="glance-gender-row" class="glance-row" hidden><h3>Reads as</h3><p id="glance-gender"></p></div>
+          </section>
+          <p id="progress-empty" class="fine" hidden>Record a couple of takes and your progress shows here.</p>
+        </div>
+        <div class="pane" data-pane="add" hidden>
+          <section id="speakers-card" class="card speakers-card" hidden aria-label="Who's speaking"></section>
+          <section id="suggest-wrap" class="suggest-wrap" hidden aria-labelledby="sug-head">
+            <div class="section-head">
+              <h3 id="sug-head">Suggested lines</h3>
+              <button id="autopick" class="btn primary autopick" type="button" hidden></button>
+            </div>
+            <p class="fine">The best lines from its recordings that you haven't added yet: clear, in the voice's usual pitch, and about 3 seconds long.</p>
+            <ol id="suggestions" class="vlines"></ol>
+          </section>
+          <section class="card add-card" aria-labelledby="add-head">
+            <h3 id="add-head">Add lines</h3>
+            <form id="link-form" class="row">
+              <input id="new-link" type="url" placeholder="Paste a YouTube link" aria-label="Video link">
+              <button class="btn get" type="submit">Get lines</button>
+            </form>
+            <div class="row">
+              <label class="btn"><input id="new-file" type="file" accept="audio/*,video/*" hidden>Upload a file</label>
+              <button id="new-record" class="btn" type="button">Record a clip</button>
+            </div>
+            <p class="fine">A video or recording over a minute long is split into lines to pick from. A short clip becomes one line.</p>
+          </section>
+          <section id="recordings-wrap" class="recordings-wrap" hidden aria-labelledby="rec-head">
+            <h3 id="rec-head">Recordings</h3>
+            <ul id="recordings" class="recordings"></ul>
+          </section>
+        </div>
       </section>
 
       <section id="trim" class="trim" hidden>
@@ -200,94 +212,98 @@
           <button id="cancel-line" class="link" type="button">Cancel</button>
         </form>
 
-        <section class="card guide-card" aria-label="Listen and follow">
-          <div class="guide-bar">
-            <div class="listen">
-              <button id="play-target" class="pill" type="button"><span class="icon">▶</span> Target</button>
-              <button id="play-take" class="pill" type="button" disabled><span class="icon">▶</span> You</button>
-              <button id="play-both" class="pill" type="button" disabled><span class="icon">▶</span> Both</button>
-              <button id="play-note" class="pill note" type="button" title="A tone on the target's typical pitch, to hum"><span class="icon">♪</span> <span id="note-name">Note</span></button>
-            </div>
-            <div class="speed" role="group" aria-label="Playback speed">
-              <button type="button" data-rate="1" aria-pressed="true">1×</button>
-              <button type="button" data-rate="0.75" aria-pressed="false">¾</button>
-              <button type="button" data-rate="0.5" aria-pressed="false">½</button>
-            </div>
-          </div>
-          <canvas id="guide" aria-label="The target's pitch through the line, with yours over it"></canvas>
-          <div class="guide-foot">
-            <span class="legend"><i class="sw target"></i>target <i class="sw take"></i>you</span>
-            <span id="words-caption" class="fine"></span>
-          </div>
-          <div id="words" class="words" hidden></div>
-          <p id="word-note" class="word-note" hidden></p>
-        </section>
 
-        <section id="coach" class="card coach" aria-label="Coach">
-          <div class="coach-head">
-            <h3>What to do now</h3>
-            <div id="focus-chips" class="chips" role="group" aria-label="What to work on"></div>
-          </div>
-          <p id="coach-progress" class="coach-progress" hidden></p>
-          <p id="coach-focus" class="coach-focus"></p>
-          <p id="coach-message" class="coach-message"></p>
-          <p id="coach-words" class="coach-words" hidden></p>
-          <p id="coach-stuck" class="coach-stuck" hidden></p>
-          <ol id="checklist" class="checklist" hidden></ol>
-          <div id="drill" class="drill" hidden>
-            <p class="drill-title">Drill</p>
-            <ol id="drill-steps" class="drill-steps"></ol>
-            <div id="drill-actions" class="drill-actions"></div>
-          </div>
-          <div id="plateau" class="plateau" hidden>
-            <p id="plateau-text"></p>
-            <div id="plateau-actions" class="drill-actions"></div>
-          </div>
-        </section>
 
-        <div class="recorder">
-          <button id="record" class="record" type="button">
-            <span class="dot"></span><span id="record-label">Record a take</span>
-          </button>
-          <button id="warmup" class="btn warmup" type="button" title="Live pitch on the guide, nothing saved">Warm up</button>
-          <div class="meter" aria-hidden="true"><div id="level"></div></div>
-          <span class="fine keys"><kbd>Space</kbd> starts and stops</span>
+
+
+        <div class="line-grid">
+          <div class="line-main">
+            <section class="card guide-card" aria-label="Listen and follow">
+              <div class="guide-bar">
+                <div class="listen">
+                  <button id="play-target" class="pill" type="button"><span class="icon">▶</span> Target</button>
+                  <button id="play-take" class="pill" type="button" disabled><span class="icon">▶</span> You</button>
+                  <button id="play-both" class="pill" type="button" disabled><span class="icon">▶</span> Both</button>
+                  <button id="play-note" class="pill note" type="button" title="A tone on the target's typical pitch, to hum"><span class="icon">♪</span> <span id="note-name">Note</span></button>
+                </div>
+                <div class="speed" role="group" aria-label="Playback speed">
+                  <button type="button" data-rate="1" aria-pressed="true">1×</button>
+                  <button type="button" data-rate="0.75" aria-pressed="false">¾</button>
+                  <button type="button" data-rate="0.5" aria-pressed="false">½</button>
+                </div>
+              </div>
+              <canvas id="guide" aria-label="The target's pitch through the line, with yours over it"></canvas>
+              <div class="guide-foot">
+                <span class="legend"><i class="sw target"></i>target <i class="sw take"></i>you</span>
+                <span id="words-caption" class="fine"></span>
+              </div>
+              <div id="words" class="words" hidden></div>
+              <p id="word-note" class="word-note" hidden></p>
+            </section>
+            <div class="recorder">
+              <button id="record" class="record" type="button">
+                <span class="dot"></span><span id="record-label">Record a take</span>
+              </button>
+              <button id="warmup" class="btn warmup" type="button" title="Live pitch on the guide, nothing saved">Warm up</button>
+              <div class="meter" aria-hidden="true"><div id="level"></div></div>
+              <span class="fine keys"><kbd>Space</kbd> starts and stops</span>
+            </div>
+            <div id="live" class="live" hidden>
+              <p id="live-text" class="live-text"></p>
+            </div>
+            <section id="result" class="card result" hidden>
+              <div class="score-row">
+                <div class="ring" aria-hidden="true">
+                  <svg viewBox="0 0 80 80"><circle class="ring-track" cx="40" cy="40" r="34"/><circle id="ring-fill" class="ring-fill" cx="40" cy="40" r="34"/></svg>
+                </div>
+                <div class="score-text">
+                  <div class="score"><span id="overall"></span><small>/ 100 on this line</small></div>
+                  <p id="score-note"></p>
+                </div>
+              </div>
+              <div class="ladder" title="On this scale the real person, recorded on another mic, scores about 90, and a stranger saying the same line about 20.">
+                <div class="ladder-track"><i id="ladder-best"></i><i id="ladder-now"></i></div>
+                <div class="ladder-marks">
+                  <span style="left: 20%">20<br>a stranger</span>
+                  <span style="left: 90%">90<br>the real person</span>
+                </div>
+              </div>
+              <p id="check" class="check" hidden>Passes a speaker check: a voice-verification model would take this for the same person.</p>
+              <ul id="components" class="components"></ul>
+              <div id="hints-wrap" hidden>
+                <h3>About the words</h3>
+                <ul id="hints" class="hints"></ul>
+              </div>
+            </section>
+          </div>
+          <aside class="line-side">
+            <section id="coach" class="card coach" aria-label="Coach">
+              <div class="coach-head">
+                <h3>What to do now</h3>
+                <div id="focus-chips" class="chips" role="group" aria-label="What to work on"></div>
+              </div>
+              <p id="coach-progress" class="coach-progress" hidden></p>
+              <p id="coach-focus" class="coach-focus"></p>
+              <p id="coach-message" class="coach-message"></p>
+              <p id="coach-words" class="coach-words" hidden></p>
+              <p id="coach-stuck" class="coach-stuck" hidden></p>
+              <ol id="checklist" class="checklist" hidden></ol>
+              <div id="drill" class="drill" hidden>
+                <p class="drill-title">Drill</p>
+                <ol id="drill-steps" class="drill-steps"></ol>
+                <div id="drill-actions" class="drill-actions"></div>
+              </div>
+              <div id="plateau" class="plateau" hidden>
+                <p id="plateau-text"></p>
+                <div id="plateau-actions" class="drill-actions"></div>
+              </div>
+            </section>
+            <section id="history" class="history" hidden>
+              <h3>Takes <span id="history-note"></span></h3>
+              <div id="takes" class="takes"></div>
+            </section>
+          </aside>
         </div>
-        <div id="live" class="live" hidden>
-          <p id="live-text" class="live-text"></p>
-        </div>
-
-        <section id="result" class="card result" hidden>
-          <div class="score-row">
-            <div class="ring" aria-hidden="true">
-              <svg viewBox="0 0 80 80"><circle class="ring-track" cx="40" cy="40" r="34"/><circle id="ring-fill" class="ring-fill" cx="40" cy="40" r="34"/></svg>
-            </div>
-            <div class="score-text">
-              <div class="score"><span id="overall"></span><small>/ 100 on this line</small></div>
-              <p id="score-note"></p>
-            </div>
-          </div>
-          <div class="ladder" aria-hidden="true">
-            <div class="ladder-track"><i id="ladder-best"></i><i id="ladder-now"></i></div>
-            <div class="ladder-marks">
-              <span style="left: 20%">20<br>a stranger</span>
-              <span style="left: 90%">90<br>the real person</span>
-            </div>
-          </div>
-          <p class="scale">On this scale the real person, recorded on another mic, scores about 90, and a stranger saying the same line about 20.</p>
-          <p id="check" class="check" hidden>Passes a speaker check: a voice-verification model would take this for the same person.</p>
-          <ul id="components" class="components"></ul>
-          <div id="gender-read" class="gender-read" hidden></div>
-          <div id="hints-wrap" hidden>
-            <h3>About the words</h3>
-            <ul id="hints" class="hints"></ul>
-          </div>
-        </section>
-
-        <section id="history" class="history" hidden>
-          <h3>Takes <span id="history-note"></span></h3>
-          <div id="takes" class="takes"></div>
-        </section>
         <audio id="target-audio" preload="auto"></audio>
         <audio id="take-audio" preload="auto"></audio>
       </section>
@@ -316,7 +332,7 @@
         <section id="train-card" class="card train-card">
           <div class="section-head">
             <h3>Word by word</h3>
-            <p class="fine">Furthest off first. Hear the word, then say just that word.</p>
+            <p class="fine">Furthest off first. Hear it, then say just that. Words said in one breath stay together.</p>
           </div>
           <div id="train-words" class="words"></div>
           <div class="train-word">

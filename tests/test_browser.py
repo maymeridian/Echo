@@ -110,7 +110,8 @@ def test_make_a_voice_add_a_clip_and_practise_it(server, page, tmp_path):
     assert not page.is_visible("#live")
     first = int(page.text_content("#overall"))
     assert 0 <= first <= 100
-    assert page.locator("#components li").count() == 6
+    assert page.locator("#components li").count() == 7  # six parts of the score, and gender read
+    assert "Gender read" in page.text_content("#components li.extra")
     assert "baseline" in page.text_content("#score-note")
     # The coach names one thing to work on; it's highlighted among the parts.
     assert page.text_content("#coach-focus").startswith("Work on ")
@@ -306,6 +307,8 @@ def test_a_long_recording_becomes_lines_to_add_to_the_voice(server, page, tmp_pa
     assert "words a second" in page.text_content("#glance-voice")
     assert page.text_content("#glance-you").startswith("Over your last 4 takes")
     assert f"{found} lines found in it, 4 added" in page.text_content("#suggestions .more")
+    assert page.is_hidden("#suggestions")  # on the "Add lines" tab
+    page.click("#voice-tabs [data-tab=add]")
     page.click("#suggestions .more-btn")  # picking by hand, from the recording's whole list
     page.wait_for_selector("#source:not([hidden]) #lines .line-item")
     first = page.locator("#lines .line-item").first
@@ -437,6 +440,7 @@ def test_a_pasted_link_becomes_a_voice_and_its_speakers_are_told_apart(server, p
         assert page.locator("#voices .voice-btn").count() == 2
 
         # In the recording's own list, each line says whose it is.
+        page.click("#voice-tabs [data-tab=add]")
         page.click("#recordings .btn")
         page.wait_for_selector("#source:not([hidden]) #lines .line-item")
         assert page.is_visible("#source-speakers")

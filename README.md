@@ -309,10 +309,26 @@ between them, and the last word to where the sound stops. Across 118 words
 from 11 lines, words that ended while the sound was still loud fell from 16.9%
 to 0.8%.
 
+**Words said in one breath.** Speech isn't a string of separate words. In
+"The proper course to pursue is to offer your name and address", "to pursue is to" comes out as one
+stretch of sound, and the recogniser's times inside it are guesses. A word that can't be heard on its own can't be practised or measured
+on its own, so adjacent words are joined into one unit when the sound doesn't
+dip between them (`line.speech_units`). The rule is a dip of less than 6 dB
+below the quieter of the two. On two real practice lines, every boundary
+heard as a break dipped 6.5 dB or more, and every run-together one under 5.2.
+A run over 1.3 s is split at its deepest dip, and a unit under 0.15 s joins
+the neighbour it dips least from. The word strip, the chart's labels, the
+per-word feedback and the trainer all use these units. That threshold comes
+from 15 boundaries on two lines, so it's a starting point, not a validated
+number.
+
 ## Gender read
 
-Every take shows how female or male it reads, 0 (male) to 100 (female),
-beside the target's. The voice's page shows the voice's own read. It comes
+Every take has a **Gender read** row among its measurements: 100 when the
+take reads as female or male as the target does, with both reads in the
+detail, each from 0 (male) to 100 (female). It isn't weighted into the
+headline, and its Train button opens "pitch and resonance together", since
+those are what move it. The voice's page shows the voice's own read. It comes
 from the two things that carry most of perceived voice gender, pitch and
 resonance: a logistic regression on median pitch and the mean F2–F3 shift
 (`gender.py`, `tools/train_gender.py`). It isn't part of the headline score,
@@ -356,9 +372,18 @@ breathy delivery, but advice that isn't working is worse than none.
 
 ## Progress
 
-The voice's page shows **Your progress**: every take as a dot (one colour
-per line), the average of the last five, and each part over your last five
-takes against your first five.
+The voice's page has three tabs: **Practise** (the voice score and your
+lines), **Progress** and **Add lines** (suggestions, links, uploads,
+recordings and speakers). A voice with no lines yet opens on Add lines.
+**Progress** shows every take as a dot (one colour per line), the average of
+the last five, each part over your last five takes against your first five,
+and the voice at a glance.
+
+On a wide window the line's page has two columns: the guide, the record
+button and the result on the left, and the coach and your takes on the right,
+so the advice stays beside the chart. The guide leaves out the pitch
+tracker's slips: points more than 7 semitones from the line's median, nearly
+always an octave error on a creaky or breathy stretch.
 
 ## What the number means
 

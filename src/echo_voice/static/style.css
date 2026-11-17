@@ -140,7 +140,9 @@ input[type="text"], input[type="url"], input[type="search"] {
 
 /* ---------- main ---------- */
 
-main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
+main { padding: 28px 36px 64px; max-width: 1240px; width: 100%; }
+/* Pages of text and lists read better narrower; the line page uses the width. */
+#home, #empty, #voice, #source, #trim, #train, #check-result { max-width: 920px; }
 .status { min-height: 1.5em; margin: 0 0 10px; color: var(--muted); }
 .status.error { color: var(--bad); }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
@@ -169,7 +171,8 @@ main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
 
 /* ---------- practising a line ---------- */
 
-.line-row { display: flex; align-items: baseline; gap: 10px; margin: 0 0 16px; }
+.line-row { display: flex; align-items: baseline; gap: 10px; margin: 0; }
+.line-head { align-items: baseline; margin-bottom: 14px; }
 .target-line { margin: 0; font-size: 19px; line-height: 1.4; }
 .target-line.empty { color: var(--muted); font-size: 14px; }
 .line-form { display: flex; gap: 8px; align-items: center; margin: 0 0 16px; }
@@ -217,7 +220,7 @@ main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
 .word[aria-pressed="true"] { outline: 2px solid currentColor; outline-offset: 1px; }
 .word-note { margin: 0; font-size: 14px; }
 
-.coach { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; border-left: 4px solid var(--accent); }
+.coach { display: flex; flex-direction: column; gap: 6px; border-left: 4px solid var(--accent); }
 .coach-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 2px; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip {
@@ -238,7 +241,7 @@ main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
 .coach-message { margin: 0; }
 .coach-words { margin: 0; font-size: 14px; color: var(--muted); }
 
-.recorder { display: flex; align-items: center; gap: 12px; margin: 20px 0 8px; flex-wrap: wrap; }
+.recorder { display: flex; align-items: center; gap: 12px; margin: 4px 0; flex-wrap: wrap; }
 .record {
   display: inline-flex;
   align-items: center;
@@ -263,7 +266,7 @@ main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
 .live { margin: 0 0 12px; }
 .live-text { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; }
 
-.result { margin-top: 14px; display: flex; flex-direction: column; gap: 16px; }
+.result { display: flex; flex-direction: column; gap: 14px; }
 .score-row { display: flex; align-items: center; gap: 20px; }
 .ring { position: relative; flex: 0 0 auto; width: 84px; height: 84px; }
 .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
@@ -280,7 +283,7 @@ main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
 .components { display: flex; flex-direction: column; gap: 4px; }
 .components li {
   display: grid;
-  grid-template-columns: 96px 1fr 30px 38px 64px 58px;
+  grid-template-columns: 104px 1fr 30px 38px 58px;
   gap: 2px 10px;
   align-items: center;
   padding: 6px 8px;
@@ -297,13 +300,15 @@ main { padding: 28px 36px 64px; max-width: 920px; width: 100%; }
 .spark { width: 64px; height: 20px; }
 .spark polyline { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linejoin: round; }
 .components li.focus .spark polyline { stroke: var(--accent); }
-.components .detail { grid-column: 2 / 7; font-size: 13px; color: var(--muted); }
+.components .detail { grid-column: 2 / 6; font-size: 12.5px; line-height: 1.35; color: var(--muted); }
+.components li.extra { margin-top: 4px; padding-top: 10px; border-top: 1px dashed var(--line); border-radius: 0; }
+.components li.extra .bar i { background: var(--muted); }
 .train-btn { border: 1px solid var(--line); border-radius: 999px; background: var(--panel); padding: 2px 9px; font-size: 12px; color: var(--accent); cursor: pointer; white-space: nowrap; }
 .train-btn:hover { border-color: var(--accent); }
 .hints { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .hints li { padding-left: 12px; border-left: 3px solid var(--accent); }
 
-.history { margin-top: 24px; }
+.history { margin-top: 4px; }
 #history-note { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 8px; }
 .takes { display: flex; align-items: flex-end; gap: 3px; height: 72px; margin-top: 10px; overflow-x: auto; }
 .takes button { flex: 0 0 14px; min-height: 4px; padding: 0; border: 0; border-radius: 3px 3px 0 0; background: var(--line); cursor: pointer; }
@@ -430,6 +435,32 @@ button.brand:hover h1 { color: var(--accent); }
 /* ---------- a voice ---------- */
 
 .voice-page { display: flex; flex-direction: column; gap: 16px; }
+.pane { display: flex; flex-direction: column; gap: 16px; }
+
+/* ---------- tabs ---------- */
+
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
+.tabs button {
+  padding: 9px 16px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--muted);
+  font-weight: 600;
+  cursor: pointer;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+
+/* ---------- the line page: the guide and results beside the coach ---------- */
+
+.line-grid { display: flex; flex-direction: column; gap: 14px; }
+.line-main, .line-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+@media (min-width: 1180px) {
+  .line-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, 1fr); align-items: start; gap: 18px; }
+  .line-side { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto; }
+}
 .voice-page .page-head { margin-bottom: 0; }
 .head-actions { display: flex; gap: 14px; }
 .channel-rename { display: block; margin-top: 4px; font-size: 13px; }
@@ -515,16 +546,6 @@ button.brand:hover h1 { color: var(--accent); }
 .tag.speaker-tag.s1 { background: var(--band); color: var(--target); }
 .tag.speaker-tag.s2 { background: var(--good-bg); color: var(--good); }
 .tag.speaker-tag.s3 { background: var(--mid-bg); color: var(--mid); }
-
-/* ---------- gender read ---------- */
-
-.gender-read { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
-.gender-read p { margin: 0; font-size: 14px; }
-.gender-track { position: relative; height: 10px; border-radius: 5px; background: linear-gradient(90deg, var(--band), var(--accent-soft)); }
-.gender-track i { position: absolute; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; box-shadow: 0 0 0 2px var(--panel); }
-.gender-track .target-mark { background: var(--target); }
-.gender-track .take-mark { background: var(--accent); }
-.gender-ends { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
 
 /* ---------- warnings, a stuck part, progress ---------- */
 
@@ -636,9 +657,7 @@ button.brand:hover h1 { color: var(--accent); }
   .sidebar { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
   .sidebar-foot { display: none; }
   main { padding: 20px 16px 40px; }
-  .components li { grid-template-columns: 86px 1fr 28px 34px 54px; }
-  .spark { display: none; }
-  .components .detail { grid-column: 2 / 6; }
+  .components li { grid-template-columns: 92px 1fr 28px 34px 54px; }
   .keys { display: none; }
   .line-item { grid-template-columns: 32px 1fr auto; }
   .line-item .when, .line-item .len { display: none; }

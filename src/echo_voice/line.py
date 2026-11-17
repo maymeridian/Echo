@@ -124,6 +124,88 @@ def refine_word_times(y: np.ndarray, words: list[dict], sr: int = 16000) -> list
     return out
 
 
+JOIN_DIP = 6.0  # dB: with less of a dip than this between them, two words are run together
+MIN_UNIT = 0.15  # s: anything shorter can't be played or measured on its own
+MAX_UNIT = 1.3  # s: a longer run is split at its deepest dip
+UNITS_VERSION = 1
+
+
+def speech_units(y: np.ndarray, words: list[dict], sr: int = 16000) -> list[dict]:
+    """Words as they're actually said: ones run together become one unit.
+
+    Speech isn't a string of separate words. In "The proper course to pursue
+    is to offer your name and address", "to pursue is to" comes out as one
+    stretch of sound, and the recogniser's times inside it are guesses. A unit
+    that can't be heard on its own can't be practised or measured on its own,
+    so adjacent words are joined when the sound doesn't dip between them: less
+    than 6 dB below the quieter of the two. On two real practice lines, every
+    boundary heard as a break dipped 6.5 dB or more (6.5 to 34), and every
+    run-together one under 5.2. A run over 1.3 s is split at its deepest dip,
+    and a unit under 0.15 s joins the neighbour it dips least from.
+
+    Each unit has `text` (its words), `start` and `end`."""
+    import librosa
+
+    if not words:
+        return []
+    hop = 160
+    rms = librosa.feature.rms(y=np.asarray(y, dtype=np.float32), frame_length=400, hop_length=hop)[0]
+    db = 20 * np.log10(np.maximum(rms, 1e-6))
+    frame = lambda t: int(np.clip(round(t * sr / hop), 0, len(db) - 1))  # noqa: E731
+
+    def level(w):
+        a, b = frame(w["start"]), frame(w["end"])
+        return float(np.median(db[a : max(b, a + 1)]))
+
+    def dip(i):  # how far the sound drops between word i and word i + 1
+        a, b = words[i], words[i + 1]
+        lo, hi = frame(min(a["end"], b["start"]) - 0.04), frame(max(a["end"], b["start"]) + 0.04)
+        return min(level(a), level(b)) - float(db[lo : hi + 1].min())
+
+    dips = [dip(i) for i in range(len(words) - 1)]
+    groups = [[0]]
+    for i in range(1, len(words)):
+        joined = dips[i - 1] < JOIN_DIP and words[i]["start"] - words[i - 1]["end"] < 0.06
+        if joined:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+
+    def length(g):
+        return words[g[-1]]["end"] - words[g[0]]["start"]
+
+    def split(g):
+        if length(g) <= MAX_UNIT or len(g) < 2:
+            return [g]
+        # The deepest dip that leaves a playable piece either side.
+        cuts = [k for k in range(1, len(g)) if length(g[:k]) >= 0.25 and length(g[k:]) >= 0.25]
+        if not cuts:
+            return [g]
+        k = max(cuts, key=lambda k: dips[g[k - 1]])
+        return split(g[:k]) + split(g[k:])
+
+    groups = [piece for g in groups for piece in split(g)]
+    while len(groups) > 1:
+        short = next((k for k, g in enumerate(groups) if length(g) < MIN_UNIT), None)
+        if short is None:
+            break
+        left = dips[groups[short][0] - 1] if short > 0 else np.inf
+        right = dips[groups[short][-1]] if short + 1 < len(groups) else np.inf
+        if left <= right:
+            groups[short - 1 : short + 1] = [groups[short - 1] + groups[short]]
+        else:
+            groups[short : short + 2] = [groups[short] + groups[short + 1]]
+    return [
+        {
+            "text": " ".join(words[i]["text"] for i in g),
+            "start": words[g[0]]["start"],
+            "end": max(words[g[-1]]["end"], round(words[g[0]]["start"] + 0.05, 2)),
+            "count": len(g),
+        }
+        for g in groups
+    ]
+
+
 def normalise(word: str) -> str:
     return re.sub(r"[^a-z0-9]", "", word.lower().replace("’", "'"))
 

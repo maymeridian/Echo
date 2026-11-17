@@ -53,3 +53,28 @@ def test_word_edges_move_onto_the_audio():
     assert 1.58 <= out[1]["end"] <= 1.7  # to where the sound stops
     assert out[0]["start"] <= 0.22 and all(w["refined"] for w in out)
     assert refine_word_times(y, out) == out  # moved once
+
+
+def test_words_said_in_one_breath_become_one_unit():
+    import numpy as np
+
+    from echo_voice.line import speech_units
+
+    sr = 16000
+    t_ = np.arange(int(2.4 * sr)) / sr
+    y = 0.001 * np.random.default_rng(0).standard_normal(len(t_))
+    for a, b in ((0.1, 0.5), (0.8, 1.6), (1.9, 2.3)):  # three bursts of sound, with silence between
+        on = (t_ >= a) & (t_ < b)
+        y[on] += 0.5 * np.sin(2 * np.pi * 200 * t_[on])
+    words = [
+        {"text": "I'll", "start": 0.1, "end": 0.5},
+        {"text": "let", "start": 0.8, "end": 1.0},  # these four share the second burst
+        {"text": "you", "start": 1.0, "end": 1.05},
+        {"text": "in", "start": 1.05, "end": 1.4},
+        {"text": "on", "start": 1.4, "end": 1.6},
+        {"text": "this.", "start": 1.9, "end": 2.3},
+    ]
+    units = speech_units(y, words)
+    assert [u["text"] for u in units] == ["I'll", "let you in on", "this."]
+    assert (units[1]["start"], units[1]["end"], units[1]["count"]) == (0.8, 1.6, 4)
+    assert speech_units(y, []) == []
