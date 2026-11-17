@@ -52,6 +52,23 @@ def transcribe(y: np.ndarray) -> list[str]:
     return [w for w in text.split() if normalise(w)]
 
 
+def glue(words: list[dict]) -> list[dict]:
+    """Join a piece that starts with punctuation onto the word before it.
+    Whisper times "12,000" as two words, "12" and ",000". Shown, that reads
+    "12 ,000"; counted, it is two words where a take that says the same thing
+    has one, and the word check called that a slip."""
+    out: list[dict] = []
+    for w in words:
+        if out and w["text"][:1] in ",.;:!?%":
+            last = out[-1] | {"text": out[-1]["text"] + w["text"], "end": max(out[-1]["end"], w["end"])}
+            if "p" in w and "p" in last:
+                last["p"] = min(last["p"], w["p"])
+            out[-1] = last
+        else:
+            out.append(w)
+    return out
+
+
 def transcribe_timed(y: np.ndarray) -> list[dict]:
     """Like `transcribe`, with where each word starts and ends in seconds.
     Used for targets, so a take can be compared word by word."""
@@ -66,7 +83,7 @@ def transcribe_timed(y: np.ndarray) -> list[dict]:
             for s in segments
             for w in s.words or []
         ]
-    return refine_word_times(y, [w for w in words if normalise(w["text"]) and w["end"] > w["start"]])
+    return refine_word_times(y, [w for w in glue(words) if normalise(w["text"]) and w["end"] > w["start"]])
 
 
 def refine_word_times(y: np.ndarray, words: list[dict], sr: int = 16000) -> list[dict]:
@@ -84,8 +101,8 @@ def refine_word_times(y: np.ndarray, words: list[dict], sr: int = 16000) -> list
     db = 20 * np.log10(np.maximum(rms, 1e-6))
     floor, peak = float(np.percentile(db, 10)), float(db.max())
     quiet = floor + max(6.0, 0.2 * (peak - floor))  # near the noise floor: the sound has stopped
-    frame = lambda t: int(np.clip(round(t * sr / hop), 0, len(db) - 1))  # noqa: E731
-    time = lambda f: round(f * hop / sr, 2)  # noqa: E731
+    frame = lambda t: int(np.clip(round(t * sr / hop), 0, len(db) - 1))
+    time = lambda f: round(f * hop / sr, 2)
     duration = len(y) / sr
     out = [dict(w) for w in words]
     for i in range(len(out) - 1):
@@ -151,7 +168,7 @@ def speech_units(y: np.ndarray, words: list[dict], sr: int = 16000) -> list[dict
     hop = 160
     rms = librosa.feature.rms(y=np.asarray(y, dtype=np.float32), frame_length=400, hop_length=hop)[0]
     db = 20 * np.log10(np.maximum(rms, 1e-6))
-    frame = lambda t: int(np.clip(round(t * sr / hop), 0, len(db) - 1))  # noqa: E731
+    frame = lambda t: int(np.clip(round(t * sr / hop), 0, len(db) - 1))
 
     def level(w):
         a, b = frame(w["start"]), frame(w["end"])

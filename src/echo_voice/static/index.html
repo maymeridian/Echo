@@ -27,7 +27,17 @@
         </form>
         <button id="new-voice" class="btn new-voice-btn" type="button">+ New voice</button>
       </nav>
-      <p class="fine sidebar-foot">A voice is one person or character: the lines you practise, the recordings they came from, and your voice score across them.</p>
+      <div id="mic-box" class="mic-box">
+        <label for="mic-select">Microphone</label>
+        <select id="mic-select" aria-describedby="mic-note"><option value="">The browser's choice</option></select>
+        <div class="mic-row">
+          <button id="mic-test" class="btn" type="button" title="Open the microphone for a few seconds and show its level. Nothing is recorded.">Test</button>
+          <div class="meter" aria-hidden="true"><div id="mic-level"></div></div>
+          <button id="mic-off" class="btn" type="button" title="Let go of the microphone now" hidden>Turn off</button>
+        </div>
+        <p id="mic-note" class="fine" role="status"></p>
+      </div>
+      <p class="fine sidebar-foot">A voice is one person or character: the lines you practise, the recordings they came from, and your voice score across them. <span id="version" class="version"></span></p>
     </aside>
 
     <main>
@@ -244,12 +254,18 @@
               <button id="record" class="record" type="button">
                 <span class="dot"></span><span id="record-label">Record a take</span>
               </button>
-              <button id="warmup" class="btn warmup" type="button" title="Live pitch on the guide, nothing saved">Warm up</button>
+              <button id="warmup" class="btn warmup" type="button" title="Live pitch and resonance, nothing saved">Warm up</button>
               <div class="meter" aria-hidden="true"><div id="level"></div></div>
               <span class="fine keys"><kbd>Space</kbd> starts and stops</span>
             </div>
             <div id="live" class="live" hidden>
               <p id="live-text" class="live-text"></p>
+              <div id="live-res" class="drill-meter live-res" hidden>
+                <span class="end">◀ darker</span>
+                <div class="drill-track"><i class="zone"></i><i class="centre"></i><i id="live-res-mark" class="mark now"></i></div>
+                <span class="end">brighter ▶</span>
+                <span id="live-res-text" class="scale-note"></span>
+              </div>
             </div>
             <section id="result" class="card result" hidden>
               <div class="score-row">
@@ -342,6 +358,7 @@
               <button id="train-note" class="pill note" type="button" title="The pitch the target uses on this word"><span class="icon">♪</span> <span id="train-note-name">Its note</span></button>
               <button id="train-say" class="record" type="button"><span class="dot"></span><span id="train-say-label">Say it</span></button>
               <button id="train-mine" class="pill" type="button" disabled><span class="icon">▶</span> You</button>
+              <button id="train-try" class="pill" type="button" title="Watch your pitch and resonance move as you speak. Nothing is scored or kept."><span class="icon">◎</span> <span id="train-try-label">Try it live</span></button>
               <span class="fine keys"><kbd>Space</kbd> starts and stops</span>
             </div>
             <p id="train-live" class="live-text" hidden></p>

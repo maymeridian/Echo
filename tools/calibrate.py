@@ -257,7 +257,8 @@ def auc(good: np.ndarray, bad: np.ndarray) -> float:
 
 
 def fit(pairs_path: Path, write: bool) -> None:
-    rows = [json.loads(line) for line in open(pairs_path, encoding="utf-8")]
+    with open(pairs_path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f]
     by_kind = defaultdict(lambda: defaultdict(list))
     for r in rows:
         for k in KEYS:

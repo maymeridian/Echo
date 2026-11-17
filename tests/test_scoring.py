@@ -109,7 +109,7 @@ def parts(**scores):
 def test_the_coach_picks_what_costs_most_and_sticks_with_it_until_it_is_good():
     from echo_voice.scoring import coach
 
-    base = dict(identity=50, pitch=40, melody=90, resonance=90, articulation=90, rhythm=90)
+    base = {"identity": 50, "pitch": 40, "melody": 90, "resonance": 90, "articulation": 90, "rhythm": 90}
     first = parts(**base) | {"coach": coach(parts(**base))}
     assert first["coach"]["focus"] == "pitch" and first["coach"]["message"] == "fix pitch"
     assert first["coach"]["progress"] is None
@@ -205,7 +205,7 @@ def test_gender_read_follows_pitch_and_resonance():
     assert gender.score(analyze(load(ARCTIC / "slt_arctic_a0001.wav"))) > 90  # a woman
     assert gender.score(analyze(load(ARCTIC / "bdl_arctic_a0001.wav"))) < 25  # a man
     low, raised = analyze(voice()), analyze(voice(f0=220, formant_scale=1.18))
-    assert gender.score(low) < 30 < 70 < gender.score(raised)
+    assert gender.score(low) < 30 and gender.score(raised) > 70
     result = compare(low, raised)
     assert result["gender"]["take"] > result["gender"]["target"]
     assert gender.describe(85) == "female" and gender.describe(50) == "in between" and gender.describe(10) == "male"

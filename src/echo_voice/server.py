@@ -17,9 +17,27 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from . import autopick, clean, gender, line, sources
-from .analysis import MAX_SECONDS, SR, AnalysisError, Voice, analyze, decode, load, speaker_ceiling, steadied
-from .scoring import CHECK_LINES, MIN_CHECK_LINES, coach, compare, voice_check, word_drill
+from . import __version__, autopick, clean, gender, sources
+from . import line as transcript
+from .analysis import (
+    MAX_SECONDS,
+    SR,
+    AnalysisError,
+    Voice,
+    analyze,
+    decode,
+    load,
+    speaker_ceiling,
+    steadied,
+)
+from .scoring import (
+    CHECK_LINES,
+    MIN_CHECK_LINES,
+    coach,
+    compare,
+    voice_check,
+    word_drill,
+)
 from .store import NotFound, Store
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 30 s of 16-bit mono at 16 kHz is under 1 MB
@@ -151,20 +169,20 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     def target_words(target_id: str, voice: Voice) -> tuple[list[str], list[dict]]:
         """The target's words, and its speech units: the words as they're said,
-        with ones run together as one unit (line.speech_units). Both are worked
+        with ones run together as one unit (transcript.speech_units). Both are worked
         out once and kept with the clip. The words can be corrected by hand;
         the units stay as heard, for the word-by-word comparison."""
         meta = store.target_meta(target_id)
         if meta.get("word_times") is None:  # targets from before timings were kept
-            timed = line.transcribe_timed(voice.y)
+            timed = transcript.transcribe_timed(voice.y)
             words = meta["words"] if meta.get("words") is not None else [w["text"] for w in timed]
             meta = store.update_target(target_id, words=words, word_times=timed)
         elif meta["word_times"] and not all(w.get("refined") for w in meta["word_times"]):
             # Timings from before word edges were moved onto the audio.
-            meta = store.update_target(target_id, word_times=line.refine_word_times(voice.y, meta["word_times"]))
-        if meta.get("units_v") != line.UNITS_VERSION:
-            units = line.speech_units(voice.y, meta["word_times"])
-            meta = store.update_target(target_id, units=units, units_v=line.UNITS_VERSION)
+            meta = store.update_target(target_id, word_times=transcript.refine_word_times(voice.y, meta["word_times"]))
+        if meta.get("units_v") != transcript.UNITS_VERSION:
+            units = transcript.speech_units(voice.y, meta["word_times"])
+            meta = store.update_target(target_id, units=units, units_v=transcript.UNITS_VERSION)
         return meta["words"], meta["units"]
 
     def known_voice(voice_id: str) -> dict | None:
@@ -191,7 +209,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         # Targets usually come from films or videos: take the voice out of any
         # music or background first (clean.py), and score that.
         cleaned = await analysed(await run_in_threadpool(clean.vocals, original))
-        timed = await run_in_threadpool(line.transcribe_timed, cleaned.y)
+        timed = await run_in_threadpool(transcript.transcribe_timed, cleaned.y)
         owner = (recording and known_voice(recording.get("voice_id") or "")) or known_voice(voice)
         if owner is None:  # older clients named a clip after its voice
             owner = store.voice_for_line(name or "Untitled")
@@ -244,6 +262,10 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             "median_f0": None,
             "low": None,
             "high": None,
+            # For the live resonance meter (static/formants.js): the formant
+            # ceilings Resonance uses for this voice and for whoever practises it.
+            "ceiling": voice_ceiling(store.target_meta(target_id).get("voice_id") or "") or voice.formant_ceiling,
+            "my_ceiling": my_ceiling(target_id),
         }
         if f0.size >= 20:
             low, median, high = np.percentile(f0, [10, 50, 90])
@@ -265,7 +287,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         take = await uploaded_voice(request)
         take = await run_in_threadpool(steadied, take, await run_in_threadpool(my_ceiling, target_id, take.formant_ceiling))
         said, timed = await run_in_threadpool(target_words, target_id, target)
-        words = await run_in_threadpool(line.transcribe, take.y)
+        words = await run_in_threadpool(transcript.transcribe, take.y)
         suspect = pitch_suspect(store.target_meta(target_id))
         result = await run_in_threadpool(compare, target, take, said, words, timed, suspect)
         earlier = store.list_takes(target_id)
@@ -351,7 +373,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         store.update_source(meta["id"], voice_id=owner["id"])
         size = 0
         try:
-            with open(folder / f"upload.{ext}", "wb") as f:
+            with open(folder / f"upload.{ext}", "wb") as f:  # noqa: ASYNC230 (small writes, one per awaited chunk)
                 async for chunk in request.stream():
                     size += len(chunk)
                     if size > MAX_SOURCE_BYTES:
@@ -515,7 +537,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             # python.exe on Windows is a launcher with the real interpreter as
             # its child, so the whole tree has to go.
             if sys.platform == "win32":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(job.pid)], capture_output=True)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(job.pid)], capture_output=True, check=False)
             else:
                 job.terminate()
             job.wait(timeout=10)
@@ -709,7 +731,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     @app.get("/api/config")
     def config() -> dict:
-        return {"sample_rate": SR}
+        return {"sample_rate": SR, "version": __version__}
 
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
     return app

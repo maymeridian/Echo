@@ -215,7 +215,7 @@ def transcribe_words(y: np.ndarray, progress=lambda share: None) -> list[dict]:
     """Every word with its start and end in seconds and Whisper's confidence."""
     from faster_whisper import WhisperModel
 
-    from .line import MODEL, TEMPERATURE, normalise
+    from .line import MODEL, TEMPERATURE, glue, normalise
 
     model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=4)
     segments, _ = model.transcribe(
@@ -229,7 +229,7 @@ def transcribe_words(y: np.ndarray, progress=lambda share: None) -> list[dict]:
             text = w.word.strip()
             if normalise(text) and w.end > w.start:
                 words.append({"start": float(w.start), "end": float(w.end), "text": text, "p": float(w.probability)})
-    return words
+    return glue(words)
 
 
 def split_lines(words: list[dict]) -> list[list[dict]]:
@@ -523,7 +523,7 @@ def read_audio(folder: Path, start: float = 0.0, end: float | None = None) -> np
 def _lock(folder: Path):
     """Hold the folder's lock for as long as this process runs; the OS lets go
     when the process ends, however it ends. None if another process has it."""
-    handle = open(folder / LOCK, "a+b")
+    handle = open(folder / LOCK, "a+b")  # noqa: SIM115 (kept open on purpose: the lock lasts as long as the handle)
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -666,7 +666,7 @@ def run(folder: Path, report=lambda step, share: None) -> int:
                     have = sum(1 for t in store.list_targets() if t.get("voice_id") == meta["voice_id"])
                     want = max(autopick.CHECK_LINES, have + 3)
                 autopick.pick(store, meta["voice_id"], want or autopick.CHECK_LINES, report=lambda d, n: status("picking", d / n))
-            except Exception as exc:  # the lines are found either way; picking is a bonus
+            except Exception as exc:  # noqa: BLE001 (the lines are found either way; picking is a bonus)
                 print(f"Couldn't pick lines: {exc!r}", file=sys.stderr, flush=True)
         status("ready", None, force=True)
         return 0

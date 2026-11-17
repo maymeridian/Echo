@@ -2,7 +2,6 @@ import io
 
 import numpy as np
 import pytest
-
 import soundfile as sf
 from fastapi.testclient import TestClient
 from synth import SR, voice
@@ -186,7 +185,7 @@ def test_a_voice_gathers_lines_and_scores_them_together_in_a_voice_check(tmp_pat
     assert voice["gender"] < 25  # reads male
 
     # One take on each line, as the page does in a voice check.
-    take = lambda line: client.post(  # noqa: E731
+    take = lambda line: client.post(
         f"/api/targets/{line['id']}/takes", content=(ARCTIC / "slt_arctic_a0001.wav").read_bytes()
     ).json()
     taken = [take(line) for line in lines]
@@ -336,7 +335,6 @@ def test_trainer_attempts_are_kept_and_progress_gathers_every_take(tmp_path):
     assert {c["key"]: c["score"] for c in odd["components"]}["pitch"] is None
 
     # Trainer attempts are saved with their audio.
-    import numpy as np
 
     word = {"text": "ah", "start": 0.0, "end": 0.4}
     client.patch(f"/api/targets/{lines[0]['id']}", json={"line": "ah ee oo eh"})
@@ -438,3 +436,51 @@ def test_takes_are_measured_at_one_ceiling_per_speaker(tmp_path):
     meta_path.write_text(json_.dumps(meta), "utf-8")
     assert client.post(f"/api/targets/{second}/takes", content=wav(voice())).status_code == 201
     assert json_.loads(meta_path.read_text("utf-8"))["ceiling"] == lines[1]["ceiling"]
+
+
+def test_the_app_says_which_version_it_is(tmp_path, capsys):
+    import re
+    from importlib.metadata import version
+
+    import echo_voice
+    from echo_voice import cli
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", echo_voice.__version__)
+    assert version("echo-voice") == echo_voice.__version__  # the package is built from the same number
+    assert TestClient(create_app(tmp_path)).get("/api/config").json()["version"] == echo_voice.__version__
+    with pytest.raises(SystemExit):
+        cli.main(["--version"])
+    assert capsys.readouterr().out.strip() == f"echo-voice {echo_voice.__version__}"
+
+
+def test_a_damaged_file_is_left_out_and_files_are_written_whole(tmp_path):
+    from echo_voice import store as store_module
+
+    client = TestClient(create_app(tmp_path))
+    voice_id = client.post("/api/voices", json={"name": "Synth"}).json()["id"]
+    lines = [
+        client.post("/api/targets", params={"name": f"line {i}", "voice": voice_id}, content=wav(voice(f0=f0))).json()
+        for i, f0 in enumerate((118, 122))
+    ]
+    for f0 in (120, 124):
+        client.post(f"/api/targets/{lines[0]['id']}/takes", content=wav(voice(f0=f0)))
+    takes = sorted((tmp_path / "targets" / lines[0]["id"] / "takes").glob("*.json"))
+    assert len(takes) == 2
+
+    # Half a file, as a crash in the middle of an in-place write used to leave.
+    takes[0].write_text(takes[0].read_text("utf-8")[:40], "utf-8")
+    (tmp_path / "targets" / lines[1]["id"] / "meta.json").write_text("{", "utf-8")
+    assert [t["id"] for t in client.get(f"/api/targets/{lines[0]['id']}/takes").json()] == [takes[1].stem]
+    assert [t["id"] for t in client.get("/api/targets").json()] == [lines[0]["id"]]
+    assert [line["id"] for line in client.get(f"/api/voices/{voice_id}").json()["lines"]] == [lines[0]["id"]]
+    assert client.post(f"/api/targets/{lines[0]['id']}/takes", content=wav(voice(f0=126))).status_code == 201
+
+    # A write that fails part-way leaves the old file as it was, and nothing half-written beside it.
+    meta_path = tmp_path / "voices" / voice_id / "meta.json"
+    before = meta_path.read_text("utf-8")
+    with pytest.raises(TypeError):
+        store_module._write(meta_path, None)
+    assert meta_path.read_text("utf-8") == before
+    store_module._write(meta_path, before.replace("Synth", "Synth 2"))
+    assert client.get(f"/api/voices/{voice_id}").json()["name"] == "Synth 2"
+    assert not list(tmp_path.rglob("*.tmp"))

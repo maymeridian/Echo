@@ -4,12 +4,14 @@ import argparse
 import json
 import sys
 
+from . import __version__
 from .analysis import AnalysisError, analyze, load
 from .scoring import compare
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="echo-voice", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"echo-voice {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the practice app in your browser")

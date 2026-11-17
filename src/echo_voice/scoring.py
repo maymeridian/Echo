@@ -501,8 +501,8 @@ def _line_hints(check: line.LineCheck | None) -> list[str]:
     if check is None or not check.flagged:
         return []
     if check.match_rate < 0.5:
-        return [f"That doesn't sound like the target's line. It says “{_phrase(' '.join(check.target))}”; "
-                f"you said “{_phrase(' '.join(check.take)) or '…'}”."]
+        said = _phrase(" ".join(check.take)) or "…"
+        return [f"That doesn't sound like the target's line. It says “{_phrase(' '.join(check.target))}”; you said “{said}”."]
     hints = [f"You said “{_phrase(said)}” where the line has “{_phrase(has)}”." for has, said in check.swaps()]
     hints += [f"You left out “{_phrase(w)}”." for w in check.runs("miss")]
     hints += [f"You added “{_phrase(w)}”." for w in check.runs("extra")]

@@ -47,7 +47,7 @@ def compilation(clips=("bdl_arctic_a0001", "bdl_arctic_a0002") * 2 + ("slt_arcti
     import soundfile as sf
 
     rng = np.random.default_rng(0)
-    quiet = lambda seconds: 1e-4 * rng.standard_normal(int(seconds * SR))  # noqa: E731
+    quiet = lambda seconds: 1e-4 * rng.standard_normal(int(seconds * SR))
     parts = []
     for name in clips:
         y, sr = sf.read(ARCTIC / f"{name}.wav", dtype="float32")

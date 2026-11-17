@@ -3,13 +3,17 @@
 Practise a voice impression and get closer with every take. Named after Echo,
 the nymph of Greek myth who could only speak in other people's words.
 
-Add a clip of the voice you're imitating, trim it to one line in the page,
-record yourself saying the same line, and get a 0–100 match with a breakdown of what to change: voice identity,
-pitch, melody, resonance, articulation and rhythm. Every take is kept, so you
-can see whether you're getting closer. A coach picks one thing to work on
-after each take, a guide draws your pitch over the target's while you speak,
-and each word of the line shows how close you came, with the target's word
-and yours to play back to back.
+Version 1.0.0. [CHANGELOG.md](CHANGELOG.md) says what's in it.
+
+Paste a link to a video of the voice you're imitating, and Echo finds its
+lines and picks a handful worth practising. Record yourself saying a line and
+get a 0–100 match with a breakdown of what to change: voice identity, pitch,
+melody, resonance, articulation and rhythm. Every take is kept, so you can see
+whether you're getting closer. A coach picks one thing to work on after each
+take. While you speak, a guide draws your pitch over the target's and a meter
+shows your resonance against it. Each phrase of the line shows how close you
+came, with the target's and yours to play back to back, and a trainer works on
+one part of one phrase at a time.
 
 Everything belongs to a **voice**: the person or character you're imitating.
 A voice holds the lines you practise and the recordings they came from, such
@@ -28,9 +32,26 @@ python -m venv .venv
 .\.venv\Scripts\echo-voice serve
 ```
 
-Then open http://127.0.0.1:8000. Clips and takes are stored in `data/`, which
-is not tracked by git. The first run downloads the speaker model (26 MB) to
+Then open http://127.0.0.1:8000. `echo-voice --version` says which version
+this is, and so does the foot of the sidebar. Clips and takes are stored in
+`data/`, which is not tracked by git. Its files are written whole or not at
+all, so a crash can't leave half a file; a file that can't be read is left out
+of its list, and the rest still open. The first run downloads the speaker model (26 MB) to
 `~/.cache/echo`; set `ECHO_CACHE` to put it elsewhere.
+
+**The microphone.** The sidebar's Microphone box lists the microphones by name
+once the browser has allowed one. Choose yours there: Echo remembers it and
+asks the browser for exactly that one from then on. **Test** shows its level
+for a few seconds without recording anything.
+
+This matters on a computer with virtual audio devices, which streaming, headset
+and VR software add. A browser told to remember the permission stops asking
+which microphone and hands over the system's default, and that is often one of
+those, hearing nothing. The microphone also stays open between takes, so a
+browser that asks every time it's opened (Firefox, unless you tick "Remember
+this decision") asks once. It turns off after 15 minutes unused, or with
+**Turn off**. If nothing at all is coming from it, the page says so while you
+record.
 
 To score two files without the app:
 
@@ -292,6 +313,13 @@ it left off; **▶ You** replays your last attempt.
   keep the tongue forward and don't drop the jaw or larynx. A word counts
   when both are close.
 - **"♪ Its note"** plays the pitch the target uses on that word.
+- **Live.** While the microphone is open a ring on the map, and a hollow mark
+  on the meter, follow your voice: where the last 1.2 seconds of it sit against
+  the target's phrase, in pitch and in resonance, with a short tail showing
+  which way you're moving. **Try it live** opens the microphone for up to 45
+  seconds without scoring or keeping anything, to hold a sound, slide the
+  pitch and watch whether the brightness comes with it. During **Say it** the
+  ring shows too, and the scored dot replaces it when the attempt comes back.
 - **Melody and rhythm** run across the whole line, so their Train sets the
   coach's focus and points at the line drills (½ speed, speak along).
 
@@ -412,6 +440,15 @@ last 5 seconds against the target's pitch band (10th to 90th percentile, line at
 the median), with a readout such as "You: 144 Hz · target about 95 Hz — go
 lower (7.2 st)".
 
+**Live resonance.** Under that readout a meter runs from darker to brighter
+with the target in the middle: "Resonance so far: about 6% brighter than the
+target". It takes what you've said since your last pause and lines it up with
+the target sound by sound, the way a take's Resonance is measured, so each
+vowel is held against the same vowel. It shows while you warm up, speak along
+or record a take. The
+browser reads it (see "Live resonance" under Validation); the Resonance score
+still comes from the server once the take is in.
+
 **Music under the target.** Every target clip goes through vocal separation
 (UVR-MDX-NET-Voc_FT, on the CPU) before anything is measured. Clips from films
 and videos usually have music or background under the voice, which throws off
@@ -507,9 +544,8 @@ below. These steps write `src/echo_voice/speaker_mean.json` and
 git; RAVDESS itself (CC BY-NC-SA 4.0) stays in the ignored `cache/`.
 
 **Limits.** RAVDESS is acted speech: short lines from one studio. The
-microphone is simulated, not real. Clips from films or videos with music under
-them will score lower until clip cleaning exists (see Next). A held-out check on
-four CMU ARCTIC clips agrees with the scale:
+microphone is simulated, not real. A held-out check on four CMU ARCTIC clips
+agrees with the scale:
 
 | ARCTIC pair | Score |
 | --- | --- |
@@ -678,6 +714,74 @@ a 15-cent fine error. It skips 8.4% of voiced frames, which just leaves gaps in
 the live trace, and calls 1.0% of unvoiced frames voiced. A looser threshold
 fills the gaps but nearly triples the gross errors.
 `node tools/check_live_pitch.mjs cache/ptdb` reproduces this.
+
+### Live resonance
+
+The live meter reads F1–F3 in the browser (`static/formants.js`). It follows
+Praat's Burg tracker step by step: 50 ms frames, resampled to twice the
+speaker's formant ceiling, pre-emphasis from 50 Hz, Praat's Gaussian window,
+ten coefficients, and the three lowest roots between 50 Hz and 50 Hz under the
+ceiling. The page reads the target's audio and the microphone with the same
+code and the same per-speaker ceilings the scorer uses, so a gap between them
+is a gap between the voices.
+
+On the same audio and the same frames it lands a median 1.1% (F1), 0.8% (F2)
+and 0.7% (F3) from Praat, with no lean either way. Which frames count matters
+more than the fit, because typical formants are medians over the voiced
+frames. The pitch tracker's own test of "voiced" kept 30% fewer frames than
+Praat and put typical F1 and F2 4–6% off. So a frame counts when its
+normalised autocorrelation is at least 0.55 and it is at least a tenth as loud
+as the loudest frame so far, which finds 93% of Praat's voiced frames with 6%
+extra. That test was chosen on two sentences; the check below uses ten others.
+
+Checked on 120 recordings (12 VCC2018 speakers, the same 10 sentences each),
+against what the app measures:
+
+| | Result |
+| --- | --- |
+| Typical F1 / F2 / F3 against Praat at the same ceiling | 2.2% / 1.2% / 0.6% apart (median) |
+| The gap between two speakers on a sentence, against the trainer's measure (660 pairs) | correlation 0.983; a median 1.5 points apart; within 3 points in 81% |
+| Says the right way, brighter or darker, when the app puts them 3% or more apart | 99% of 559 pairs |
+| The line page's meter, lined up first, against a take's Resonance (660 pairs) | correlation 0.987; a median 1.5 points apart; within 3 points in 81%; right way in 100% |
+| The same without lining up, as the meter first was | correlation 0.962; a median 2.4 points apart; within 3 points in 60% |
+| The pitch gap between two speakers, the live tracker on both sides against Praat on both | correlation 0.982; a median 0.31 semitones apart; over 1 semitone in 11% |
+
+**Lining up.** Typical formants over a whole line depend on how long each
+speaker dwells on each vowel, and no two people dwell the same. On one demo
+pair the unaligned reading was 5% darker, by Praat as well as by the browser,
+where the take's Resonance, measured along the alignment, was level. So the
+line page's meter aligns first (`formants.alignedShift`): dynamic time warping
+on the formants themselves, each side centred on its own typical values, with
+an open end so a take in progress lines up with the part of the line it has
+reached. Half-way through a take it is a median 2.1 points from the finished
+take's Resonance. The trainer's ring doesn't align, and doesn't need to: a
+scored attempt on a phrase is measured by typical formants too.
+
+One reading takes 0.4 ms and one alignment 0.6 ms. To reproduce:
+
+```powershell
+.\.venv\Scripts\python tools\live_resonance_ref.py --vcc cache\vcc2018 --out cache\live_resonance_ref.json
+node tools\check_live_resonance.mjs cache\live_resonance_ref.json
+```
+
+End to end in a real browser, with the microphone fed from a file
+(`cache/experiments/live_resonance/live_check.py`): a target's own phrase
+reads "on pitch, resonance about level". Played 8% faster, which lifts pitch
+by 1.3 semitones and every formant by 8%, it reads 0.8–1.3 semitones high and
+4–15% brighter, mostly 7–10; the server scored that attempt 1.3 semitones high
+and 6% brighter. Played 8% slower it reads 1.4–2.3 semitones low and 0–10%
+darker, less steadily.
+
+**Limits:**
+- The ring shows the last 1.2 seconds, so it moves by a few points as
+  different sounds pass through. Its direction and rough size are what to go
+  by; the scored attempt is the number.
+- The trainer's live pitch is the live tracker's reading of the target's
+  phrase, not Praat's. On a word with a creaky or fading end the two trackers
+  count different frames as voiced: on one such word they were 3 semitones
+  apart, which is why the ring isn't held against the score's pitch.
+- All of this is studio speech read aloud. Whispered and breathy voices,
+  where formants are hardest, haven't been checked.
 
 ### Formants
 
@@ -876,11 +980,12 @@ src/echo_voice/
   store.py           voices and their checks, targets (lines), takes and recordings on disk
   server.py          FastAPI app; runs the recordings' jobs
   cli.py             `echo-voice serve`, `echo-voice score`, `echo-voice import`
-  static/            the page: records, trims, recordings' lines, live pitch (pitch.js), shows results
+  static/            the page: records, trims, recordings' lines, live pitch (pitch.js) and resonance (formants.js), shows results
 tools/calibrate.py   fits calibration.json (RAVDESS) and speaker_mean.json
 tools/validate.py    checks pitch, formants, cleaning, the word check and the whole score against reference data
 tools/train_similarity.py  trains similarity_model.json on VoxSim ratings
 tools/check_live_pitch.mjs  checks the page's live pitch tracker against PTDB-TUG
+tools/live_resonance_ref.py, check_live_resonance.mjs  check the page's live formant tracker against the app's own measurements
 tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 ```
 

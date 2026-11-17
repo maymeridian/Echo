@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
@@ -27,6 +28,46 @@ from . import gender
 from .analysis import SR, Voice
 
 _ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def _write(path: Path, text: str) -> None:
+    """Write a file whole or not at all: to a neighbour first, then swapped in.
+    Written in place, a crash or a full disk part-way would leave half a JSON
+    file, and the voice or line it describes would stop opening; another
+    thread reading at that moment would see half of it too."""
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(4)}.tmp")
+    tmp.write_text(text, "utf-8")
+    for _ in range(40):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows refuses while a reader has the old file open
+            time.sleep(0.025)
+    path.write_text(text, "utf-8")  # still held after a second: in place, as before
+    tmp.unlink(missing_ok=True)
+
+
+def _load(path: Path):
+    """Read a JSON file. Windows can refuse a read for a moment while the file is being swapped."""
+    for attempt in range(40):
+        try:
+            return json.loads(path.read_text("utf-8"))
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.025)
+
+
+def _listed(paths) -> list:
+    """Every file that reads as JSON. A list of voices, lines or takes leaves out
+    one that doesn't (a file damaged by an earlier crash), not fail altogether."""
+    out = []
+    for path in paths:
+        try:
+            out.append(_load(path))
+        except (OSError, ValueError):
+            continue
+    return out
 
 
 class NotFound(LookupError):
@@ -51,7 +92,7 @@ class Store:
     def new_voice(self, name: str) -> dict:
         meta = {"id": secrets.token_hex(6), "name": name, "created": _now(), "check_lines": None}
         (self.voices / meta["id"] / "checks").mkdir(parents=True)
-        (self.voices / meta["id"] / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        _write(self.voices / meta["id"] / "meta.json", json.dumps(meta, indent=2))
         return meta
 
     def voice_dir(self, voice_id: str) -> Path:
@@ -61,16 +102,16 @@ class Store:
         return path
 
     def voice_meta(self, voice_id: str) -> dict:
-        return json.loads((self.voice_dir(voice_id) / "meta.json").read_text("utf-8"))
+        return _load(self.voice_dir(voice_id) / "meta.json")
 
     def update_voice(self, voice_id: str, **fields) -> dict:
         meta = self.voice_meta(voice_id) | fields
-        (self.voice_dir(voice_id) / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        _write(self.voice_dir(voice_id) / "meta.json", json.dumps(meta, indent=2))
         return meta
 
     def list_voices(self) -> list[dict]:
         """Every voice, oldest first; not one merged into another."""
-        metas = [json.loads(p.read_text("utf-8")) for p in self.voices.glob("*/meta.json")]
+        metas = _listed(self.voices.glob("*/meta.json"))
         return sorted((m for m in metas if not m.get("merged_into")), key=lambda m: m["created"])
 
     def voice_named(self, name: str) -> dict:
@@ -101,20 +142,17 @@ class Store:
         record = {"id": f"{datetime.now():%Y%m%d-%H%M%S-%f}-{secrets.token_hex(2)}", "created": _now(), **record}
         folder = self.voice_dir(voice_id) / "checks"
         folder.mkdir(exist_ok=True)
-        (folder / f"{record['id']}.json").write_text(json.dumps(record), "utf-8")
+        _write(folder / f"{record['id']}.json", json.dumps(record))
         return record
 
     def list_checks(self, voice_id: str) -> list[dict]:
-        return [
-            json.loads(path.read_text("utf-8"))
-            for path in sorted((self.voice_dir(voice_id) / "checks").glob("*.json"))
-        ]
+        return _listed(sorted((self.voice_dir(voice_id) / "checks").glob("*.json")))
 
     def check(self, voice_id: str, check_id: str) -> dict:
         path = self.voice_dir(voice_id) / "checks" / f"{check_id}.json"
         if not _ID.match(check_id) or not path.is_file():
             raise NotFound(check_id)
-        return json.loads(path.read_text("utf-8"))
+        return _load(path)
 
     def migrate(self) -> None:
         """Give every recording and line a voice. Before voices existed, a
@@ -125,7 +163,7 @@ class Store:
                 self.update_source(meta["id"], voice_id=self.voice_named(meta["name"] or "Untitled")["id"])
         recordings = {m["id"]: m for m in self.list_sources()}
         for path in self.root.glob("*/meta.json"):
-            meta = json.loads(path.read_text("utf-8"))
+            meta = _load(path)
             if meta.get("voice_id"):
                 continue
             recording = recordings.get(meta.get("source") or "")
@@ -142,7 +180,7 @@ class Store:
         recording's line that starts with that text is the one, if only one does."""
         by_name = {m["name"]: m for m in recordings.values() if m["status"] == "ready"}
         for path in self.root.glob("*/meta.json"):
-            meta = json.loads(path.read_text("utf-8"))
+            meta = _load(path)
             if meta.get("source") or ": " not in meta["name"]:
                 continue
             prefix, text = meta["name"].split(": ", 1)
@@ -184,7 +222,7 @@ class Store:
         }
         path = self.sources / meta["id"]
         path.mkdir(parents=True)
-        (path / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        _write(path / "meta.json", json.dumps(meta, indent=2))
         return meta, path
 
     def source_dir(self, source_id: str) -> Path:
@@ -194,29 +232,20 @@ class Store:
         return path
 
     def source_meta(self, source_id: str) -> dict:
-        path = self.source_dir(source_id) / "meta.json"
-        for attempt in range(5):
-            # The job replaces the file atomically, but Windows can refuse a
-            # read during the replace.
-            try:
-                return json.loads(path.read_text("utf-8"))
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.05)
+        return _load(self.source_dir(source_id) / "meta.json")
 
     def update_source(self, source_id: str, **fields) -> dict:
         meta = self.source_meta(source_id) | fields
-        (self.source_dir(source_id) / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        _write(self.source_dir(source_id) / "meta.json", json.dumps(meta, indent=2))
         return meta
 
     def list_sources(self) -> list[dict]:
-        metas = [self.source_meta(p.parent.name) for p in self.sources.glob("*/meta.json")]
+        metas = _listed(self.sources.glob("*/meta.json"))
         return sorted(metas, key=lambda m: m["created"])
 
     def source_lines(self, source_id: str) -> list[dict] | None:
         path = self.source_dir(source_id) / "lines.json"
-        return json.loads(path.read_text("utf-8")) if path.is_file() else None
+        return _load(path) if path.is_file() else None
 
     def delete_source(self, source_id: str) -> None:
         path = self.source_dir(source_id)
@@ -247,9 +276,12 @@ class Store:
     def list_targets(self) -> list[dict]:
         metas = []
         for p in self.root.glob("*/meta.json"):
-            meta = json.loads(p.read_text("utf-8"))
+            try:
+                meta = _load(p)
+            except (OSError, ValueError):
+                continue  # a damaged line is left out; the rest still list
             if "best" not in meta:  # targets from before the count was kept
-                overalls = [json.loads(t.read_text("utf-8"))["overall"] for t in (p.parent / "takes").glob("*.json")]
+                overalls = [r["overall"] for r in _listed((p.parent / "takes").glob("*.json"))]
                 meta |= {"takes": len(overalls), "best": max(overalls, default=None)}
             metas.append(meta)
         return sorted(metas, key=lambda m: m["created"])
@@ -293,15 +325,15 @@ class Store:
         sf.write(path / "target.wav", voice.y, SR, subtype="PCM_16")
         if original is not None:
             sf.write(path / "original.wav", original, SR, subtype="PCM_16")
-        (path / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        _write(path / "meta.json", json.dumps(meta, indent=2))
         return meta
 
     def target_meta(self, target_id: str) -> dict:
-        return json.loads((self._target_dir(target_id) / "meta.json").read_text("utf-8"))
+        return _load(self._target_dir(target_id) / "meta.json")
 
     def update_target(self, target_id: str, **fields) -> dict:
         meta = self.target_meta(target_id) | fields
-        (self._target_dir(target_id) / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+        _write(self._target_dir(target_id) / "meta.json", json.dumps(meta, indent=2))
         return meta
 
     def delete_target(self, target_id: str) -> None:
@@ -315,8 +347,8 @@ class Store:
         take_id = f"{datetime.now():%Y%m%d-%H%M%S-%f}-{secrets.token_hex(2)}"
         record = {"id": take_id, "created": _now(), **result}
         sf.write(takes / f"{take_id}.wav", voice.y, SR, subtype="PCM_16")
-        (takes / f"{take_id}.json").write_text(json.dumps(record), "utf-8")
-        overalls = [json.loads(p.read_text("utf-8"))["overall"] for p in takes.glob("*.json")]
+        _write(takes / f"{take_id}.json", json.dumps(record))
+        overalls = [r["overall"] for r in _listed(takes.glob("*.json"))]
         self.update_target(
             target_id,
             takes=len(overalls),
@@ -333,15 +365,13 @@ class Store:
         for meta in self.list_targets():
             if meta.get("voice_id") != voice_id:
                 continue
-            for path in (self.root / meta["id"] / "takes").glob("*.json"):
-                records.append(json.loads(path.read_text("utf-8")))
+            records += _listed((self.root / meta["id"] / "takes").glob("*.json"))
         return sorted(records, key=lambda r: r["created"])[-limit:]
 
     def list_takes(self, target_id: str) -> list[dict]:
         """Oldest first: the headline and each part's score, for trends."""
         takes = []
-        for path in sorted((self._target_dir(target_id) / "takes").glob("*.json")):
-            record = json.loads(path.read_text("utf-8"))
+        for record in _listed(sorted((self._target_dir(target_id) / "takes").glob("*.json"))):
             takes.append(
                 {k: record[k] for k in ("id", "created", "overall")}
                 | {
@@ -357,13 +387,13 @@ class Store:
         folder.mkdir(exist_ok=True)
         record = {"id": f"{datetime.now():%Y%m%d-%H%M%S-%f}-{secrets.token_hex(2)}", "created": _now(), **record}
         sf.write(folder / f"{record['id']}.wav", voice.y, SR, subtype="PCM_16")
-        (folder / f"{record['id']}.json").write_text(json.dumps(record), "utf-8")
+        _write(folder / f"{record['id']}.json", json.dumps(record))
         return record
 
     def list_drills(self, target_id: str) -> list[dict]:
         """Every trainer attempt on the line, oldest first."""
         folder = self._target_dir(target_id) / "drills"
-        return [json.loads(p.read_text("utf-8")) for p in sorted(folder.glob("*.json"))] if folder.is_dir() else []
+        return _listed(sorted(folder.glob("*.json"))) if folder.is_dir() else []
 
     def drill_audio(self, target_id: str, drill_id: str) -> Path:
         path = self._target_dir(target_id) / "drills" / f"{drill_id}.wav"
@@ -383,7 +413,10 @@ class Store:
                 files += list((self.root / meta["id"] / "takes").glob("*.json"))
         out = []
         for path in sorted(files, key=lambda p: p.name)[-limit:]:
-            record = json.loads(path.read_text("utf-8"))
+            try:
+                record = _load(path)
+            except (OSError, ValueError):
+                continue  # a damaged take has no say
             measures = record.get("measures") or {}
             if "ceiling" not in measures:
                 try:
@@ -391,17 +424,17 @@ class Store:
                 except (AnalysisError, OSError):
                     measures["ceiling"] = None
                 record["measures"] = measures
-                path.write_text(json.dumps(record), "utf-8")
+                _write(path, json.dumps(record))
             if measures["ceiling"]:
                 out.append(float(measures["ceiling"]))
         return out
 
     def last_take(self, target_id: str) -> dict | None:
         paths = sorted((self._target_dir(target_id) / "takes").glob("*.json"))
-        return json.loads(paths[-1].read_text("utf-8")) if paths else None
+        return _load(paths[-1]) if paths else None
 
     def take(self, target_id: str, take_id: str) -> dict:
-        return json.loads(self._take_file(target_id, take_id, ".json").read_text("utf-8"))
+        return _load(self._take_file(target_id, take_id, ".json"))
 
     def take_audio(self, target_id: str, take_id: str) -> Path:
         return self._take_file(target_id, take_id, ".wav")

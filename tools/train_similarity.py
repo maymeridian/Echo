@@ -25,10 +25,10 @@ import numpy as np
 from scipy.stats import pearsonr, spearmanr
 
 sys.path.insert(0, str(Path(__file__).parent))
-from validate import voxsim_pairs  # noqa: E402
+from validate import voxsim_pairs
 
-from echo_voice import similarity  # noqa: E402
-from echo_voice.analysis import MAX_SECONDS, SR, AnalysisError, analyze, load  # noqa: E402
+from echo_voice import similarity
+from echo_voice.analysis import MAX_SECONDS, SR, AnalysisError, analyze, load
 
 OUT = Path(__file__).parents[1] / "src" / "echo_voice" / "similarity_model.json"
 MONOTONIC = [1, -1, -1, -1, -1]  # see similarity.FEATURES
@@ -118,7 +118,7 @@ def tune(train: list[dict], clips, audio: Path) -> dict:
     print(f"tuning: fit on {len(yf)} pairs, validate on {len(yv)} pairs from {len(held)} held-out speakers")
     best = None
     for depth, iters, rate, leaf in itertools.product((2, 3, 4, 6), (200, 500), (0.03, 0.1), (20, 100)):
-        params = dict(max_depth=depth, max_iter=iters, learning_rate=rate, min_samples_leaf=leaf)
+        params = {"max_depth": depth, "max_iter": iters, "learning_rate": rate, "min_samples_leaf": leaf}
         model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params).fit(Xf, yf)
         pred = model.predict(Xv)
         # Both jobs count: ranking everyone, and ranking strangers.

@@ -37,10 +37,10 @@ def server(tmp_path):
     thread.join(timeout=5)
 
 
-@pytest.fixture
-def page(tmp_path):
+def open_page(tmp_path, samples):
+    """A page in headless Edge or Chrome whose microphone plays `samples` in a loop."""
     mic = tmp_path / "mic.wav"
-    sf.write(mic, voice(f0=140), SR, subtype="PCM_16")  # the browser loops this as the microphone
+    sf.write(mic, samples, SR, subtype="PCM_16")
     args = [
         "--use-fake-ui-for-media-stream",
         "--use-fake-device-for-media-stream",
@@ -52,7 +52,7 @@ def page(tmp_path):
             try:
                 browser = p.chromium.launch(channel=channel, headless=True, args=args)
                 break
-            except Exception:
+            except Exception:  # noqa: BLE001, S112 (whichever of the two browsers is installed)
                 continue
         if browser is None:
             pytest.skip("neither Edge nor Chrome is installed")
@@ -64,11 +64,30 @@ def page(tmp_path):
         page.on("response", lambda r: r.status >= 400 and page.errors.append(f"{r.status} {r.url}"))
         # Confirm every question; a prompt gets its suggested answer.
         page.on("dialog", lambda dialog: dialog.accept(dialog.default_value) if dialog.type == "prompt" else dialog.accept())
+        # Every time the page asks the browser for a microphone, and which one it asked for.
+        page.add_init_script(
+            "window.micAsks = []; const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);"
+            "navigator.mediaDevices.getUserMedia = (c) => { window.micAsks.push(c.audio.deviceId?.exact ?? null); return real(c); };"
+        )
         yield page
         browser.close()
 
 
-def record(page, button: str, seconds: float = 2.5, check_live: bool = False) -> None:
+@pytest.fixture
+def page(tmp_path):
+    yield from open_page(tmp_path, voice(f0=140))  # a 140 Hz voice at the microphone
+
+
+@pytest.fixture
+def silent_page(tmp_path):
+    yield from open_page(tmp_path, np.zeros(SR, dtype=np.float32))  # a microphone that hears nothing
+
+
+def record(page, button: str, seconds: float = 2.5, check_live: bool = False, fresh: bool = False) -> None:
+    if fresh and page.is_visible("#mic-off"):
+        # The microphone stays open between takes, and the fake one keeps looping its file.
+        # Turning it off first starts the file again, so two takes hear the same thing.
+        page.click("#mic-off")
     page.click(button)
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Recording')")
     page.wait_for_timeout(seconds * 1000)
@@ -246,7 +265,7 @@ def test_a_long_recording_becomes_lines_to_add_to_the_voice(server, page, tmp_pa
 
     # Before a take, the words are there to hear; after it, each is coloured.
     page.wait_for_selector("#words:not([hidden]) .word")
-    record(page, "#record")
+    record(page, "#record", fresh=True)
     page.wait_for_selector("#result:not([hidden])", timeout=30000)
     words = page.locator("#words .word")
     assert words.count() >= 6
@@ -295,7 +314,7 @@ def test_a_long_recording_becomes_lines_to_add_to_the_voice(server, page, tmp_pa
     # The fake mic says the same thing every time: after four takes the line has
     # stopped improving, and the coach offers a fresh one.
     for n in (2, 3, 4):
-        record(page, "#record")
+        record(page, "#record", fresh=True)
         page.wait_for_function(f"document.querySelectorAll('#takes button').length === {n}", timeout=30000)
     page.wait_for_selector("#plateau:not([hidden])")
     assert page.is_visible("#ladder-best")
@@ -380,6 +399,12 @@ def test_warming_up_shows_live_pitch_and_saves_nothing(server, page, tmp_path):
     page.click("#warmup")
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warming up')")
     page.wait_for_function("document.querySelector('#live-text').textContent.startsWith('You:')", timeout=10000)
+    # Resonance shows live too, read in the browser. The microphone plays the
+    # target's own vowels at another pitch, so it sits close to level.
+    page.wait_for_function("!document.querySelector('#live-res').hidden", timeout=10000)
+    said = page.text_content("#live-res-text")
+    assert said.startswith("Resonance so far: about "), said
+    assert "level" in said or int(said.split("about ")[1].split("%")[0]) <= 6, said
     assert page.is_disabled("#record")
     page.click("#warmup")
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warm-up done')")
@@ -448,3 +473,124 @@ def test_a_pasted_link_becomes_a_voice_and_its_speakers_are_told_apart(server, p
         assert page.errors == []
     finally:
         web.shutdown()
+
+
+def test_the_trainer_follows_your_voice_live_and_keeps_nothing(server, page):
+    made = httpx.post(f"{server}/api/voices", json={"name": "Real"}).json()
+    clip = ARCTIC / "bdl_arctic_a0001.wav"
+    line = httpx.post(
+        f"{server}/api/targets", params={"name": "clip", "voice": made["id"]}, content=clip.read_bytes(), timeout=180
+    ).json()
+
+    page.goto(server)
+    page.click("#voices .voice-btn")
+    page.wait_for_selector("#voice:not([hidden])")
+    page.click("#voice-lines .vline .practise")
+    page.wait_for_selector("#practice:not([hidden])")
+    record(page, "#record")
+    page.wait_for_selector("#result:not([hidden])", timeout=30000)
+    page.click("#components li:has-text('Resonance') .train-btn")
+    page.wait_for_selector("#train:not([hidden])")
+
+    # "Try it live": a ring on the map and a mark on the meter follow the
+    # microphone's pitch and resonance, read in the browser.
+    page.click("#train-try")
+    page.wait_for_function("document.querySelector('#train-live').textContent.startsWith('Now:')", timeout=15000)
+    page.wait_for_function("/brighter|darker|level/.test(document.querySelector('#train-live').textContent)", timeout=15000)
+    assert page.is_visible("#train-map .map-live") and page.is_visible("#train-meter .mark.now")
+    assert page.is_disabled("#train-say") and page.text_content("#train-try-label") == "Stop"
+    page.click("#train-try")
+    page.wait_for_function("document.querySelector('#train-try-label').textContent === 'Try it live'")
+    # Nothing was scored or kept.
+    assert page.is_hidden("#train-live") and page.locator("#train-attempts li").count() == 0
+    assert httpx.get(f"{server}/api/targets/{line['id']}/drills").json() == []
+
+    # A scored attempt shows the ring while it records, then the server's dot.
+    page.click("#train-say")
+    page.wait_for_function("document.querySelector('#train-live').textContent.startsWith('Now:')", timeout=15000)
+    assert page.is_disabled("#train-try")
+    page.wait_for_timeout(1500)
+    page.click("#train-say")
+    page.wait_for_selector("#train-attempts li", timeout=20000)
+    assert page.locator("#train-map .map-dot").count() == 1 and page.is_hidden("#train-map .map-live")
+    assert page.errors == []
+
+
+def a_line(server, tmp_path) -> None:
+    made = httpx.post(f"{server}/api/voices", json={"name": "Mic"}).json()
+    clip = tmp_path / "target.wav"
+    sf.write(clip, voice(), SR, subtype="PCM_16")
+    httpx.post(f"{server}/api/targets", params={"name": "clip", "voice": made["id"]}, content=clip.read_bytes(), timeout=120)
+
+
+def open_the_line(page, server) -> None:
+    page.goto(server)
+    page.click("#voices .voice-btn")
+    page.wait_for_selector("#voice:not([hidden])")
+    page.click("#voice-lines .vline .practise")
+    page.wait_for_selector("#practice:not([hidden])")
+
+
+def warm_up(page) -> None:
+    page.click("#warmup")
+    page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warming up')")
+    page.wait_for_function("document.querySelector('#live-text').textContent.startsWith('You:')", timeout=10000)
+    page.click("#warmup")
+    page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warm-up done')")
+
+
+def test_the_microphone_is_opened_once_chosen_once_and_remembered(server, page, tmp_path):
+    a_line(server, tmp_path)
+    open_the_line(page, server)
+    # Nothing chosen yet: the browser decides which microphone.
+    assert page.input_value("#mic-select") == "" and page.is_hidden("#mic-off")
+    warm_up(page)
+    assert page.evaluate("window.micAsks") == [None]
+    # It stays on between takes, so a browser that asks each time asks once.
+    assert page.is_visible("#mic-off") and page.text_content("#mic-note").startswith("On: ")
+    record(page, "#record")
+    page.wait_for_selector("#result:not([hidden])", timeout=20000)
+    assert page.evaluate("window.micAsks") == [None]
+
+    # The microphones are listed by name now. Choosing one opens it and shows its level.
+    names = page.locator("#mic-select option").all_text_contents()
+    assert names[0] == "The browser's choice" and len(names) >= 2 and all(names)
+    page.select_option("#mic-select", index=1)
+    chosen = page.input_value("#mic-select")
+    page.wait_for_function("document.querySelector('#mic-note').textContent.startsWith('Say something')", timeout=10000)
+    page.wait_for_function("parseFloat(document.querySelector('#mic-level').style.width) > 0", timeout=10000)
+    assert page.evaluate("window.micAsks") == [None, chosen]
+    assert page.evaluate("localStorage.getItem('echo.mic')") == chosen
+    page.click("#mic-test")  # stop the test
+    page.wait_for_function("document.querySelector('#mic-test').textContent === 'Test'")
+    assert "No sound" not in page.text_content("#mic-note")
+
+    # Next time it is asked for by its id, whatever the browser's own default is.
+    page.reload()
+    page.wait_for_selector("#practice:not([hidden])")
+    assert page.input_value("#mic-select") == chosen
+    warm_up(page)
+    assert page.evaluate("window.micAsks") == [chosen]
+    # "Turn off" lets go of it.
+    page.click("#mic-off")
+    assert page.is_hidden("#mic-off") and not page.text_content("#mic-note").startswith("On: ")
+    assert page.errors == []
+
+
+def test_a_microphone_that_hears_nothing_is_called_out(server, silent_page, tmp_path):
+    page = silent_page
+    a_line(server, tmp_path)
+    open_the_line(page, server)
+    page.click("#warmup")
+    page.wait_for_function("document.querySelector('#status').textContent.includes('No sound is coming from')", timeout=10000)
+    assert "Choose your microphone" in page.text_content("#status")
+    page.click("#warmup")
+    page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warm-up done')")
+    # The test button says so too, and the box asks for attention.
+    page.click("#mic-test")
+    page.wait_for_function("document.querySelector('#mic-note').textContent.startsWith('Say something')", timeout=10000)
+    page.wait_for_timeout(500)
+    page.click("#mic-test")
+    page.wait_for_function("document.querySelector('#mic-note').textContent.startsWith('No sound came from')")
+    assert "attention" in page.get_attribute("#mic-box", "class")
+    assert page.errors == []

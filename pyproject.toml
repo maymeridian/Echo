@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echo-voice"
-version = "0.1.0"
-description = "Practice a voice impression and measure how close you get."
+dynamic = ["version"]
+description = "Practise a voice impression and measure how close you get."
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
@@ -30,6 +30,9 @@ echo-voice = "echo_voice.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "echo_voice.__version__" }
 
 [tool.setuptools.package-data]
 echo_voice = ["static/*", "*.json"]

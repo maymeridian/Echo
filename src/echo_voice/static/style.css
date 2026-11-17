@@ -263,7 +263,7 @@ main { padding: 28px 36px 64px; max-width: 1240px; width: 100%; }
 .meter { flex: 1; min-width: 80px; height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
 #level { height: 100%; width: 0; background: var(--accent); }
 .keys { white-space: nowrap; }
-.live { margin: 0 0 12px; }
+div.live { margin: 0 0 12px; }
 .live-text { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; }
 
 .result { display: flex; flex-direction: column; gap: 14px; }
@@ -670,3 +670,26 @@ button.brand:hover h1 { color: var(--accent); }
   .check-lines .bar { display: none; }
   .first-voice { flex-direction: column; }
 }
+
+/* Live resonance: a ring that follows your voice on the trainer's map, and a hollow mark on the meters. */
+.map-live { fill: var(--panel); fill-opacity: 0.6; stroke: var(--accent); stroke-width: 3; }
+.map-trail { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; opacity: 0.35; }
+.drill-track .mark.now { background: var(--panel); border: 3px solid var(--accent); box-shadow: none; transition: left 0.1s linear; }
+.live-res { margin-top: 8px; max-width: 520px; }
+.live-res .zone { left: 43.4%; width: 13.2%; } /* within 3.3%: where a word scores 90 or more */
+.pill.on { border-color: var(--accent); color: var(--accent); }
+
+/* The sidebar's microphone box. */
+.mic-box { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 14px 6px 0; border-top: 1px solid var(--line); }
+.mic-box + .sidebar-foot { margin-top: 0; }
+.mic-box label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+.mic-box select { width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--raised); color: var(--text); font: inherit; font-size: 13px; }
+.mic-row { display: flex; align-items: center; gap: 8px; }
+.mic-row .btn { padding: 4px 10px; font-size: 12px; }
+.mic-row .meter { min-width: 40px; }
+#mic-level { height: 100%; width: 0; background: var(--accent); }
+.mic-box .fine { margin: 0; }
+.mic-box.attention select { border-color: var(--accent); }
+.mic-box.attention #mic-note { color: var(--accent); font-weight: 600; }
+
+.version { display: block; margin-top: 8px; font-variant-numeric: tabular-nums; }

@@ -1,7 +1,10 @@
+import { Listener, alignedShift, shift, track, typical } from "./formants.js";
 import { yin } from "./pitch.js";
 
 // The browser's jobs are capturing the microphone, playing clips, drawing, and
-// turning any clip into 16 kHz mono WAV; all measurement happens on the server.
+// turning any clip into 16 kHz mono WAV. Everything that is scored is measured
+// on the server; the browser measures only what it shows while you speak (your
+// pitch, pitch.js, and your resonance, formants.js).
 //
 // The pages: home, a voice (its score, lines and recordings), a recording (its
 // lines to pick from), a line (listen, record, improve), and a voice check's
@@ -58,7 +61,8 @@ let takes = []; // its takes' summaries, oldest first
 let shown = null; // the take on screen
 let source = null; // the open recording, with its lines once they're found
 let session = null; // { kind: "take" | "target" | "warmup", recorder, timer }
-let live = null; // { points: [{t, f0}], started, onset, done }
+let live = null; // { points: [{t, f0, f}], started, onset, done, listener, target }
+let targetTrack = null; // the open line's F1-F3 through time, as the browser reads them: { id, ceiling, frames }
 let check = null; // a voice check under way: { voiceId, voiceName, lines, index, results }
 let selectedWord = null;
 let speed = 1;
@@ -166,47 +170,267 @@ async function decodeMono(blob, maxSeconds) {
 
 const toWav = async (blob) => encodeWav(await decodeMono(blob, MAX_SECONDS + 1));
 
+// ---------- the microphone ----------
+
+// The browser's call-quality processing reshapes the voice, which is the
+// thing being measured, so all of it is off.
+const MIC = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+const MIC_IDLE_SECONDS = 15 * 60;
+const QUIET = 0.0002; // a microphone whose loudest sample stays under this is giving silence
+
+// One stream, kept open between takes, and asked for by the id of the
+// microphone chosen here. Two things go wrong otherwise:
+// - A browser that asks every time the microphone is opened (Firefox, unless
+//   told to remember) would ask at every take.
+// - A browser told to remember stops asking which microphone, and hands over
+//   the system's default. On a computer with virtual audio devices (streaming
+//   and headset software add them) that is often one that hears nothing.
+const mic = { stream: null, devices: [], timer: null, note: "", testing: null };
+
+const micLive = () => Boolean(mic.stream?.getAudioTracks().some((t) => t.readyState === "live"));
+const micLabel = () => mic.stream?.getAudioTracks()[0]?.label || stored.get("echo.mic.label") || "the microphone";
+
+function micProblem(err) {
+  if (err?.name === "NotAllowedError" || err?.name === "SecurityError") {
+    return "The browser is blocking the microphone for this page. Allow it (the microphone icon in the address bar), then try again.";
+  }
+  if (err?.name === "NotFoundError" || err?.name === "OverconstrainedError") return "No microphone was found. Plug one in, then try again.";
+  if (err?.name === "NotReadableError" || err?.name === "AbortError") {
+    return "The microphone didn't start: another app may be using it. Close that, or choose another microphone on the left.";
+  }
+  return "Couldn't open the microphone. Choose another one on the left, or allow it for this page, and try again.";
+}
+
+async function listMics() {
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    // Chrome also lists "default" and "communications", which are whatever the system points them at.
+    mic.devices = all.filter((d) => d.kind === "audioinput" && d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications");
+  } catch {
+    mic.devices = [];
+  }
+  renderMic();
+}
+
+// Has the browser been told to always allow the microphone here? Then it won't ask, or say which one it picked.
+async function alwaysAllowed() {
+  try {
+    return (await navigator.permissions.query({ name: "microphone" })).state === "granted";
+  } catch {
+    return false; // this browser doesn't say
+  }
+}
+
+async function openMic() {
+  clearTimeout(mic.timer);
+  if (micLive()) return mic.stream;
+  const ask = (audio) => navigator.mediaDevices.getUserMedia({ audio });
+  const wanted = stored.get("echo.mic");
+  const name = stored.get("echo.mic.label");
+  mic.note = "";
+  let stream = null;
+  if (wanted) {
+    try {
+      stream = await ask({ ...MIC, deviceId: { exact: wanted } });
+    } catch (err) {
+      if (err.name !== "OverconstrainedError" && err.name !== "NotFoundError") throw err;
+    }
+  }
+  if (!stream) {
+    // No choice yet, or the chosen microphone isn't there under that id: take what the browser gives.
+    const allowed = await alwaysAllowed();
+    const before = performance.now();
+    stream = await ask(MIC);
+    const asked = !allowed && performance.now() - before > 400; // the browser put its own question, with its own list
+    await listMics();
+    const got = stream.getAudioTracks()[0];
+    const same = name && got.label !== name ? mic.devices.find((d) => d.label === name) : null;
+    if (same && !asked) {
+      // The chosen microphone under a new id (a browser hands out new ids when it forgets a site): switch to it.
+      try {
+        const again = await ask({ ...MIC, deviceId: { exact: same.deviceId } });
+        stream.getTracks().forEach((t) => t.stop());
+        stream = again;
+      } catch {}
+    } else if (wanted && name && got.label !== name && !asked) {
+      mic.note = `“${name}” isn't connected. This is the browser's default instead.`;
+    }
+    const now = stream.getAudioTracks()[0];
+    const id = now.getSettings().deviceId;
+    // Remember it when it was chosen: in the browser's question just now, or here before.
+    if (id && (asked || now.label === name)) {
+      stored.set("echo.mic", id);
+      stored.set("echo.mic.label", now.label);
+    }
+  }
+  mic.stream = stream;
+  stream.getAudioTracks()[0].addEventListener("ended", () => {
+    if (mic.stream !== stream) return;
+    mic.stream = null; // unplugged, or taken away by the browser
+    renderMic();
+  });
+  await listMics(); // the names can be read now
+  return stream;
+}
+
+// Let go of the microphone: at once, or after it has gone unused for a while.
+function closeMic() {
+  clearTimeout(mic.timer);
+  if (session || drillRec || mic.testing) return restMic();
+  mic.stream?.getTracks().forEach((t) => t.stop());
+  mic.stream = null;
+  renderMic();
+}
+
+function restMic() {
+  clearTimeout(mic.timer);
+  mic.timer = setTimeout(closeMic, MIC_IDLE_SECONDS * 1000);
+}
+
+// An audio graph on the microphone, for the level and the live readouts.
+// Firefox won't join a microphone to a context running at another sample
+// rate, so other rates are tried before giving up on the readouts.
+function listenTo(stream) {
+  const own = stream.getAudioTracks()[0]?.getSettings().sampleRate;
+  for (const rate of [null, own, 48000, 44100, 32000, 16000, 96000]) {
+    if (rate === undefined) continue;
+    let ctx = null;
+    try {
+      ctx = rate ? new AudioContext({ sampleRate: rate }) : new AudioContext();
+      const source = ctx.createMediaStreamSource(stream);
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      return { ctx, source };
+    } catch {
+      ctx?.close().catch(() => {});
+    }
+  }
+  return null;
+}
+
 class Recorder {
   async start(onLevel, onPitch) {
-    // The browser's call-quality processing reshapes the voice, which is the
-    // thing being measured, so all of it is off.
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
+    this.heard = 0; // the loudest sample so far
+    this.ctx = null;
+    this.stream = await openMic();
     this.chunks = [];
-    this.media = new MediaRecorder(this.stream);
-    this.media.ondataavailable = (e) => e.data.size && this.chunks.push(e.data);
-    this.media.start();
+    try {
+      this.media = new MediaRecorder(this.stream);
+      this.media.ondataavailable = (e) => e.data.size && this.chunks.push(e.data);
+      this.media.start();
+    } catch (err) {
+      restMic();
+      throw err;
+    }
+    renderMic();
 
-    this.ctx = new AudioContext();
+    const wired = listenTo(this.stream);
+    if (!wired) return; // the take still records; only the level and the live readouts are missing
+    this.ctx = wired.ctx;
+    const rate = this.ctx.sampleRate;
     const analyser = this.ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    this.ctx.createMediaStreamSource(this.stream).connect(analyser);
+    // Pitch reads the latest 2048 samples at 44.1 and 48 kHz, as it was
+    // checked. The formant tracker reads 50 ms, which is more than that, so
+    // the buffer is twice as long and `onPitch` is handed all of it too.
+    const span = rate > 50000 ? 4096 : 2048;
+    analyser.fftSize = 2 * span;
+    wired.source.connect(analyser);
     const buffer = new Float32Array(analyser.fftSize);
+    const recent = buffer.subarray(buffer.length - span);
     const tick = () => {
       if (this.media.state !== "recording") return;
       analyser.getFloatTimeDomainData(buffer);
-      const peak = buffer.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+      const peak = recent.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+      this.heard = Math.max(this.heard, peak);
       onLevel(peak);
       if (onPitch && peak > 0) {
-        const frame = buffer.map((x) => x / peak);
-        onPitch(yin(frame, this.ctx.sampleRate)?.f0 ?? null);
+        const frame = recent.map((x) => x / peak);
+        onPitch(yin(frame, rate)?.f0 ?? null, buffer, rate);
       }
       requestAnimationFrame(tick);
     };
     tick();
   }
 
+  // True once it's clear the microphone is giving nothing at all.
+  get silent() {
+    return Boolean(this.ctx) && this.heard < QUIET;
+  }
+
   stop() {
     return new Promise((resolve) => {
       this.media.onstop = () => {
-        this.stream.getTracks().forEach((track) => track.stop());
-        this.ctx.close();
+        this.ctx?.close().catch(() => {});
+        restMic(); // the stream stays open for the next take
+        renderMic();
         resolve(new Blob(this.chunks, { type: this.media.mimeType }));
       };
       this.media.stop();
     });
   }
+}
+
+const noSound = () => `No sound is coming from “${micLabel()}”. Choose your microphone in the list on the left.`;
+
+// The sidebar's microphone box: which one, a level to see that it hears you, and what's going on.
+function renderMic() {
+  const select = $("#mic-select");
+  const busy = Boolean(session || drillRec);
+  const chosen = stored.get("echo.mic") || "";
+  const name = stored.get("echo.mic.label");
+  const options = [el("option", { value: "", textContent: "The browser's choice" })];
+  mic.devices.forEach((d, i) => options.push(el("option", { value: d.deviceId, textContent: d.label || `Microphone ${i + 1}` })));
+  // The chosen one stays listed while the browser isn't naming its microphones (before it's allowed) or it's unplugged.
+  if (chosen && !mic.devices.some((d) => d.deviceId === chosen)) options.push(el("option", { value: chosen, textContent: name || "The one you chose" }));
+  select.replaceChildren(...options);
+  select.value = chosen;
+  select.disabled = busy || Boolean(mic.testing);
+  $("#mic-test").textContent = mic.testing ? "Stop" : "Test";
+  $("#mic-test").disabled = busy;
+  $("#mic-off").hidden = !micLive() || busy || Boolean(mic.testing);
+  $("#mic-box").classList.toggle("attention", Boolean(mic.note));
+  const on = micLive() ? `On: ${mic.stream.getAudioTracks()[0].label || "the microphone"}. It stays on between takes, and turns off after 15 minutes unused.` : "";
+  $("#mic-note").textContent = mic.note || on || (chosen ? "" : "If the browser picks the wrong one, choose yours here. Echo remembers it.");
+}
+
+async function chooseMic(id) {
+  const device = mic.devices.find((d) => d.deviceId === id);
+  stored.set("echo.mic", id);
+  stored.set("echo.mic.label", id ? (device?.label ?? stored.get("echo.mic.label")) : "");
+  mic.note = "";
+  closeMic(); // let go of the other one
+  if (id) await testMic(); // open it and show its level straight away
+}
+
+// Open the microphone for a few seconds and show its level; nothing is recorded.
+async function testMic() {
+  if (mic.testing) return stopMicTest();
+  if (session || drillRec) return;
+  const recorder = new Recorder();
+  mic.testing = { recorder, timer: null };
+  renderMic();
+  try {
+    await recorder.start((peak) => ($("#mic-level").style.width = `${Math.min(100, peak * 140)}%`));
+  } catch (err) {
+    mic.testing = null;
+    mic.note = micProblem(err);
+    renderMic();
+    return;
+  }
+  if (mic.testing?.recorder !== recorder) return recorder.stop(); // stopped while it was opening
+  mic.testing.timer = setTimeout(stopMicTest, 8000);
+  mic.note = "Say something: the bar should move.";
+  renderMic();
+}
+
+async function stopMicTest() {
+  const test = mic.testing;
+  if (!test) return;
+  mic.testing = null;
+  clearTimeout(test.timer);
+  $("#mic-level").style.width = "0";
+  mic.note = test.recorder.silent ? `No sound came from “${micLabel()}”. Try another one.` : "";
+  if (test.recorder.media?.state === "recording") await test.recorder.stop();
+  renderMic();
 }
 
 // ---------- shared pieces: a score ring and the scale from a stranger to the real person ----------
@@ -344,6 +568,7 @@ function leave() {
     clearTimeout(drillRec.timer);
     drillRec.recorder.stop();
     drillRec = null;
+    drillLive = null;
   }
   training = null;
   check = null;
@@ -2174,7 +2399,7 @@ function modeScore(r, part) {
   return scores.some((s) => s == null) ? null : Math.min(...scores);
 }
 const passedWord = (tries, part) => tries.length >= IN_A_ROW && tries.slice(-IN_A_ROW).every((r) => (modeScore(r, part) ?? 0) >= PASS);
-let drillRec = null; // { recorder, timer }
+let drillRec = null; // { recorder, timer, free, index }: the trainer has the microphone open
 
 async function openTrainer(part) {
   if (!current) return;
@@ -2209,9 +2434,9 @@ async function openTrainer(part) {
         const unit = (profile?.words ?? []).findIndex((w) => r.start >= w.start - 0.02 && r.start < w.end);
         if (unit >= 0) (training.attempts[unit] ??= []).push(r);
       }
-      // Start at the first word not done yet.
+      // Start at the first word not done yet, unless a word was picked meanwhile.
       const next = training.order.findIndex((i) => !passedWord(training.attempts[i] ?? [], training.part));
-      training.at = Math.max(0, next);
+      if (!training.picked) training.at = Math.max(0, next);
       renderTrainer();
     } catch {}
   }
@@ -2224,6 +2449,7 @@ function switchTrainMode(part) {
   openTrainer(part);
   training.attempts = attempts; // the same attempts, read for another part
   training.at = Math.max(0, training.order.indexOf(word));
+  training.picked = true; // stay on this word when the saved attempts arrive
   renderTrainer();
 }
 
@@ -2238,6 +2464,15 @@ function trainDirection(part) {
 function renderTrainer() {
   const { part, order, at } = training;
   const info = TRAIN[part];
+  if (drillRec && drillRec.index !== order[at]) stopDrill(); // the word changed under an open microphone
+  const scoring = Boolean(drillRec && !drillRec.free);
+  const trying = Boolean(drillRec?.free);
+  $("#train-say").classList.toggle("live", scoring);
+  $("#train-say-label").textContent = scoring ? "Stop" : "Say it";
+  $("#train-say").disabled = trying;
+  $("#train-try").classList.toggle("on", trying);
+  $("#train-try-label").textContent = trying ? "Stop" : "Try it live";
+  $("#train-try").disabled = scoring;
   for (const b of document.querySelectorAll("#train-modes button")) b.setAttribute("aria-pressed", String(b.dataset.part === part));
   $("#train-crumb").textContent = `‹ “${lineText(current)}”`;
   $("#train-crumb").onclick = leaveTrainer;
@@ -2274,6 +2509,7 @@ function renderTrainer() {
       button.setAttribute("aria-pressed", String(k === at));
       button.onclick = () => {
         training.at = k;
+        training.picked = true;
         renderTrainer();
       };
       return button;
@@ -2339,6 +2575,7 @@ function playWordNote() {
 function renderDrillMap(part, tries) {
   const show_ = part === "pitch" || part === "resonance" || part === "both";
   $("#train-map").hidden = !show_;
+  mapLive = null;
   if (!show_) return;
   const ns = "http://www.w3.org/2000/svg";
   const make = (tag, attrs) => {
@@ -2383,14 +2620,22 @@ function renderDrillMap(part, tries) {
     n.textContent = String(k + 1);
     svg.append(n);
   });
+  // Where your voice is right now, while the microphone is open (renderDrillLive).
+  const trail = make("polyline", { points: "", class: "map-trail" });
+  const ring_ = make("circle", { cx: W / 2, cy: H / 2, r: 8, class: "map-live" });
+  ring_.style.display = "none";
+  svg.append(trail, ring_);
+  mapLive = { ring: ring_, trail, x, y };
   $("#train-map").replaceChildren(svg);
 }
 
 function renderDrillMeter(part, last) {
   const value = part === "resonance" ? last?.percent : part === "pitch" ? last?.pitch : null;
   const scaled = part === "resonance" || part === "pitch";
-  $("#train-meter").hidden = !scaled || !last;
-  if (!scaled || !last) return;
+  const showing = scaled && Boolean(last || drillLive);
+  $("#train-meter").hidden = !showing;
+  meterLive = null;
+  if (!showing) return;
   // ±25% of formant shift, or ±6 semitones; the band is where a word scores 90 or more.
   const [range, band, unit] = part === "resonance" ? [25, 3.3, "%"] : [6, 1.3, " st"];
   const [low, high] = part === "resonance" ? ["darker", "brighter"] : ["lower", "higher"];
@@ -2404,6 +2649,9 @@ function renderDrillMeter(part, last) {
     mark.style.left = `${50 + (at / range) * 50}%`;
     track.append(mark);
   }
+  meterLive = el("i", { className: "mark now" }); // where your voice is right now
+  meterLive.style.display = "none";
+  track.append(meterLive);
   $("#train-meter").replaceChildren(
     el("span", { className: "end", textContent: `◀ ${low}` }),
     track,
@@ -2460,47 +2708,112 @@ function playTrainWord() {
     .finally(() => playing === token && stopPlayback());
 }
 
-async function toggleDrill() {
-  if (drillRec) return stopDrill();
-  if (session) return;
+// While the microphone is open in the trainer, a ring on the map (and a mark on
+// the meter) shows where the last second or so of your voice sits against the
+// target's phrase: pitch in semitones, resonance in percent. Both are read in
+// the browser; the attempt that counts is still measured on the server.
+const LIVE_SECONDS = 1.2;
+let drillLive = null; // { listener, points: [{t, f0, f}], started, unit, pitch, trail, ticks }
+let mapLive = null; // the map's ring and trail, and its scales
+let meterLive = null; // the meter's live mark
+
+function drillNow() {
+  const now = (performance.now() - drillLive.started) / 1000;
+  const recent = drillLive.points.filter((p) => p.t > now - LIVE_SECONDS);
+  const f0s = recent.map((p) => p.f0).filter(Boolean).sort((a, b) => a - b);
+  const hz = f0s.length >= 5 ? f0s[f0s.length >> 1] : null;
+  return {
+    hz,
+    pitch: hz && drillLive.pitch ? 12 * Math.log2(hz / drillLive.pitch) : null,
+    percent: shift(typical(recent.map((p) => p.f)), drillLive.unit),
+  };
+}
+
+function renderDrillLive() {
+  const { hz, pitch, percent } = drillNow();
+  const said = [];
+  if (pitch != null) said.push(Math.abs(pitch) < 0.3 ? "on pitch" : `${Math.abs(pitch).toFixed(1)} semitones ${pitch > 0 ? "high" : "low"}`);
+  else if (hz) said.push(`${Math.round(hz)} Hz (${noteName(hz)})`);
+  if (percent != null) said.push(Math.abs(percent) < 2 ? "resonance about level" : `about ${Math.abs(percent).toFixed(0)}% ${percent > 0 ? "brighter" : "darker"}`);
+  if (said.length) $("#train-live").textContent = `Now: ${said.join(", ")}`;
+  const seen = pitch != null || percent != null;
+  if (mapLive) {
+    mapLive.ring.style.display = seen ? "" : "none";
+    if (seen) {
+      const point = [mapLive.x(pitch ?? 0), mapLive.y(percent ?? 0)];
+      mapLive.ring.setAttribute("cx", point[0]);
+      mapLive.ring.setAttribute("cy", point[1]);
+      // A short tail, so the direction you're moving in shows.
+      if (drillLive.ticks++ % 3 === 0) {
+        drillLive.trail.push(point);
+        if (drillLive.trail.length > 40) drillLive.trail.shift();
+      }
+      mapLive.trail.setAttribute("points", drillLive.trail.map((p) => p.map((v) => v.toFixed(1)).join(",")).join(" "));
+    }
+  }
+  if (meterLive) {
+    const [value, range] = training.part === "resonance" ? [percent, 25] : [pitch, 6];
+    meterLive.style.display = value == null ? "none" : "";
+    if (value != null) meterLive.style.left = `${50 + (Math.max(-range, Math.min(range, value)) / range) * 50}%`;
+  }
+}
+
+// `free`: just look, for as long as 45 s; nothing is scored or kept.
+async function startDrill(free) {
+  if (drillRec || session || !training) return;
   stopPlayback();
+  await stopMicTest();
   const recorder = new Recorder();
-  const target = profile?.median_f0;
+  const index = training.order[training.at];
+  const word = profile.words[index];
+  const mine = { listener: null, points: [], started: performance.now(), unit: null, pitch: wordPitch(index) ?? profile.median_f0 ?? null, trail: [], ticks: 0 };
   $("#train-live").hidden = false;
-  $("#train-live").textContent = "Say the word…";
-  const recent = [];
+  $("#train-live").textContent = free ? "Say it, hold it, slide it: the ring follows your voice." : "Say it…";
   try {
     await recorder.start(
       () => {},
-      (f0) => {
-        if (!f0) return;
-        recent.push(f0);
-        if (recent.length > 20) recent.shift();
-        const now = [...recent].sort((a, b) => a - b)[Math.floor(recent.length / 2)];
-        $("#train-live").textContent = `You: ${Math.round(now)} Hz (${noteName(now)})${target ? ` · the line sits around ${Math.round(target)} Hz (${noteName(target)})` : ""}`;
+      (f0, frame, rate) => {
+        if (drillLive !== mine) return;
+        const f = mine.listener ? mine.listener.hear(frame, rate) : null;
+        // Pitch counts on the frames loud enough to count for resonance, as in the target's phrase.
+        mine.points.push({ t: (performance.now() - mine.started) / 1000, f0: mine.listener?.quiet ? null : f0, f });
+        if (mine.points.length > 900) mine.points.splice(0, 300);
+        renderDrillLive();
       },
     );
-  } catch {
+  } catch (err) {
     $("#train-live").hidden = true;
-    setStatus("Couldn't open the microphone — allow access for this page and try again.", true);
+    setStatus(micProblem(err), true);
     return;
   }
-  const timer = setTimeout(stopDrill, 6000); // a word, not a line
-  drillRec = { recorder, timer };
-  $("#train-say").classList.add("live");
-  $("#train-say-label").textContent = "Stop";
+  drillLive = mine;
+  drillRec = { recorder, free, index, timer: setTimeout(stopDrill, (free ? 45 : 6) * 1000) }; // a word, not a line
+  renderTrainer();
+  renderMic();
+  setTimeout(() => {
+    if (drillRec?.recorder === recorder && recorder.silent) $("#train-live").textContent = noSound();
+  }, 1500);
+  // The target's phrase, read the way the microphone is.
+  loadTargetTrack().then((frames) => {
+    if (!frames || drillLive !== mine) return;
+    const said = frames.filter((f) => f.t >= word.start - 0.02 && f.t < word.end + 0.02);
+    mine.unit = typical(said.map((f) => f.f), 5);
+    const f0s = said.map((f) => f.f0).filter(Boolean).sort((a, b) => a - b);
+    if (f0s.length >= 5) mine.pitch = f0s[f0s.length >> 1]; // the live tracker's own reading of the phrase
+    mine.listener = new Listener(profile.my_ceiling ?? profile.ceiling);
+  });
 }
 
 async function stopDrill() {
   if (!drillRec) return;
-  const { recorder, timer } = drillRec;
+  const { recorder, timer, free, index } = drillRec;
   drillRec = null;
+  drillLive = null;
   clearTimeout(timer);
-  $("#train-say").classList.remove("live");
-  $("#train-say-label").textContent = "Say it";
   $("#train-live").hidden = true;
+  if (training) renderTrainer();
   const blob = await recorder.stop();
-  const index = training.order[training.at];
+  if (free || !training) return; // just looking: nothing to score or keep
   setStatus("Measuring…");
   try {
     const result = await postWav(`/api/targets/${current.id}/drill?word=${index}`, await toWav(blob));
@@ -2511,6 +2824,9 @@ async function stopDrill() {
     setStatus(err.message, true);
   }
 }
+
+const toggleDrill = () => (drillRec ? stopDrill() : startDrill(false));
+const toggleTryLive = () => (drillRec ? stopDrill() : startDrill(true));
 
 let minePlayer = null;
 
@@ -2525,6 +2841,7 @@ function playMine() {
 
 function nextTrainWord() {
   if (training.at + 1 < training.order.length) training.at += 1;
+  training.picked = true;
   renderTrainer();
 }
 
@@ -2546,6 +2863,7 @@ function leaveTrainer() {
 
 async function startRecording(kind) {
   stopPlayback();
+  await stopMicTest();
   const recorder = new Recorder();
   const withLive = kind !== "target";
   if (withLive && !profile && current) {
@@ -2559,9 +2877,9 @@ async function startRecording(kind) {
       (peak) => ($("#level").style.width = `${Math.min(100, peak * 140)}%`),
       withLive ? onLivePitch : null,
     );
-  } catch {
+  } catch (err) {
     stopLive();
-    setStatus("Couldn't open the microphone — allow access for this page and try again.", true);
+    setStatus(micProblem(err), true);
     return;
   }
   const started = performance.now();
@@ -2569,12 +2887,14 @@ async function startRecording(kind) {
   const label = kind === "warmup" ? "Warming up, not scored" : "Recording";
   const timer = setInterval(() => {
     const seconds = (performance.now() - started) / 1000;
-    setStatus(`${label}… ${seconds.toFixed(0)} s`);
+    const dead = seconds > 1.5 && recorder.silent;
+    setStatus(dead ? `${label}… ${seconds.toFixed(0)} s. ${noSound()}` : `${label}… ${seconds.toFixed(0)} s`, dead);
     if (seconds >= limit) stopRecording();
   }, 250);
   session = { kind, recorder, timer };
   setStatus(`${label}…`);
   renderControls();
+  renderMic();
 }
 
 async function stopRecording() {
@@ -2596,12 +2916,66 @@ async function stopRecording() {
 
 const toggleRecording = (kind) => (session ? stopRecording() : startRecording(kind));
 
+// The target's F1-F3 through the line, read in the browser by the tracker the
+// microphone goes through (formants.js), so a gap between the two is a gap
+// between the voices and not between two ways of measuring.
+function loadTargetTrack() {
+  if (!current || !profile?.ceiling) return Promise.resolve(null);
+  const { id } = current;
+  const { ceiling } = profile;
+  if (targetTrack?.id !== id || targetTrack.ceiling !== ceiling) {
+    const frames = fetch(`/api/targets/${id}/audio`)
+      .then((response) => response.blob())
+      .then((blob) => decodeMono(blob, MAX_SECONDS + 30))
+      .then((samples) => track(samples, SR, ceiling))
+      .catch(() => null);
+    targetTrack = { id, ceiling, frames };
+  }
+  return targetTrack.frames;
+}
+
+const brightness = (percent) =>
+  Math.abs(percent) < 2 ? "about level with" : `about ${Math.abs(percent).toFixed(0)}% ${percent > 0 ? "brighter" : "darker"} than`;
+
+// Your resonance so far against the target's, with your sounds lined up with
+// the target's first, as a take's Resonance is measured: each vowel is held
+// against the same vowel. Without that, a whole line's typical formants depend
+// on how long each speaker dwells on each sound, and read several points off.
+// What's lined up is what you've said since your last pause of a second or
+// more: one pass through the line, however often you warm up on it.
+function renderLiveResonance() {
+  let percent = null;
+  if (live?.target && live.onset != null) {
+    const said = [];
+    let later = null;
+    for (let i = live.points.length - 1; i >= 0; i--) {
+      const point = live.points[i];
+      if (!point.f) continue;
+      if (later != null && later - point.t > 1) break;
+      said.push(point.f);
+      later = point.t;
+    }
+    percent = alignedShift(said.reverse(), live.target.map((f) => f.f), { open: true });
+  }
+  $("#live-res").hidden = percent == null;
+  if (percent == null) return;
+  $("#live-res-mark").style.left = `${50 + (Math.max(-25, Math.min(25, percent)) / 25) * 50}%`;
+  $("#live-res-text").textContent = `Resonance so far: ${brightness(percent)} the target`;
+}
+
 function startLive() {
-  live = { points: [], started: performance.now(), onset: null, done: false };
+  const started = { points: [], started: performance.now(), onset: null, done: false, listener: null, target: null };
+  live = started;
   selectedWord = null;
   $("#live").hidden = false;
   $("#live-text").textContent = "Speak…";
+  $("#live-res").hidden = true;
   drawGuide();
+  loadTargetTrack().then((frames) => {
+    if (!frames || live !== started) return;
+    started.target = frames;
+    started.listener = new Listener(profile.my_ceiling ?? profile.ceiling);
+  });
 }
 
 function stopLive() {
@@ -2609,10 +2983,10 @@ function stopLive() {
   $("#live").hidden = true;
 }
 
-function onLivePitch(f0) {
+function onLivePitch(f0, frame, rate) {
   if (!live || live.done) return;
   const t = (performance.now() - live.started) / 1000;
-  live.points.push({ t, f0 });
+  live.points.push({ t, f0, f: live.listener && frame ? live.listener.hear(frame, rate) : null });
   if (f0 && live.onset == null) live.onset = t;
   const recent = live.points.filter((p) => p.f0 && p.t > t - 0.5).map((p) => p.f0).sort((a, b) => a - b);
   const target = profile?.median_f0;
@@ -2626,6 +3000,7 @@ function onLivePitch(f0) {
     }
     $("#live-text").textContent = text;
   }
+  if (live.points.length % 4 === 0) renderLiveResonance(); // a few times a second is plenty
   drawGuide();
 }
 
@@ -2635,6 +3010,7 @@ async function submitTake(blob) {
     const focus = chosenFocus();
     const path = `/api/targets/${current.id}/takes${focus ? `?focus=${focus}` : ""}`;
     const take = await postWav(path, await toWav(blob));
+    if (profile && take.measures?.ceiling_used) profile.my_ceiling = take.measures.ceiling_used; // for the live meter
     takes.push({
       id: take.id,
       created: take.created,
@@ -3015,6 +3391,16 @@ $("#train-note").onclick = playWordNote;
 $("#train-mine").onclick = playMine;
 for (const b of document.querySelectorAll("#train-modes button")) b.onclick = () => switchTrainMode(b.dataset.part);
 $("#train-say").onclick = toggleDrill;
+$("#mic-select").onchange = (e) => chooseMic(e.target.value);
+$("#mic-test").onclick = testMic;
+$("#mic-off").onclick = closeMic;
+navigator.mediaDevices?.addEventListener?.("devicechange", listMics);
+api("/api/config")
+  .then((config) => ($("#version").textContent = `Echo ${config.version}`))
+  .catch(() => {});
+window.addEventListener("pagehide", () => mic.stream?.getTracks().forEach((t) => t.stop()));
+listMics();
+$("#train-try").onclick = toggleTryLive;
 $("#train-next").onclick = nextTrainWord;
 $("#train-back").onclick = leaveTrainer;
 $("#check-stop").onclick = stopCheck;

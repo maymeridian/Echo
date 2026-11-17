@@ -41,7 +41,7 @@ def _features(item):
 
     try:
         x = features(analyze(load(path)))
-    except Exception:
+    except Exception:  # noqa: BLE001 (a clip that can't be read or measured is left out)
         x = None
     return None if x is None else (corpus, speaker, female, x.tolist())
 

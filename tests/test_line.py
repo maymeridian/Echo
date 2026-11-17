@@ -3,7 +3,7 @@ from pathlib import Path
 from echo_voice import analyze, compare, load
 from echo_voice.line import compare_words, transcribe
 
-LINE = "Author of the Danger Trail, Philip Steels, etc.".split()
+LINE = ["Author", "of", "the", "Danger", "Trail,", "Philip", "Steels,", "etc."]
 
 
 def check(said: str):
@@ -78,3 +78,19 @@ def test_words_said_in_one_breath_become_one_unit():
     assert [u["text"] for u in units] == ["I'll", "let you in on", "this."]
     assert (units[1]["start"], units[1]["end"], units[1]["count"]) == (0.8, 1.6, 4)
     assert speech_units(y, []) == []
+
+
+def test_a_piece_that_starts_with_punctuation_joins_the_word_before():
+    from echo_voice.line import glue
+
+    words = [
+        {"text": "12", "start": 0.0, "end": 0.3, "p": 0.9},
+        {"text": ",000", "start": 0.3, "end": 0.8, "p": 0.6},
+        {"text": "people", "start": 0.9, "end": 1.4, "p": 0.95},
+        {"text": "!", "start": 1.4, "end": 1.45, "p": 0.5},
+    ]
+    glued = glue(words)
+    assert [w["text"] for w in glued] == ["12,000", "people!"]
+    assert (glued[0]["start"], glued[0]["end"], glued[0]["p"]) == (0.0, 0.8, 0.6)
+    assert glue([{"text": ",", "start": 0.0, "end": 0.1}]) == [{"text": ",", "start": 0.0, "end": 0.1}]  # nothing before it
+    assert words[0]["text"] == "12"  # the list handed in is left as it was

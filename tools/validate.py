@@ -218,13 +218,13 @@ def _formant_job(item):
 
 def _h95_truth(root: Path):
     truth = {}
-    for line in open(root / "vowdata.dat", encoding="latin-1"):
+    for line in (root / "vowdata.dat").read_text("latin-1").splitlines():
         parts = line.split()
         if len(parts) == 16 and parts[0][:1] in "mwbg" and parts[0][1:3].isdigit():
             v = [float(x) for x in parts[1:]]
             truth[parts[0]] = np.array([[v[6], v[9], v[12]], [v[7], v[10], v[13]], [v[8], v[11], v[14]]])
     times = {}
-    for line in open(root / "timedata.dat", encoding="latin-1"):
+    for line in (root / "timedata.dat").read_text("latin-1").splitlines():
         parts = line.split()
         if len(parts) >= 3 and parts[0] in truth:
             times[parts[0]] = (float(parts[1]) / 1000, float(parts[2]) / 1000)
@@ -389,7 +389,7 @@ def validate_formant_lines(root: Path, workers: int) -> None:
             for k in range(3):
                 a = np.array(groups[g][k])
                 cells.append(f"{np.median(a):6.1%} / {np.mean(a > 0.15):5.1%}")
-            pick = np.median(picks[label][g]) if g != "all" else np.median(sum(picks[label].values(), []))
+            pick = np.median(picks[label][g]) if g != "all" else np.median([p for group in picks[label].values() for p in group])
             print(f"{label:32s} {g:9s}" + "".join(f"{c:>17s}" for c in cells) + f"   {pick:.0f} Hz")
         print()
 
@@ -465,8 +465,7 @@ def score_vcc(root: Path, out: Path, workers: int) -> None:
     done = 0
     with ProcessPoolExecutor(workers) as pool, open(out, "w", encoding="utf-8") as f:
         for rows in pool.map(_vcc_job, groups.items()):
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
+            f.writelines(json.dumps(r) + "\n" for r in rows)
             done += 1
             if done % 50 == 0:
                 print(f"  {done}/{len(groups)}", file=sys.stderr)
@@ -480,7 +479,7 @@ def report_vcc(path: Path, extra: dict[str, dict] | None = None) -> None:
 
     from scipy.stats import pearsonr, spearmanr
 
-    rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+    rows = [json.loads(line) for line in Path(path).read_text("utf-8").splitlines()]
     measures = ["overall", "identity"] + sorted(k for k in rows[0] if k.startswith("score_"))
     values = {m: [r[m] for r in rows] for m in measures}
     for label, table in (extra or {}).items():
@@ -518,7 +517,7 @@ def report_vcc(path: Path, extra: dict[str, dict] | None = None) -> None:
     print(head)
     for m in measures:
         cells = [corr(range(len(rows)), m), corr(conv, m), corr(conv_t, m)]
-        sr, pr, n = system_corr(conv, m)
+        sr, pr, _ = system_corr(conv, m)
         print(f"{m:26s}" + "".join(f"{a:7.3f}/{b:6.3f} " for a, b in cells) + f"  {sr:6.3f}/{pr:6.3f}")
     print(f"\nper system: {system_corr(conv, 'overall')[2]} groups (system x compared-with x task), "
           "means weighted by number of ratings")
@@ -600,7 +599,7 @@ def _embed_files(paths: list[str], cache: Path, workers: int) -> dict[str, dict[
 def vcc_models(root: Path, scored: Path, workers: int) -> None:
     import json
 
-    rows = [json.loads(line) for line in open(scored, encoding="utf-8")]
+    rows = [json.loads(line) for line in Path(scored).read_text("utf-8").splitlines()]
     files = sorted({r["target"] for r in rows} | {r["take"] for r in rows})
     from calibrate import cohort_files
 
@@ -1195,7 +1194,7 @@ def validate_speakers(vcc: Path, workers: int, trials: int = 60) -> None:
             found = find_speakers(rows, emb, threshold)
             right_count[k] += len(found) == k
             # Match each found speaker to the real one most of its lines belong to.
-            truth = {s["speaker"]: max(set(r["who"] for r in rows if r["speaker"] == s["speaker"]),
+            truth = {s["speaker"]: max({r["who"] for r in rows if r["speaker"] == s["speaker"]},
                                        key=lambda n: sum(1 for r in rows if r["speaker"] == s["speaker"] and r["who"] == n))
                      for s in found}
             main_right += bool(found) and truth.get(0) == plan_main(plan)
@@ -1263,7 +1262,7 @@ def validate_speakers_wild(vox: Path, workers: int, trials: int = 30) -> None:
                 emb[i] = e
             found = find_speakers(rows, emb, threshold)
             right_count[k] += len(found) == k
-            truth = {s["speaker"]: max(set(r["who"] for r in rows if r["speaker"] == s["speaker"]),
+            truth = {s["speaker"]: max({r["who"] for r in rows if r["speaker"] == s["speaker"]},
                                        key=lambda n: sum(1 for r in rows if r["speaker"] == s["speaker"] and r["who"] == n))
                      for s in found}
             for r in rows:
