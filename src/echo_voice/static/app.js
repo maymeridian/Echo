@@ -753,7 +753,7 @@ function renderProgress() {
   );
 }
 
-// "▶ <title> · <channel> ↗", opening the video in a new tab.
+// "▶ <channel> on YouTube: <title>", opening the video in a new tab.
 function videoLink(s) {
   const site = /youtu\.?be/i.test(s.link) ? "YouTube" : "the web";
   const title = s.title || s.name;

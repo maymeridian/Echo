@@ -31,7 +31,7 @@ Source = "https://github.com/maymeridian/Echo"
 Changelog = "https://github.com/maymeridian/Echo/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = ["pytest", "httpx", "ruff"]
 e2e = ["playwright"]  # drives the installed Edge or Chrome; no browser download
 
 [project.scripts]

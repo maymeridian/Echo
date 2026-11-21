@@ -460,8 +460,9 @@ def rank(rows: list[dict], speaker: int = 0) -> list[tuple[float, int]]:
     ending make its tune), and in the voice's usual range: within 4 semitones
     of its median pitch. A line far outside it is usually creaky voice or a pitch tracker
     off by an octave, and makes a poor target either way. On a 25-minute
-    soft-spoken video that rules out 19 of 185 untagged lines, including two of
-    the five it suggested before, both at 98-99 Hz against a typical 191."""
+    video of one soft-spoken speaker that rules out 19 of 185 untagged lines,
+    including two of the five it suggested before, both at 98-99 Hz against a
+    typical 191."""
     clean = [r["pitch"] for r in rows if not line_flags(r, speaker) and r["pitch"]]
     typical = float(np.median(clean)) if len(clean) >= 5 else None
     ranked = []
