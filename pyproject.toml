@@ -27,8 +27,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://maymeridian.dev/projects/echo/"
-Source = "https://github.com/maymeridian/echo"
-Changelog = "https://github.com/maymeridian/echo/blob/main/CHANGELOG.md"
+Source = "https://github.com/maymeridian/Echo"
+Changelog = "https://github.com/maymeridian/Echo/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]

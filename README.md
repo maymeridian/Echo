@@ -36,8 +36,8 @@ runs on the CPU.
 On Windows (PowerShell):
 
 ```powershell
-git clone https://github.com/maymeridian/echo
-cd echo
+git clone https://github.com/maymeridian/Echo
+cd Echo
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
 .\.venv\Scripts\echo-voice serve
@@ -46,8 +46,8 @@ python -m venv .venv
 On macOS or Linux:
 
 ```bash
-git clone https://github.com/maymeridian/echo
-cd echo
+git clone https://github.com/maymeridian/Echo
+cd Echo
 python3 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 .venv/bin/echo-voice serve
