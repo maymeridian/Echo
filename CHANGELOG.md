@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.1.1 (2026-11-20)
+
+The source is now public, under the MIT licence. This release fixes what a
+review of the whole code found before it went out.
+
+### Safety
+
+- Other websites can no longer use Echo's server. A page on another site
+  could make your browser queue downloads or delete voices, and with a DNS
+  trick read the API, your takes' audio included. Echo now answers only to
+  its own address, and only its own page can change anything.
+- An upload over the size limit is refused before it is read in.
+- Live streams are refused, since they have no end to wait for, and a
+  download stops at 2 GB.
+
+### Recording
+
+- Pressing Record or Space again while the microphone was still opening
+  started a second recording that nothing could stop, and every later take
+  then ended within a quarter of a second. Nothing new can start while a take
+  is starting or being scored.
+- Leaving a line in the middle of a take drops the take. Before, it was scored
+  against whichever line was open when it stopped.
+- If the microphone is unplugged during a take, the take ends and is scored
+  with what was recorded. Before, the page hung.
+- A take that begins with a moment of digital silence, as a device waking up
+  or a Bluetooth headset switching mode gives, no longer runs on in a noisy
+  room.
+- The live meters no longer take a DC offset on the microphone for a voice.
+- Errors from the server read as words, not "[object Object]".
+
+### Your data
+
+- Saved audio is no longer trimmed a second time when it is read back. That
+  moved a line's ends by up to 60 ms against its word timings, and by 160 ms
+  on a clip that starts in digital silence. Saved takes are scored again the
+  first time 1.1.1 starts, as with 1.1.0.
+- Re-scoring carries on past a take whose audio is missing. A voice check is
+  worked out again only once all its takes have been.
+- Choosing another speaker in a recording no longer deletes lines you have
+  trained on in the trainer but not yet taken.
+- A name you give a voice while its video is downloading is kept. Before, the
+  channel's name replaced it.
+- Two changes at once to a line or a voice no longer undo each other.
+- A recording's list of lines is written whole, so an interrupted job can't
+  leave half a file behind.
+- Splitting off a speaker marks the copy ready only once it is complete.
+- Auto-pick and Add can't be clicked twice while they run.
+
+### Known limits
+
+- With the microphone open and no one speaking, a steady hum can show as a
+  pitch in the live readout. Echo can't yet tell a hum from a very soft voice
+  without hiding the soft voice too.
+
 ## 1.1.0 (2026-11-17)
 
 Every measurement was audited against recordings whose right answer is known

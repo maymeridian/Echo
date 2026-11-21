@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__, autopick, clean, gender, sources
 from . import line as transcript
@@ -48,16 +49,50 @@ MAX_SOURCE_BYTES = 4 * 1024**3  # a long video
 MAX_SLICE_SECONDS = 90.0  # of a long recording, sent to the page at once
 SUSPECT_SEMITONES = 7.0  # a line this far from its voice's usual pitch has an untrustworthy pitch reading
 JOB_ATTEMPTS = 3
+# The names the page may be reached by when the server listens on this computer
+# only. Any other Host is refused, which stops DNS rebinding: a web page whose
+# own domain is made to point at 127.0.0.1 could otherwise read the API, your
+# takes' audio included. ("testserver" is the name Starlette's test client uses.)
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "testserver")
 FINISHED = {"ready", "failed"}
 STATIC = Path(__file__).parent / "static"
 
 
-def create_app(data_dir: str | Path | None = None) -> FastAPI:
+def number(body: dict, key: str, default, kind=int):
+    """A number from a request's JSON body; a clear 422 if it isn't one."""
+    try:
+        return kind(body.get(key, default))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, f"`{key}` must be a number.") from exc
+
+
+def create_app(data_dir: str | Path | None = None, hosts: tuple[str, ...] | None = LOCAL_HOSTS) -> FastAPI:
+    """`hosts`: the Host names to answer to, or None for any (the server was
+    asked to listen beyond this computer, so its address isn't known)."""
     store = Store(Path(data_dir or os.environ.get("ECHO_DATA", "data")))
     targets: dict[str, Voice] = {}  # analysed targets, so each take only analyses itself
     steady: dict[tuple[str, float], Voice] = {}  # the same, with formants at their voice's ceiling
     jobs: dict[str, subprocess.Popen] = {}  # source id -> the job processing it
     app = FastAPI(title="Echo")
+    if hosts is not None:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(hosts))
+
+    @app.middleware("http")
+    async def only_this_page_changes_things(request: Request, call_next):
+        """A page on another site can send a request here (a form or a
+        text/plain fetch needs no permission), and the server would act on
+        it: queue downloads, delete voices. Browsers say where a request comes
+        from, so anything that changes something must come from this page.
+        Requests from outside a browser (scripts, the tests) say nothing and
+        are let through."""
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = request.headers.get("origin")
+            own = f"{request.url.scheme}://{request.headers.get('host', '')}"
+            if request.headers.get("sec-fetch-site") == "cross-site" or (origin is not None and origin != own):
+                return JSONResponse({"detail": "Only Echo's own page can do that."}, status_code=403)
+        return await call_next(request)
+
+    job_lock = threading.Lock()  # requests are served on several threads
 
     def start_job(meta: dict) -> dict:
         """Make sure an unfinished recording has a job working on it.
@@ -67,25 +102,29 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         because the computer was shut down, it starts again, up to three times."""
         if meta["status"] in FINISHED or meta["status"] == "uploading":
             return meta
-        job = jobs.get(meta["id"])
-        if job is not None and job.poll() is None:
+        with job_lock:  # two polls at once would start two jobs
+            meta = store.source_meta(meta["id"])
+            if meta["status"] in FINISHED or meta["status"] == "uploading":
+                return meta
+            job = jobs.get(meta["id"])
+            if job is not None and job.poll() is None:
+                return meta
+            folder = store.source_dir(meta["id"])
+            if sources.job_running(folder):  # a previous server's job, or `echo-voice import`
+                return meta
+            attempts = meta.get("attempts", 0)
+            if attempts >= JOB_ATTEMPTS:
+                return store.update_source(meta["id"], status="failed", error="Processing kept stopping before it finished.")
+            meta = store.update_source(meta["id"], attempts=attempts + 1)
+            flags = 0
+            if sys.platform == "win32":
+                flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
+            with open(folder / "job.log", "ab") as log:
+                jobs[meta["id"]] = subprocess.Popen(
+                    [sys.executable, "-m", "echo_voice.sources", str(folder)],
+                    stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags,
+                )
             return meta
-        folder = store.source_dir(meta["id"])
-        if sources.job_running(folder):  # a previous server's job, or `echo-voice import`
-            return meta
-        attempts = meta.get("attempts", 0)
-        if attempts >= JOB_ATTEMPTS:
-            return store.update_source(meta["id"], status="failed", error="Processing kept stopping before it finished.")
-        meta = store.update_source(meta["id"], attempts=attempts + 1)
-        flags = 0
-        if sys.platform == "win32":
-            flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
-        with open(folder / "job.log", "ab") as log:
-            jobs[meta["id"]] = subprocess.Popen(
-                [sys.executable, "-m", "echo_voice.sources", str(folder)],
-                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags,
-            )
-        return meta
 
     store.migrate()  # data from before voices existed
 
@@ -97,57 +136,76 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         were scored."""
         done = 0
         for meta in store.list_targets():
-            for record in store.take_records(meta["id"]):
-                if record.get("scoring") == SCORING:
-                    continue
-                try:
-                    take = analyze(load(store.take_audio(meta["id"], record["id"])))
-                    ceiling = pair_ceiling(meta["id"], take.formant_ceiling)
-                    target = steady_target(meta["id"], ceiling)
-                    said, timed = target_words(meta["id"], target)
-                    heard = (record.get("line") or {}).get("take")
-                    words = heard.split() if heard else transcript.transcribe(take.y)
-                    usual = (typical_pitch(meta.get("voice_id")), my_pitch(meta.get("voice_id"), take.median_f0))
-                    result = compare(target, steadied(take, ceiling), said, words, timed, pitch_suspect(meta), usual)
-                except (AnalysisError, OSError, ValueError, KeyError) as exc:
-                    print(f"Couldn't score take {record.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
-                    continue
-                store.replace_take(meta["id"], record | result)
-                done += 1
-            for record in store.list_drills(meta["id"]):
-                if record.get("scoring") == SCORING:
-                    continue
-                try:
-                    ceiling = pair_ceiling(meta["id"])
-                    target = steady_target(meta["id"], ceiling)
-                    _, timed = target_words(meta["id"], target)
-                    # The word it was an attempt at: by where it starts, should the words have been regrouped since.
-                    word = next((w for w in timed if abs(w["start"] - record.get("start", -1)) < 0.02), None) or timed[record["word"]]
-                    attempt = analyze(load(store.drill_audio(meta["id"], record["id"])), ceiling)
-                    result = word_drill(target, word, attempt)
-                except (AnalysisError, NotFound, OSError, ValueError, KeyError, IndexError) as exc:
-                    print(f"Couldn't measure trainer attempt {record.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
-                    continue
-                store.replace_drill(meta["id"], record | result | {"ceiling": attempt.formant_ceiling})
+            try:
+                done += rescore_line(meta)
+            except Exception as exc:  # noqa: BLE001 (a line deleted meanwhile, say: the others still get done)
+                print(f"Couldn't score the takes on line {meta.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
         for voice in store.list_voices():
             for check in store.list_checks(voice["id"]):
-                if check.get("scoring") == SCORING:
-                    continue
-                rows = []
-                for row in check.get("lines", []):
-                    try:
-                        take = store.take(row["target"], row["take"])
-                    except (NotFound, OSError, ValueError):
-                        rows.append(row)  # its line is gone: as it was
-                        continue
-                    rows.append(row | {
-                        "overall": take["overall"],
-                        "parts": {c["key"]: c["score"] for c in take["components"]},
-                        "measures": take.get("measures"),
-                    })
-                if rows:
-                    store.replace_check(voice["id"], check | voice_check(rows) | {"scoring": SCORING})
+                try:
+                    rescore_check(voice["id"], check)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Couldn't work voice check {check.get('id')} out again: {exc!r}", file=sys.stderr, flush=True)
         return done
+
+    def rescore_line(meta: dict) -> int:
+        done = 0
+        for record in store.take_records(meta["id"]):
+            if record.get("scoring") == SCORING:
+                continue
+            try:
+                take = analyze(load(store.take_audio(meta["id"], record["id"])), trim=False)
+                ceiling = pair_ceiling(meta["id"], take.formant_ceiling)
+                target = steady_target(meta["id"], ceiling)
+                said, timed = target_words(meta["id"], target)
+                heard = (record.get("line") or {}).get("take")
+                words = heard.split() if heard else transcript.transcribe(take.y)
+                usual = (typical_pitch(meta.get("voice_id")), my_pitch(meta.get("voice_id"), take.median_f0))
+                result = compare(target, steadied(take, ceiling), said, words, timed, pitch_suspect(meta), usual)
+            except Exception as exc:  # noqa: BLE001 (its audio is missing, say: the next take still gets done)
+                print(f"Couldn't score take {record.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
+                continue
+            store.replace_take(meta["id"], record | result)
+            done += 1
+        for record in store.list_drills(meta["id"]):
+            if record.get("scoring") == SCORING:
+                continue
+            try:
+                ceiling = pair_ceiling(meta["id"])
+                target = steady_target(meta["id"], ceiling)
+                _, timed = target_words(meta["id"], target)
+                # The word it was an attempt at: by where it starts, should the words have been regrouped since.
+                word = next((w for w in timed if abs(w["start"] - record.get("start", -1)) < 0.02), None) or timed[record["word"]]
+                attempt = analyze(load(store.drill_audio(meta["id"], record["id"])), ceiling, trim=False)
+                result = word_drill(target, word, attempt)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Couldn't measure trainer attempt {record.get('id')} again: {exc!r}", file=sys.stderr, flush=True)
+                continue
+            store.replace_drill(meta["id"], record | result | {"ceiling": attempt.formant_ceiling})
+        return done
+
+    def rescore_check(voice_id: str, check: dict) -> None:
+        """A voice check worked out again from its takes, once every one of
+        them that still exists has been scored again; until then it stays as
+        it was, and the next start tries again."""
+        if check.get("scoring") == SCORING:
+            return
+        rows = []
+        for row in check.get("lines", []):
+            try:
+                take = store.take(row["target"], row["take"])
+            except (NotFound, OSError, ValueError):
+                rows.append(row)  # its line is gone: as it was
+                continue
+            if take.get("scoring") != SCORING:
+                return
+            rows.append(row | {
+                "overall": take["overall"],
+                "parts": {c["key"]: c["score"] for c in take["components"]},
+                "measures": take.get("measures"),
+            })
+        if rows:
+            store.replace_check(voice_id, check | voice_check(rows) | {"scoring": SCORING})
 
     # Pick up recordings that were still being processed when the app last stopped.
     for meta in store.list_sources():
@@ -173,15 +231,23 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         return response
 
     async def uploaded_audio(request: Request):
-        data = await request.body()
+        length = request.headers.get("content-length", "")
+        if length.isdigit() and int(length) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "That file is too large.")
+        data = bytearray()
+        async for chunk in request.stream():
+            data += chunk
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, "That file is too large.")
         if not data:
             raise HTTPException(400, "No audio received.")
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, "That file is too large.")
         try:
-            return await run_in_threadpool(decode, data)
+            y = await run_in_threadpool(decode, bytes(data))
         except AnalysisError as exc:
             raise HTTPException(422, str(exc)) from exc
+        if y.size == 0:
+            raise HTTPException(422, "There's no sound in that file.")
+        return y
 
     async def analysed(y) -> Voice:
         try:
@@ -194,8 +260,14 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     def target_voice(target_id: str) -> Voice:
         if target_id not in targets:
-            targets[target_id] = analyze(load(store.target_audio(target_id)))
+            targets[target_id] = analyze(load(store.target_audio(target_id)), trim=False)
         return targets[target_id]
+
+    def forget(target_id: str) -> None:
+        """Drop a deleted line from the caches."""
+        targets.pop(target_id, None)
+        for key in [k for k in steady if k[0] == target_id]:
+            del steady[key]
 
     def voice_ceiling(voice_id: str) -> float | None:
         """One formant ceiling for a voice: the middle of what its lines pick."""
@@ -255,10 +327,19 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         return meta["words"], meta["units"]
 
     def known_voice(voice_id: str) -> dict | None:
-        try:
-            return store.voice_meta(voice_id) if voice_id else None
-        except NotFound:
-            return None
+        """The voice, or the one it was merged into (a page opened before the
+        merge still holds the old id)."""
+        seen = set()
+        while voice_id and voice_id not in seen:
+            seen.add(voice_id)
+            try:
+                meta = store.voice_meta(voice_id)
+            except NotFound:
+                return None
+            if not meta.get("merged_into"):
+                return meta
+            voice_id = meta["merged_into"]
+        return None
 
     @app.post("/api/targets", status_code=201)
     async def add_target(
@@ -300,7 +381,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     @app.delete("/api/targets/{target_id}")
     def delete_target(target_id: str) -> Response:
         store.delete_target(target_id)
-        targets.pop(target_id, None)
+        forget(target_id)
         return Response(status_code=204)
 
     @app.get("/api/targets/{target_id}/profile")
@@ -553,7 +634,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             meta = store.update_source(source_id, link=url, title=title, channel=channel)
             if "speaker" not in body:
                 return {"recording": recording_speakers(meta), "removed": 0, "added": []}
-        return await choose_speaker(meta, int(body.get("speaker", meta.get("speaker") or 0)))
+        return await choose_speaker(meta, number(body, "speaker", meta.get("speaker") or 0))
 
     async def choose_speaker(meta: dict, speaker: int) -> dict:
         """Which speaker of the recording its voice is of. Lines Echo picked
@@ -565,9 +646,10 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         meta = store.update_source(source_id, speaker=speaker)
         removed = 0
         for line in voice_lines(meta["voice_id"]):
-            if line.get("source") == source_id and line.get("auto") and not line.get("takes"):
+            practised = line.get("takes") or store.list_drills(line["id"])  # takes, or attempts in the trainer
+            if line.get("source") == source_id and line.get("auto") and not practised:
                 store.delete_target(line["id"])
-                targets.pop(line["id"], None)
+                forget(line["id"])
                 removed += 1
         added = await run_in_threadpool(autopick.pick, store, meta["voice_id"])
         return {"recording": recording_speakers(meta), "removed": removed, "added": added}
@@ -579,18 +661,25 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         lines picked."""
         meta = store.source_meta(source_id)
         body = await request.json()
-        speaker = int(body.get("speaker", 0))
+        speaker = number(body, "speaker", 0)
         lines = store.source_lines(source_id) or []
         if speaker not in {r.get("speaker") for r in lines}:
             raise HTTPException(422, "There's no such speaker in that recording.")
         name = str(body.get("name", "")).strip()[:80] or f"{meta['name']}, speaker {speaker + 1}"
         voice = store.new_voice(name)
-        copy, folder = store.new_source(meta["name"], link=meta.get("link"), file=meta.get("file"), status="ready")
+        # "uploading" until the copy is whole: if the app stops part-way, it is
+        # marked failed on the next start instead of passing for ready.
+        copy, folder = store.new_source(meta["name"], link=meta.get("link"), file=meta.get("file"), status="uploading")
         old = store.source_dir(source_id)
-        for part in (sources.AUDIO, sources.LINES):
-            shutil.copy2(old / part, folder / part)
+        try:
+            for part in (sources.AUDIO, sources.LINES):
+                shutil.copy2(old / part, folder / part)
+        except OSError as exc:
+            store.delete_source(copy["id"])
+            store.delete_voice(voice["id"])
+            raise HTTPException(507, f"Couldn't copy the recording: {exc}") from exc
         keep = {k: meta.get(k) for k in ("duration", "count", "title", "channel", "speakers")}
-        store.update_source(copy["id"], voice_id=voice["id"], speaker=speaker, **keep)
+        store.update_source(copy["id"], voice_id=voice["id"], speaker=speaker, status="ready", **keep)
         added = await run_in_threadpool(autopick.pick, store, voice["id"])
         return {"voice": voice_card(store.voice_meta(voice["id"])), "added": added}
 
@@ -765,6 +854,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 raise HTTPException(422, "Give the voice a name.")
             fields["name"] = name
             fields["named_from"] = "hand"  # no more suggestions
+            fields["name_pending"] = False  # and the video's title or channel won't replace it
         if "check_lines" in body:
             ids = {line["id"] for line in voice_lines(voice_id)}
             fields["check_lines"] = [str(i) for i in body["check_lines"] if str(i) in ids]
@@ -779,7 +869,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 remove_source(s["id"])
         for line in voice_lines(voice_id):
             store.delete_target(line["id"])
-            targets.pop(line["id"], None)
+            forget(line["id"])
         store.delete_voice(voice_id)
         return Response(status_code=204)
 
@@ -790,7 +880,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         recording = store.source_meta(str(body.get("source", "")))
         if recording.get("voice_id") != voice_id:
             raise HTTPException(422, "That recording belongs to another voice.")
-        start = float(body.get("start", -1))
+        start = number(body, "start", -1.0, float)
         row = next((r for r in store.source_lines(recording["id"]) or [] if abs(r["start"] - start) < 0.01), None)
         if row is None:
             raise HTTPException(404, "That line isn't in the recording.")
@@ -803,7 +893,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     async def autopick_lines(voice_id: str, request: Request) -> dict:
         """Add the best suggested lines until the voice has `want` (5)."""
         store.voice_meta(voice_id)
-        want = max(1, min(12, int((await request.json()).get("want", CHECK_LINES))))
+        want = max(1, min(12, number(await request.json(), "want", CHECK_LINES)))
         return {"added": await run_in_threadpool(autopick.pick, store, voice_id, want)}
 
     @app.post("/api/voices/{voice_id}/checks", status_code=201)

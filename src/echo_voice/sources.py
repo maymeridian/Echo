@@ -76,6 +76,9 @@ class SourceError(RuntimeError):
 # ---------- getting the audio ----------
 
 
+MAX_DOWNLOAD_BYTES = 2 * 1024**3  # a long video's audio is a few hundred MB
+
+
 def is_link(text: str) -> bool:
     return bool(re.match(r"^https?://\S+$", text.strip()))
 
@@ -108,12 +111,16 @@ def download(url: str, folder: Path, progress=lambda share: None) -> tuple[Path,
         "no_warnings": True,
         "noprogress": True,
         "progress_hooks": [hook],
+        "max_filesize": MAX_DOWNLOAD_BYTES,
     }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
             if info.get("_type") == "playlist":
                 raise SourceError("That's a playlist; paste the link of one video.")
+            if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming", "post_live"):
+                # A stream has no end to wait for, and its length isn't known.
+                raise SourceError("That's a live stream; paste a link to a video once it's been published.")
             if (info.get("duration") or 0) > MAX_HOURS * 3600:
                 raise SourceError(f"That video is over {MAX_HOURS} hours long.")
             info = ydl.process_ie_result(info, download=True)
@@ -549,11 +556,17 @@ def job_running(folder: Path) -> bool:
 
 
 def _write_meta(folder: Path, meta: dict) -> None:
-    tmp = folder / (META + ".tmp")
-    tmp.write_text(json.dumps(meta, indent=2), "utf-8")
+    _write_whole(folder / META, json.dumps(meta, indent=2))
+
+
+def _write_whole(path: Path, text: str) -> None:
+    """Write a file whole or not at all: a job can be stopped at any moment
+    (the computer shuts down), and half a lines.json would fail every retry."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, "utf-8")
     for attempt in range(20):
         try:  # Windows refuses the replace while the server is reading the file
-            os.replace(tmp, folder / META)
+            os.replace(tmp, path)
             return
         except PermissionError:
             if attempt == 19:
@@ -636,19 +649,23 @@ def run(folder: Path, report=lambda step, share: None) -> int:
                 path.unlink()
         y = read_audio(folder)
         meta["duration"] = round(len(y) / SR, 2)
+        rows = None
         if (folder / LINES).is_file():
             # Found before (the job stopped part-way, or the recording is
             # from before speakers were found): keep them, so lines already
-            # added keep their place.
-            rows = json.loads((folder / LINES).read_text("utf-8"))
-        else:
+            # added keep their place. A file that can't be read is found again.
+            try:
+                rows = json.loads((folder / LINES).read_text("utf-8"))
+            except ValueError:
+                rows = None
+        if rows is None:
             status("transcribing", 0.0, force=True)
             rows = find_lines(y, lambda s: status("transcribing", s))
-            (folder / LINES).write_text(json.dumps(rows), "utf-8")
+            _write_whole(folder / LINES, json.dumps(rows))
         if any("speaker" not in r for r in rows):
             status("speakers", None, force=True)
             find_speakers(rows, embed_lines(y, rows))
-            (folder / LINES).write_text(json.dumps(rows), "utf-8")
+            _write_whole(folder / LINES, json.dumps(rows))
         meta.update(count=len(rows), good=sum(1 for r in rows if not line_flags(r, meta.get("speaker") or 0)), error=None)
         meta["speakers"] = len(speaker_summary(rows))
         if not meta.get("voice_id"):

@@ -64,7 +64,8 @@ CALIBRATION = json.loads((Path(__file__).parent / "calibration.json").read_text(
 # (server.rescore), so a best or a trend never mixes two scales.
 #   2 (1.1.0): alignment and Articulation from what a speech recogniser hears,
 #              Rhythm from that alignment, Resonance from F2 and F3 at one ceiling.
-SCORING = 2
+#   3 (1.1.1): saved audio is read as saved, not trimmed a second time.
+SCORING = 3
 
 
 @dataclass

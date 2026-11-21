@@ -43,6 +43,7 @@ export class Ending {
     this.speech = 0; // s of speech so far
     this.quiet = 0; // s since the last of it
     this.over = false;
+    this.started = false; // a reading other than digital silence has come in
   }
 
   percentile(share) {
@@ -57,6 +58,13 @@ export class Ending {
   // `rms`: the level of the latest stretch of sound, 1 being full scale; `t`: when, in seconds.
   hear(rms, t) {
     const db = Math.max(LOWEST, Math.min(0, Math.round(20 * Math.log10(Math.max(rms, 1e-9)))));
+    // Digital silence before anything else is a device starting up (or a
+    // Bluetooth headset switching mode), not the room: counted in, it set the
+    // floor so low that a fan read as speech and the take ran on. Digital
+    // silence later on is a microphone's noise gate between words, and does
+    // say how quiet the room is, so it counts.
+    if (db === LOWEST && !this.started) return this.over;
+    this.started = true;
     this.times.push(t);
     this.levels.push(db);
     this.counts[db - LOWEST]++;

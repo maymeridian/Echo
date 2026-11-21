@@ -192,6 +192,12 @@ export function voicing(frame, sampleRate) {
   const rate = Math.min(sampleRate, 8000);
   const x = resample(latest(frame, sampleRate), sampleRate, rate);
   const n = x.length;
+  // Without the frame's mean taken out, a DC offset on room noise reads as
+  // perfectly periodic (0.9997 with an offset of 0.01).
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += x[i];
+  mean = n ? mean / n : 0;
+  for (let i = 0; i < n; i++) x[i] -= mean;
   let power = 0;
   for (let i = 0; i < n; i++) power += x[i] * x[i];
   const longest = Math.min(Math.floor(rate / 60), n >> 1);

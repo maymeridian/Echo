@@ -3,7 +3,8 @@
 Practise a voice impression and get closer with every take. Named after Echo,
 the nymph of Greek myth who could only speak in other people's words.
 
-Version 1.0.0. [CHANGELOG.md](CHANGELOG.md) says what's in it.
+Version 1.1.1. [CHANGELOG.md](CHANGELOG.md) says what's in it. More about the
+project, with screenshots: [maymeridian.dev/projects/echo](https://maymeridian.dev/projects/echo/).
 
 Paste a link to a video of the voice you're imitating, and Echo finds its
 lines and picks a handful worth practising. Record yourself saying a line and
@@ -26,18 +27,52 @@ lines (three or more; five by default), with no retries, averaged.
 
 ## Run it
 
+You need Python 3.10 or later and a browser that can use the microphone
+(Chrome, Edge or Firefox). For YouTube links you also need a JavaScript
+runtime for yt-dlp: Node, Deno, Bun or QuickJS, whichever you have. Nothing
+else: audio is decoded by PyAV, which brings its own FFmpeg, and every model
+runs on the CPU.
+
+On Windows (PowerShell):
+
 ```powershell
+git clone https://github.com/maymeridian/echo
+cd echo
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
 .\.venv\Scripts\echo-voice serve
 ```
 
-Then open http://127.0.0.1:8000. `echo-voice --version` says which version
-this is, and so does the foot of the sidebar. Clips and takes are stored in
-`data/`, which is not tracked by git. Its files are written whole or not at
-all, so a crash can't leave half a file; a file that can't be read is left out
-of its list, and the rest still open. The first run downloads the speaker model (26 MB) to
-`~/.cache/echo`; set `ECHO_CACHE` to put it elsewhere.
+On macOS or Linux:
+
+```bash
+git clone https://github.com/maymeridian/echo
+cd echo
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/echo-voice serve
+```
+
+Then open http://127.0.0.1:8000. The server only listens on this computer,
+and nothing you record leaves it. It also answers only to its own address,
+and only its own page can change anything, so another website open in your
+browser can't use it. To practise from another device on your network, run
+`echo-voice serve --host 0.0.0.0`; it then answers to any address, so do that
+only on a network you trust. Echo is developed and tested on Windows 11;
+the macOS and Linux commands are the usual equivalents and haven't been tried.
+The commands below are written for PowerShell; elsewhere, use `.venv/bin/`
+in place of `.\.venv\Scripts\`.
+
+`echo-voice --version` says which version this is, and so does the foot of
+the sidebar. Clips and takes are stored in `data/`, which is not tracked by
+git. Its files are written whole or not at all, so a crash can't leave half a
+file; a file that can't be read is left out of its list, and the rest still
+open.
+
+The models download on first use, checked against pinned hashes: the speaker
+model (26 MB) and the vocal separation model (67 MB) to `~/.cache/echo`
+(set `ECHO_CACHE` to put them elsewhere), and Whisper base.en (about 140 MB)
+through faster-whisper to the Hugging Face cache.
 
 **The microphone.** The sidebar's Microphone box lists the microphones by name
 once the browser has allowed one. Choose yours there: Echo remembers it and
@@ -96,7 +131,7 @@ or the channel for a title-named one. It stops offering once you rename the
 voice yourself.
 
 **Links.** The voice's page shows the link to each video under its name
-("▶ Harbour Tales on YouTube: …"), and each recording shows its own. A recording
+("▶ <channel> on YouTube: <title>"), and each recording shows its own. A recording
 uploaded as a file can be given the link it came from: "Add its YouTube
 link" looks the video up for its title and channel without downloading it.
 
@@ -177,7 +212,7 @@ these are hidden until you untick the box:
 The same job can run from a terminal:
 
 ```powershell
-.\.venv\Scripts\echo-voice import "https://www.youtube.com/watch?v=..." --name "Lighthouse"
+.\.venv\Scripts\echo-voice import "https://www.youtube.com/watch?v=..." --name "Narrator"
 .\.venv\Scripts\echo-voice import "C:\Users\me\Downloads\video.mp4"
 ```
 
@@ -241,7 +276,7 @@ the same lines ticked between checks, and the checks compare like with like.
 
 Data from before voices existed moves over on its own when the app starts. A
 recording's name becomes a voice, and lines go to their recording's voice, or
-to the voice their old name started with ("Lighthouse: …").
+to the voice their old name started with ("<recording>: <the line's words>").
 
 ## Practising
 
@@ -421,7 +456,7 @@ line is usually creaky voice, or a pitch tracker off by an octave, and its
 pitch scores say nothing about you. Its headline comes from the other parts,
 and the voice check leaves it out unless you tick it.
 
-The author's own data showed why. One line read 98 Hz against the voice's usual
+Real practice data showed why. One line read 98 Hz against the voice's usual
 191; 24 takes all scored Pitch 2, measured an octave high, and the coach kept
 saying "go lower".
 
@@ -655,7 +690,7 @@ agrees with the scale:
   its shift varied by 0.7 to 2.4 semitones, and the whole Resonance curve
   from 90 to 20 was 0.75 wide. Resonance now reads F2 and F3.
 - **Two ceilings for one comparison:** the line was read at its voice's
-  formant ceiling and the take at its speaker's. Read at 4750 Hz against 5250, a
+  formant ceiling and the take at the ceiling of whoever made it. Read at 4750 Hz against 5250, a
   copy of a line scored 3 to 24 against itself on four of five lines. Both
   are now read at one ceiling, and at four more around it, and the middle
   reading counts.
@@ -671,6 +706,11 @@ agrees with the scale:
   (the span of everything with sound) was tried and dropped: a breath after
   the last word has sound, and takes read up to 50% slow.
 - **A suggested line that started mid-sentence:** see Suggested lines.
+- **Saved audio trimmed twice (1.1.1):** a line's audio is saved trimmed, and
+  was trimmed again each time it was read back. Trimming isn't idempotent: on
+  a separated clip the ends moved by up to 60 ms, and on a clip that starts in
+  digital silence by 160 ms, away from the word timings measured on the saved
+  audio. Saved audio is now read as saved.
 
 ## Validation
 
@@ -998,7 +1038,7 @@ the median retake no further off):
 | Per speaker, from all 60 | 0.849 | 0.53 st | 1.04 st |
 
 The gain from five recordings is +0.023 (bootstrap 95% interval +0.013 to
-+0.033). On the author's own 55 practice takes, the change in Resonance from one
++0.033). On 55 real practice takes, the change in Resonance from one
 take to the next fell from 1.62 to 1.40 semitones at the 90th percentile, and
 the spread across the takes of a line from 0.75 to 0.52. The calibration was
 collected again this way: Resonance's AUC in `calibration.json` is 0.846, and
@@ -1195,6 +1235,28 @@ tests/               synthetic voices, real speech (CMU ARCTIC), API, the page
 microphone fed from a WAV file. It runs when Playwright is installed
 (`pip install -e ".[e2e]"`) and is skipped otherwise. `tests/data/arctic` holds
 four CMU ARCTIC clips under their own licence (`COPYING` there).
+
+## Licence and credits
+
+The code is under the MIT licence ([LICENSE](LICENSE)).
+
+Echo stands on other people's work, which keeps its own terms:
+
+- **Models**, downloaded on first use and not included here: WeSpeaker
+  ResNet34-LM (speaker embeddings, from the sherpa-onnx releases),
+  UVR-MDX-NET Voc_FT (vocal separation, also from the sherpa-onnx releases)
+  and Whisper base.en (speech recognition, through faster-whisper).
+- **Fitted numbers** in `src/echo_voice/`: `calibration.json` was fitted on
+  RAVDESS (Livingstone & Russo, 2018; CC BY-NC-SA 4.0), `similarity_model.json`
+  on VoxSim ratings (Ahn et al., 2024; CC BY 4.0) of VoxCeleb1 clips,
+  `gender_model.json` on RAVDESS and VCC2018 (Lorenzo-Trueba et al., 2018;
+  CC BY 4.0), and `speaker_mean.json` on recordings from RAVDESS, PTDB-TUG
+  (Pirker et al., 2011) and Hillenbrand et al. (1995). None of those
+  recordings are included.
+- **Test clips:** four CMU ARCTIC recordings in `tests/data/arctic`, under
+  their own licence (`COPYING` there).
+- **Libraries:** Praat through parselmouth, librosa, onnxruntime, sherpa-onnx,
+  faster-whisper, FastAPI and yt-dlp, among others in `pyproject.toml`.
 
 ## Next
 

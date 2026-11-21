@@ -669,7 +669,7 @@ def test_a_trainer_attempt_stops_by_itself(server, pausing_page):
 def test_hearing_the_end_of_a_line(server, page):
     """ending.js on made-up levels: speech at one level, a room at another, sixty readings a second."""
     page.goto(server)
-    run = """async ({ lead, speech, room, voice, wait, enough }) => {
+    run = """async ({ lead, speech, room, voice, wait, enough, before }) => {
         const { Ending, waitFor, spoken } = await import('/ending.js');
         const ending = new Ending({ wait, enough });
         let t = 0;
@@ -680,7 +680,7 @@ def test_hearing_the_end_of_a_line(server, page):
             }
             return false;
         };
-        const early = hear(lead, room) || hear(speech, voice);
+        const early = hear(lead, before ?? room) || hear(speech, voice);
         const from = t;
         const over = hear(6, room);
         const words = [{ start: 0, end: 1 }, { start: 1.4, end: 2 }, { start: 2.1, end: 3 }];
@@ -690,6 +690,10 @@ def test_hearing_the_end_of_a_line(server, page):
     for room in (0.0, 0.0005, 0.01):
         heard = page.evaluate(run, {"lead": 0.5, "speech": 2.0, "room": room, "voice": 0.1, "wait": 1.0, "enough": 1.0})
         assert not heard["early"] and 1.0 <= heard["after"] < 1.15, (room, heard)
+    # A device that starts with a second of digital silence, in a room with a fan: the silence
+    # isn't the room, and the fan isn't speech.
+    heard = page.evaluate(run, {"lead": 1.0, "before": 0.0, "speech": 2.0, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.0})
+    assert not heard["early"] and 1.0 <= heard["after"] < 1.15, heard
     # Speaking from the first moment, with no quiet before it to measure the room by.
     heard = page.evaluate(run, {"lead": 0, "speech": 2.0, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.0})
     assert not heard["early"] and 1.0 <= heard["after"] < 1.15, heard

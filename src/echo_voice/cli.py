@@ -1,3 +1,5 @@
+"""Echo: practise a voice impression and see how close you get."""
+
 from __future__ import annotations
 
 import argparse
@@ -40,7 +42,12 @@ def main(argv: list[str] | None = None) -> int:
         from .server import create_app
 
         identity.model_path()  # download now rather than during the first take
-        uvicorn.run(create_app(args.data), host=args.host, port=args.port)
+        from .server import LOCAL_HOSTS
+
+        # Listening beyond this computer (--host 0.0.0.0, to use it from a
+        # phone, say), the address the page is reached by can't be known.
+        local = args.host in ("127.0.0.1", "localhost")
+        uvicorn.run(create_app(args.data, hosts=LOCAL_HOSTS if local else None), host=args.host, port=args.port)
         return 0
     if args.command == "import":
         return _import(args)

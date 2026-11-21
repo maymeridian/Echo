@@ -557,3 +557,77 @@ def test_takes_from_an_earlier_scoring_are_scored_again(tmp_path):
     assert drills[0]["id"] == attempt["id"] and drills[0]["pitch"] == pytest.approx(attempt["pitch"], abs=0.1) and drills[0]["word"] == 0
     best = {t["id"]: t["best"] for t in client.get("/api/targets").json()}
     assert all(best[p["target"]] == pytest.approx(a["overall"]) for p, a in zip(picked, again, strict=True))
+
+
+def test_other_websites_cannot_use_the_server(tmp_path):
+    """A page on another site can't reach the API through a name of its own (DNS rebinding), and
+    can't make it do anything from the user's browser (a cross-site POST)."""
+    client = TestClient(create_app(tmp_path))
+    assert client.get("/api/voices", headers={"host": "evil.example"}).status_code == 400
+    assert client.get("/api/voices", headers={"host": "127.0.0.1:8000"}).status_code == 200
+    assert client.get("/api/voices", headers={"host": "localhost:8000"}).status_code == 200
+    # Changes need to come from Echo's own page, or from no page at all (a script).
+    other = client.post("/api/voices", json={"name": "x"}, headers={"origin": "https://evil.example"})
+    assert other.status_code == 403 and client.get("/api/voices").json() == []
+    assert client.post("/api/voices", json={"name": "x"}, headers={"sec-fetch-site": "cross-site"}).status_code == 403
+    assert client.post("/api/voices", json={"name": "x"}, headers={"origin": "http://testserver"}).status_code == 201
+    assert client.post("/api/voices", json={"name": "y"}).status_code == 201
+    # An upload over the limit is turned down before it is read, and an empty file is a clear error.
+    big = client.post("/api/targets", content=b"0" * 16, headers={"content-length": str(64 * 1024 * 1024)})
+    assert big.status_code == 413
+    empty = client.post("/api/targets", content=wav(np.zeros(0, dtype=np.float32)))
+    assert empty.status_code == 422
+    # Listening beyond this computer, any name is answered.
+    assert TestClient(create_app(tmp_path / "open", hosts=None)).get("/api/voices", headers={"host": "192.168.1.5:8000"}).status_code == 200
+
+
+def test_a_name_typed_in_is_kept_and_bad_numbers_are_a_clear_error(tmp_path):
+    from echo_voice.store import Store
+
+    client = TestClient(create_app(tmp_path))
+    voice = client.post("/api/voices", json={"name": "New voice"}).json()
+    Store(tmp_path).update_voice(voice["id"], name_pending=True)  # as a link's voice is, until its video is known
+    renamed = client.patch(f"/api/voices/{voice['id']}", json={"name": "Mine"}).json()
+    assert renamed["name"] == "Mine" and Store(tmp_path).voice_meta(voice["id"])["name_pending"] is False
+    assert client.post(f"/api/voices/{voice['id']}/autopick", json={"want": "five"}).status_code == 422
+
+
+def test_re_scoring_carries_on_past_a_take_it_cannot_read(tmp_path):
+    import json as json_
+    import time
+
+    from echo_voice.scoring import SCORING
+
+    client = TestClient(create_app(tmp_path))
+    voice_id = client.post("/api/voices", json={"name": "V"}).json()["id"]
+    lines = [
+        client.post("/api/targets", params={"name": f"line {f0}", "voice": voice_id}, content=wav(voice(f0=f0))).json()
+        for f0 in (120, 125, 130)
+    ]
+    takes = [client.post(f"/api/targets/{line['id']}/takes", content=wav(voice(f0=150))).json() for line in lines]
+    picked = [{"target": line["id"], "take": t["id"]} for line, t in zip(lines, takes, strict=True)]
+    check = client.post(f"/api/voices/{voice_id}/checks", json={"takes": picked}).json()
+    for line, take in zip(lines, takes, strict=True):
+        path = tmp_path / "targets" / line["id"] / "takes" / f"{take['id']}.json"
+        old = json_.loads(path.read_text("utf-8"))
+        del old["scoring"]
+        path.write_text(json_.dumps(old), "utf-8")
+    check_path = tmp_path / "voices" / voice_id / "checks" / f"{check['id']}.json"
+    old = json_.loads(check_path.read_text("utf-8"))
+    del old["scoring"]
+    check_path.write_text(json_.dumps(old), "utf-8")
+    # The first take's audio is gone (deleted by hand, or a partial restore).
+    (tmp_path / "targets" / lines[0]["id"] / "takes" / f"{takes[0]['id']}.wav").unlink()
+
+    client = TestClient(create_app(tmp_path))
+    for _ in range(300):
+        last = client.get(f"/api/targets/{lines[2]['id']}/takes/{takes[2]['id']}").json()
+        if last.get("scoring") == SCORING:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("the takes after the unreadable one were not scored again")
+    assert client.get(f"/api/targets/{lines[1]['id']}/takes/{takes[1]['id']}").json()["scoring"] == SCORING
+    assert "scoring" not in client.get(f"/api/targets/{lines[0]['id']}/takes/{takes[0]['id']}").json()
+    time.sleep(1)  # the voice check comes after the takes: it waits for its unreadable take, and stays as it was
+    assert "scoring" not in client.get(f"/api/voices/{voice_id}/checks/{check['id']}").json()

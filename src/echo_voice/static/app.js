@@ -62,7 +62,14 @@ let profile = null; // its guide: duration, onset, contour, words, pitch band
 let takes = []; // its takes' summaries, oldest first
 let shown = null; // the take on screen
 let source = null; // the open recording, with its lines once they're found
-let session = null; // { kind: "take" | "target" | "warmup", recorder, timer }
+let session = null; // { kind: "take" | "target" | "warmup", recorder, timer, target, owner }
+// While the microphone is opening for a take, a warm-up, a clip or a trainer
+// attempt (which can take seconds: the browser may ask first), and while a take
+// or attempt is being scored, nothing else may start: a second start would open
+// a second recorder that nothing stops, and a stray take would be scored too.
+let opening = null;
+let measuring = false;
+let page = 0; // goes up whenever a page is left, so work started on it can tell
 let live = null; // { points: [{t, f0, f}], started, onset, done, listener, target }
 let targetTrack = null; // the open line's F1-F3 through time, as the browser reads them: { id, ceiling, frames }
 let check = null; // a voice check under way: { voiceId, voiceName, lines, index, results }
@@ -101,15 +108,21 @@ function when(iso) {
 
 // ---------- server ----------
 
+// What went wrong, from an error response: the server's `detail` (a list of
+// problems when FastAPI itself turned the request down), else its status.
+async function problem(res) {
+  try {
+    const { detail } = await res.json();
+    if (Array.isArray(detail)) return detail.map((d) => d?.msg ?? String(d)).join("; ") || res.statusText;
+    return detail || res.statusText;
+  } catch {
+    return res.statusText || `Error ${res.status}`;
+  }
+}
+
 async function api(path, options) {
   const res = await fetch(path, options);
-  if (!res.ok) {
-    let message = res.statusText;
-    try {
-      message = (await res.json()).detail || message;
-    } catch {}
-    throw new Error(message);
-  }
+  if (!res.ok) throw new Error(await problem(res));
   return res.status === 204 ? null : res.json();
 }
 
@@ -187,7 +200,7 @@ const QUIET = 0.0002; // a microphone whose loudest sample stays under this is g
 // - A browser told to remember stops asking which microphone, and hands over
 //   the system's default. On a computer with virtual audio devices (streaming
 //   and headset software add them) that is often one that hears nothing.
-const mic = { stream: null, devices: [], timer: null, note: "", testing: null };
+const mic = { stream: null, devices: [], timer: null, note: "", testing: null, opening: null };
 
 const micLive = () => Boolean(mic.stream?.getAudioTracks().some((t) => t.readyState === "live"));
 const micLabel = () => mic.stream?.getAudioTracks()[0]?.label || stored.get("echo.mic.label") || "the microphone";
@@ -223,9 +236,16 @@ async function alwaysAllowed() {
   }
 }
 
-async function openMic() {
+// The microphone, opened once and shared. Asked for again while it is still
+// opening (a browser prompt can stay up for a while), the same request answers.
+function openMic() {
   clearTimeout(mic.timer);
-  if (micLive()) return mic.stream;
+  if (micLive()) return Promise.resolve(mic.stream);
+  mic.opening ??= openMicNow().finally(() => (mic.opening = null));
+  return mic.opening;
+}
+
+async function openMicNow() {
   const ask = (audio) => navigator.mediaDevices.getUserMedia({ audio });
   const wanted = stored.get("echo.mic");
   const name = stored.get("echo.mic.label");
@@ -310,14 +330,26 @@ function listenTo(stream) {
 }
 
 class Recorder {
-  async start(onLevel, onPitch) {
+  // `onEnd`: the recording stopped without being asked to, because the
+  // microphone went away (unplugged, or switched off by the system).
+  async start(onLevel, onPitch, onEnd = () => {}) {
     this.heard = 0; // the loudest sample so far
     this.ctx = null;
+    this.stopping = false;
     this.stream = await openMic();
     this.chunks = [];
     try {
       this.media = new MediaRecorder(this.stream);
       this.media.ondataavailable = (e) => e.data.size && this.chunks.push(e.data);
+      this.done = new Promise((resolve) => {
+        this.media.onstop = () => {
+          this.ctx?.close().catch(() => {});
+          restMic(); // the stream stays open for the next take
+          renderMic();
+          resolve(new Blob(this.chunks, { type: this.media.mimeType }));
+          if (!this.stopping) onEnd();
+        };
+      });
       this.media.start();
     } catch (err) {
       restMic();
@@ -331,9 +363,10 @@ class Recorder {
     const rate = this.ctx.sampleRate;
     const analyser = this.ctx.createAnalyser();
     // Pitch reads the latest 2048 samples at 44.1 and 48 kHz, as it was
-    // checked. The formant tracker reads 50 ms, which is more than that, so
-    // the buffer is twice as long and `onPitch` is handed all of it too.
-    const span = rate > 50000 ? 4096 : 2048;
+    // checked, and about as long a stretch at higher rates (a 192 kHz audio
+    // interface). The formant tracker reads 50 ms, which is more than that,
+    // so the buffer is twice as long and `onPitch` is handed all of it too.
+    const span = rate > 50000 ? 2 ** Math.ceil(Math.log2(rate * 0.04)) : 2048;
     analyser.fftSize = 2 * span;
     wired.source.connect(analyser);
     const buffer = new Float32Array(analyser.fftSize);
@@ -358,16 +391,12 @@ class Recorder {
     return Boolean(this.ctx) && this.heard < QUIET;
   }
 
+  // What was recorded. Safe to call more than once, and after the recording
+  // has stopped by itself.
   stop() {
-    return new Promise((resolve) => {
-      this.media.onstop = () => {
-        this.ctx?.close().catch(() => {});
-        restMic(); // the stream stays open for the next take
-        renderMic();
-        resolve(new Blob(this.chunks, { type: this.media.mimeType }));
-      };
-      this.media.stop();
-    });
+    this.stopping = true;
+    if (this.media && this.media.state !== "inactive") this.media.stop();
+    return this.done ?? Promise.resolve(new Blob());
   }
 }
 
@@ -417,12 +446,16 @@ async function chooseMic(id) {
 // Open the microphone for a few seconds and show its level; nothing is recorded.
 async function testMic() {
   if (mic.testing) return stopMicTest();
-  if (session || drillRec) return;
+  if (session || drillRec || opening) return;
   const recorder = new Recorder();
   mic.testing = { recorder, timer: null };
   renderMic();
   try {
-    await recorder.start((peak) => ($("#mic-level").style.width = `${Math.min(100, peak * 140)}%`));
+    await recorder.start(
+      (peak) => ($("#mic-level").style.width = `${Math.min(100, peak * 140)}%`),
+      null,
+      () => mic.testing?.recorder === recorder && stopMicTest(),
+    );
   } catch (err) {
     mic.testing = null;
     mic.note = micProblem(err);
@@ -573,9 +606,12 @@ function remember(view) {
 }
 
 function leave() {
+  page++;
   stopPlayback();
   stopLinePlayback();
-  if (session?.kind === "warmup") stopRecording();
+  // A take, a warm-up or a clip left part-way is kept nowhere: it belonged to
+  // the page being left.
+  if (session) stopRecording({ discard: true });
   if (drillRec) {
     // Leaving mid-word: stop the microphone, keep nothing.
     clearTimeout(drillRec.timer);
@@ -1033,17 +1069,18 @@ function renderSuggestions() {
   const missing = Math.max(0, CHECK_LINES - voice.lines.length);
   const auto = $("#autopick");
   const count = Math.min(missing, list.length);
-  auto.hidden = !count || busy;
-  auto.disabled = false;
-  auto.textContent = `Auto-pick the ${count === 1 ? "best line" : `${count} best lines`}`;
+  auto.hidden = (!count || busy) && !picking;
+  auto.disabled = picking;
+  auto.textContent = picking ? "Picking…" : `Auto-pick the ${count === 1 ? "best line" : `${count} best lines`}`;
   auto.title = `Adds the best suggested lines until the voice has ${CHECK_LINES}, enough for a steady voice check.`;
   const rows = list.map((s) => {
     const play = el("button", { type: "button", className: "play", textContent: "▶" });
     play.setAttribute("aria-label", "Play this line");
     play.onclick = () => playUrl(`/api/sources/${s.source}/audio?start=${s.start}&end=${s.end}`, play, "voice");
-    const add = el("button", { type: "button", className: "btn practise", textContent: "Add" });
-    add.disabled = busy;
-    add.onclick = () => addSuggested(s, add);
+    const key = `${s.source}:${s.start}`;
+    const add = el("button", { type: "button", className: "btn practise", textContent: adding.has(key) ? "Adding…" : "Add" });
+    add.disabled = busy || picking || adding.has(key);
+    add.onclick = () => addSuggested(s);
     return el(
       "li",
       { className: "vline suggestion" },
@@ -1060,9 +1097,16 @@ function renderSuggestions() {
   $("#suggestions").replaceChildren(...[note, ...rows, ...pickMoreRows()].filter(Boolean));
 }
 
-async function addSuggested(s, button) {
-  button.disabled = true;
-  button.textContent = "Adding…";
+// Requests under way, kept outside the page so a re-render (the page
+// refreshes while a recording is processed) doesn't offer the same click again.
+const adding = new Set(); // "<recording>:<start>" of suggested lines being added
+let picking = false; // auto-pick is running
+
+async function addSuggested(s) {
+  const key = `${s.source}:${s.start}`;
+  if (adding.has(key) || picking) return;
+  adding.add(key);
+  renderSuggestions();
   setStatus("Adding the line: separating the voice from the background takes a few seconds…");
   try {
     await send(`/api/voices/${voice.id}/lines`, "POST", { source: s.source, start: s.start });
@@ -1071,15 +1115,16 @@ async function addSuggested(s, button) {
     setStatus(`Added “${s.text}”.`);
   } catch (err) {
     setStatus(err.message, true);
-    button.disabled = false;
-    button.textContent = "Add";
+  } finally {
+    adding.delete(key);
+    if (voice) renderSuggestions();
   }
 }
 
 async function autoPick() {
-  const button = $("#autopick");
-  button.disabled = true;
-  button.textContent = "Picking…";
+  if (picking) return;
+  picking = true;
+  renderSuggestions();
   setStatus("Picking the best lines: each is separated from the background first, a few seconds a line…");
   try {
     const { added } = await send(`/api/voices/${voice.id}/autopick`, "POST", { want: CHECK_LINES });
@@ -1088,7 +1133,9 @@ async function autoPick() {
     setStatus(added.length ? `Added ${plural(added.length, "line")}. ${voice.check_set.length >= voice.min_check_lines ? "You can run a voice check now." : ""}` : "There was nothing left to add.");
   } catch (err) {
     setStatus(err.message, true);
-    renderSuggestions();
+  } finally {
+    picking = false;
+    if (voice) renderSuggestions();
   }
 }
 
@@ -1438,7 +1485,7 @@ async function practiseLine(line, rec = source) {
   setStatus("Opening the line…");
   try {
     const res = await fetch(`/api/sources/${rec.id}/audio?start=${start}&end=${end}`);
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    if (!res.ok) throw new Error(await problem(res));
     await openTrim(await res.blob(), {
       start: line.start - start,
       end: line.end - start,
@@ -2777,12 +2824,26 @@ function renderDrillLive() {
 
 // `free`: just look, for as long as 45 s; nothing is scored or kept.
 async function startDrill(free) {
-  if (drillRec || session || !training) return;
+  if (drillRec || session || opening || measuring || !training) return;
+  const index = training.order[training.at];
+  const word = profile?.words?.[index];
+  if (!word) {
+    setStatus("This line has no words to train on: correct its words first.", true);
+    return;
+  }
+  opening = free ? "try" : "attempt";
+  const at = page;
+  try {
+    await openDrill(free, index, word, at);
+  } finally {
+    opening = null;
+  }
+}
+
+async function openDrill(free, index, word, at) {
   stopPlayback();
   await stopMicTest();
   const recorder = new Recorder();
-  const index = training.order[training.at];
-  const word = profile.words[index];
   const mine = { listener: null, points: [], started: performance.now(), unit: null, pitch: wordPitch(index) ?? profile.median_f0 ?? null, trail: [], ticks: 0 };
   // A scored attempt ends when the phrase has been said; looking live goes on until it is stopped.
   const ending = !free && autoStop() ? new Ending({ wait: 0.7, enough: 0.5 * (word.end - word.start), patient: 2 }) : null;
@@ -2801,10 +2862,15 @@ async function startDrill(free) {
         if (mine.points.length > 900) mine.points.splice(0, 300);
         renderDrillLive();
       },
+      () => drillRec?.recorder === recorder && stopDrill(),
     );
   } catch (err) {
     $("#train-live").hidden = true;
     setStatus(micProblem(err), true);
+    return;
+  }
+  if (page !== at || !training) {
+    recorder.stop(); // the trainer was left while the microphone opened
     return;
   }
   drillLive = mine;
@@ -2833,16 +2899,26 @@ async function stopDrill() {
   clearTimeout(timer);
   $("#train-live").hidden = true;
   if (training) renderTrainer();
-  const blob = await recorder.stop();
-  if (free || !training) return; // just looking: nothing to score or keep
+  const line = current?.id;
+  const trained = training;
+  if (free || !training) {
+    await recorder.stop(); // just looking: nothing to score or keep
+    return;
+  }
+  measuring = true;
   setStatus("Measuring…");
   try {
-    const result = await postWav(`/api/targets/${current.id}/drill?word=${index}`, await toWav(blob));
-    (training.attempts[index] ??= []).push(result);
-    setStatus("");
-    renderTrainer();
+    const blob = await recorder.stop();
+    const result = await postWav(`/api/targets/${line}/drill?word=${index}`, await toWav(blob));
+    if (training === trained) {
+      (training.attempts[index] ??= []).push(result);
+      setStatus("");
+      renderTrainer();
+    }
   } catch (err) {
     setStatus(err.message, true);
+  } finally {
+    measuring = false;
   }
 }
 
@@ -2883,6 +2959,18 @@ function leaveTrainer() {
 // ---------- recording ----------
 
 async function startRecording(kind) {
+  if (session || drillRec || opening || measuring) return;
+  opening = kind;
+  renderControls();
+  try {
+    await openRecording(kind, page);
+  } finally {
+    opening = null;
+    renderControls();
+  }
+}
+
+async function openRecording(kind, at) {
   stopPlayback();
   await stopMicTest();
   const recorder = new Recorder();
@@ -2905,10 +2993,20 @@ async function startRecording(kind) {
         if (ending?.hear(rms, (performance.now() - opened) / 1000) && session?.recorder === recorder) stopRecording();
       },
       withLive ? onLivePitch : null,
+      () => {
+        if (session?.recorder !== recorder) return;
+        mic.note = "The microphone stopped while recording: unplugged, or switched off.";
+        stopRecording();
+      },
     );
   } catch (err) {
     stopLive();
     setStatus(micProblem(err), true);
+    return;
+  }
+  if (page !== at) {
+    recorder.stop(); // the page was left while the microphone opened
+    stopLive();
     return;
   }
   const started = performance.now();
@@ -2921,26 +3019,41 @@ async function startRecording(kind) {
     setStatus(dead ? `${label}… ${seconds.toFixed(0)} s. ${noSound()}` : `${label}… ${seconds.toFixed(0)} s${until}`, dead);
     if (seconds >= limit) stopRecording();
   }, 250);
-  session = { kind, recorder, timer };
+  // What it is for, as it was when it started: the take is scored against this
+  // line and a clip goes to this voice, whatever is open when it stops.
+  session = { kind, recorder, timer, target: current?.id, owner: voice?.id };
   setStatus(`${label}…${until}`);
   renderControls();
   renderMic();
 }
 
-async function stopRecording() {
+// `discard`: stop and keep nothing (the page it belonged to was left).
+async function stopRecording({ discard = false } = {}) {
   if (!session) return;
-  const { kind, recorder, timer } = session;
+  const { kind, recorder, timer, target, owner } = session;
   session = null;
   clearInterval(timer);
   stopLive();
   $("#level").style.width = "0";
+  if (discard) {
+    await recorder.stop();
+    renderControls();
+    if (kind !== "warmup") setStatus("");
+    return;
+  }
+  measuring = kind !== "warmup";
   renderControls();
-  const blob = await recorder.stop();
-  if (kind === "take") await submitTake(blob);
-  else if (kind === "target") await openTrim(blob, { name: "Recorded clip", back: "voice", extra: { voice: voice?.id } });
-  else {
-    markStep("note");
-    setStatus("Warm-up done. Your pitch stays on the guide until the next take.");
+  try {
+    const blob = await recorder.stop();
+    if (kind === "take") await submitTake(blob, target);
+    else if (kind === "target") await openTrim(blob, { name: "Recorded clip", back: "voice", extra: { voice: owner } });
+    else {
+      markStep("note");
+      setStatus("Warm-up done. Your pitch stays on the guide until the next take.");
+    }
+  } finally {
+    measuring = false;
+    renderControls();
   }
 }
 
@@ -2954,12 +3067,19 @@ function loadTargetTrack() {
   const { id } = current;
   const { ceiling } = profile;
   if (targetTrack?.id !== id || targetTrack.ceiling !== ceiling) {
-    const frames = fetch(`/api/targets/${id}/audio`)
-      .then((response) => response.blob())
+    const entry = { id, ceiling, frames: null };
+    entry.frames = fetch(`/api/targets/${id}/audio`)
+      .then((response) => {
+        if (!response.ok) throw new Error(response.statusText);
+        return response.blob();
+      })
       .then((blob) => decodeMono(blob, MAX_SECONDS + 30))
       .then((samples) => track(samples, SR, ceiling))
-      .catch(() => null);
-    targetTrack = { id, ceiling, frames };
+      .catch(() => {
+        if (targetTrack === entry) targetTrack = null; // try again next time, not never
+        return null;
+      });
+    targetTrack = entry;
   }
   return targetTrack.frames;
 }
@@ -3034,12 +3154,14 @@ function onLivePitch(f0, frame, rate) {
   drawGuide();
 }
 
-async function submitTake(blob) {
+// `line`: the line the take was recorded on.
+async function submitTake(blob, line) {
   setStatus("Scoring…");
   try {
     const focus = chosenFocus();
-    const path = `/api/targets/${current.id}/takes${focus ? `?focus=${focus}` : ""}`;
+    const path = `/api/targets/${line}/takes${focus ? `?focus=${focus}` : ""}`;
     const take = await postWav(path, await toWav(blob));
+    if (current?.id !== line) return setStatus("The take was scored and kept with its line.");
     if (profile && take.measures?.ceiling_used) profile.my_ceiling = take.measures.ceiling_used; // for the live meter
     takes.push({
       id: take.id,
@@ -3048,7 +3170,7 @@ async function submitTake(blob) {
       parts: Object.fromEntries(take.components.map((c) => [c.key, c.score])),
       focus: take.coach?.focus ?? null,
     });
-    live = null;
+    if (live?.done) live = null; // the take's own live trace, not a newer one
     const best = Math.max(...takes.map((t) => t.overall));
     current = { ...current, takes: takes.length, best, last: take.created, last_score: take.overall, focus: take.coach?.focus ?? null };
     targets = targets.map((t) => (t.id === current.id ? current : t));
@@ -3064,13 +3186,14 @@ function renderControls() {
   const kind = session?.kind;
   const checkDone = inCheck() && check.results[check.index];
   $("#record").classList.toggle("live", kind === "take");
-  $("#record").disabled = kind === "target" || kind === "warmup" || Boolean(checkDone);
+  const busy = Boolean(opening) || measuring; // starting, or a take being scored
+  $("#record").disabled = busy || kind === "target" || kind === "warmup" || Boolean(checkDone);
   $("#record-label").textContent = kind === "take" ? "Stop" : "Record a take";
   $("#warmup").classList.toggle("live", kind === "warmup");
-  $("#warmup").disabled = kind === "take" || kind === "target";
+  $("#warmup").disabled = busy || kind === "take" || kind === "target";
   $("#warmup").textContent = kind === "warmup" ? "Stop warm-up" : "Warm up";
   $("#new-record").classList.toggle("live", kind === "target");
-  $("#new-record").disabled = kind === "take" || kind === "warmup";
+  $("#new-record").disabled = busy || kind === "take" || kind === "warmup";
   $("#new-record").textContent = kind === "target" ? "Stop" : "Record a clip";
 }
 
@@ -3449,6 +3572,10 @@ document.addEventListener("keydown", (e) => {
   if (e.code !== "Space" || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
   const active = document.activeElement;
   if (active && active !== document.body && active.closest("button, input, textarea, select, a, label, [contenteditable]")) return;
+  if (opening || measuring) {
+    e.preventDefault(); // starting, or scoring: a second press would start another
+    return;
+  }
   if (!$("#train").hidden) {
     e.preventDefault();
     toggleDrill();

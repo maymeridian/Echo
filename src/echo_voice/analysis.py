@@ -170,12 +170,20 @@ def decode(data: bytes) -> np.ndarray:
     return y
 
 
-def analyze(y: np.ndarray, ceiling: float | None = None) -> Voice:
+def analyze(y: np.ndarray, ceiling: float | None = None, trim: bool = True) -> Voice:
     """`ceiling`: the formant ceiling to use, when the speaker's is already
     known. Without it the recording picks its own (formant_tracks), which is
     only dependable on a whole line: a single word picked the same ceiling
-    as its line 23% of the time, and its formants then read a median 5.9% off."""
-    y = _prepare(y)
+    as its line 23% of the time, and its formants then read a median 5.9% off.
+
+    `trim`: cut the lead-in and tail that are only background. Audio the app
+    saved (a line's target.wav, a take, a trainer attempt) was trimmed when
+    it came in, and trimming is not idempotent: done again on a separated
+    clip it moved the start by up to 10 ms and took 10-60 ms off the end, and
+    on a clip that starts in digital silence it moved the start 160 ms. The
+    line's word timings were measured on the audio as saved, so it is read
+    as saved (trim=False)."""
+    y = _prepare(y, trim)
     mfcc = librosa.feature.mfcc(
         y=y, sr=SR, n_mfcc=13, n_fft=N_FFT, hop_length=HOP, n_mels=40
     )[1:]
@@ -193,11 +201,12 @@ def analyze(y: np.ndarray, ceiling: float | None = None) -> Voice:
     return Voice(y=y, times=times, f0=f0, formants=formants, formant_ceiling=float(ceiling), mfcc=mfcc)
 
 
-def _prepare(y: np.ndarray) -> np.ndarray:
+def _prepare(y: np.ndarray, trim: bool = True) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0 or float(np.max(np.abs(y))) < 1e-4:
         raise AnalysisError("That recording is silent — check the microphone.")
-    y = _trim(y)
+    if trim:
+        y = _trim(y)
     seconds = len(y) / SR
     if seconds < MIN_SECONDS:
         raise AnalysisError("That recording is too short to score.")
