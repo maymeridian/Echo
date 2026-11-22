@@ -72,9 +72,10 @@ problems that a review of the whole code found before publication.
 
 - Other websites can no longer use Echo's server. Previously, a page on
   another site could make the browser queue downloads or delete voices, and,
-  through DNS rebinding, read the application programming interface (API),
-  including the audio of takes. Echo now answers only requests made to its own
-  address, and only its own page can change anything.
+  through DNS (Domain Name System) rebinding, read the application
+  programming interface (API), including the audio of takes. Echo now answers
+  only requests made to its own address, and only its own page can change
+  anything.
 - An upload over the size limit is refused before it is read in.
 - Live streams are refused, because they have no end to wait for, and a
   download stops at 2 GB.

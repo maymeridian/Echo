@@ -57,8 +57,8 @@ note, its usual range, its pace in words a second, and how breathy it is.
 Breathiness is described from the share of the words' frames (short stretches
 of audio analysed one at a time) that are voiced. Read speech is voiced on
 53–60% of its word frames; a soft, breathy voice on about 45%. The read-speech
-figure was measured on the CMU ARCTIC corpus (see `summary` in
-`src/echo_voice/sources.py`).
+figure was measured on CMU ARCTIC, a corpus of read speech (Kominek and Black,
+2004; see `summary` in `src/echo_voice/sources.py`).
 
 ### Your habits against the voice
 

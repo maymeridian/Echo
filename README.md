@@ -97,9 +97,9 @@ same words.
 Each part's distance is mapped to 0–100 so that a speaker's retake on another
 microphone scores about 90 and a same-sex stranger about 20. Each part is
 weighted in proportion to how well it separates a retake from a stranger: its
-area under the ROC curve (AUC) minus 0.5. A gender estimate and a vocal-fry
-estimate are shown but not counted. The [method](docs/method.md) gives every
-definition and curve.
+area under the receiver operating characteristic (ROC) curve (AUC) minus 0.5.
+A gender estimate and a vocal-fry estimate are shown but not counted. The
+[method](docs/method.md) gives every definition and curve.
 
 ## Accuracy
 
@@ -163,8 +163,9 @@ own licences: WeSpeaker ResNet34-LM (speaker embeddings), UVR-MDX-NET Voc_FT
 (vocal separation) and Whisper base.en (speech recognition). The fitted values
 in `src/echo_voice/` come from RAVDESS (CC BY-NC-SA 4.0), VoxSim and VCC2018
 (CC BY 4.0), PTDB-TUG and Hillenbrand et al. (1995); none of their recordings
-are included. The test clips in `tests/data/arctic` are from CMU ARCTIC, under
-the licence in that folder.
+are included. The test clips in `tests/data/arctic` are from CMU ARCTIC, a
+corpus of read speech from Carnegie Mellon University (Kominek and Black,
+2004), under the licence in that folder.
 
 ## References
 

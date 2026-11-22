@@ -11,7 +11,8 @@ reported table. For using the app, see the [guide](guide.md).
 
 **Method.** The take is aligned with the target by dynamic time warping on the
 frames of a speech recogniser. Six parts are compared: Voice, Pitch, Melody,
-Resonance, Articulation and Rhythm. On the RAVDESS corpus, each part's scale is
+Resonance, Articulation and Rhythm. On the RAVDESS corpus (24 actors saying two
+sentences in eight emotions; Livingstone and Russo, 2018), each part's scale is
 anchored at 90 for the median distance between an actor and their own retake
 and at 20 for the median distance to a same-sex stranger (Articulation's 20 is
 a different sentence instead), and each part is weighted by how well it
@@ -20,17 +21,22 @@ separates retakes from strangers.
 **Main results (measured).**
 
 - On the calibration pairs, the headline score tells an actor's retake from a
-  stranger at AUC 0.964 ([Calibration](#calibration)).
-- In the VCC2018 listening test, the headline correlates with the mean
+  stranger with an area under the receiver operating characteristic curve
+  (AUC) of 0.964 ([Calibration](#calibration)).
+- In the listening test of the Voice Conversion Challenge 2018 (VCC2018), the
+  headline correlates with the mean
   listener rating at Pearson 0.48 per pair and 0.90 per system
   ([Agreement with listeners: VCC2018](#agreement-with-listeners-vcc2018)).
-- On the VoxSim test split, Voice reaches Pearson 0.789 across all pairs and
+- On the test split of VoxSim, a set of listeners' voice-similarity ratings
+  (Ahn et al., 2024), Voice reaches Pearson 0.789 across all pairs and
   0.589 among different speakers, against 0.761 and 0.237 for
   speaker-embedding similarity alone
   ([VoxSim](#agreement-with-listeners-on-real-world-clips-voxsim)).
-- The pitch tracker makes 2.1% gross errors on PTDB-TUG
+- The pitch tracker makes 2.1% gross errors on the PTDB-TUG pitch-tracking
+  database (Pirker et al., 2011)
   ([Pitch tracking](#pitch-tracking)). The formant tracker puts 0.9%, 1.5% and
-  2.8% of F1, F2 and F3 measurements more than 15% off on the Hillenbrand et
+  2.8% of measurements of the first three formants (F1, F2 and F3: resonances
+  of the vocal tract) more than 15% off on the Hillenbrand et
   al. (1995) vowels ([Formant tracking](#formant-tracking)).
 - With music as loud as the voice, vocal separation restores a median headline
   score of 100 against the clean original, against 65 without it
@@ -83,7 +89,8 @@ Each goes in the `cache/` folder, and the docstring of each command says where
 to download it. Commands assume Echo's virtual environment is active. Each
 section below gives the command that reproduces its table where one exists.
 No command is given for the known-answers, robustness, word-timing, phrase
-trainer and vocal-fry checks, or for the CMU ARCTIC check of the calibration.
+trainer and vocal-fry checks, or for the calibration check on CMU ARCTIC, a
+corpus of read speech (Kominek and Black, 2004).
 
 | Dataset | Contents | Used for | Reference |
 | --- | --- | --- | --- |
