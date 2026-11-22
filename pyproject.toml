@@ -48,3 +48,13 @@ echo_voice = ["static/*", "*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = ["B905"]  # zip() over arrays of one length; strict= would only add noise
+
+[tool.ruff.format]
+quote-style = "preserve"  # double quotes in code, ''' for each file's header

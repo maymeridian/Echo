@@ -1,3 +1,15 @@
+/*
+src/echo_voice/static/style.css
+Author: maymeridian
+Description: The page's look: colours for light and dark, the layout, and the parts of each page.
+             - Colours are custom properties on :root, redefined for a dark system theme; the
+               drawings in app.js read them too.
+             - The layout is a sidebar beside the main column; under 760 px wide they stack.
+             - From 1180 px wide, the line page puts the coach beside the guide and results.
+*/
+
+/* --- COLOURS --- */
+
 :root {
   color-scheme: light dark;
   --bg: #f6f5f2;
@@ -44,6 +56,8 @@
   }
 }
 
+/* --- BASE --- */
+
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }  /* class rules with display: flex would otherwise win */
 body {
@@ -70,7 +84,7 @@ kbd {
 
 .app { display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }
 
-/* ---------- sidebar ---------- */
+/* --- SIDEBAR --- */
 
 .sidebar {
   position: sticky;
@@ -138,7 +152,7 @@ input[type="text"], input[type="url"], input[type="search"] {
 .fine { margin: 0; font-size: 12px; color: var(--muted); }
 .link { border: 0; background: none; color: var(--muted); cursor: pointer; text-decoration: underline; padding: 0; }
 
-/* ---------- main ---------- */
+/* --- MAIN --- */
 
 main { padding: 28px 36px 64px; max-width: 1240px; width: 100%; }
 /* Pages of text and lists read better narrower; the line page uses the width. */
@@ -169,7 +183,7 @@ main { padding: 28px 36px 64px; max-width: 1240px; width: 100%; }
 }
 .steps b { color: var(--text); }
 
-/* ---------- practising a line ---------- */
+/* --- PRACTISING A LINE --- */
 
 .line-row { display: flex; align-items: baseline; gap: 10px; margin: 0; }
 .line-head { align-items: baseline; margin-bottom: 14px; }
@@ -315,7 +329,7 @@ div.live { margin: 0 0 12px; }
 .takes button:hover { background: var(--muted); }
 .takes button[aria-current="true"] { background: var(--accent); }
 
-/* ---------- trimming ---------- */
+/* --- TRIMMING --- */
 
 .trim { display: flex; flex-direction: column; gap: 12px; }
 .trim canvas { display: block; width: 100%; height: 120px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
@@ -327,7 +341,7 @@ div.live { margin: 0 0 12px; }
 #trim-len { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 9em; }
 #trim-len.error { color: var(--bad); }
 
-/* ---------- a recording's lines ---------- */
+/* --- A RECORDING'S LINES --- */
 
 .source-status { margin: 0 0 14px; color: var(--muted); }
 .source-status.error { color: var(--bad); }
@@ -345,7 +359,7 @@ div.live { margin: 0 0 12px; }
 .tag { font-style: normal; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--track); color: var(--muted); white-space: nowrap; cursor: help; }
 .tag.done { background: var(--accent-soft); color: var(--accent); cursor: default; }
 
-/* ---------- home ---------- */
+/* --- HOME --- */
 
 .home { display: flex; flex-direction: column; gap: 14px; }
 .home h2 { margin-bottom: 4px; }
@@ -363,7 +377,7 @@ div.live { margin: 0 0 12px; }
 button.brand { border: 0; background: none; cursor: pointer; text-align: left; }
 button.brand:hover h1 { color: var(--accent); }
 
-/* ---------- the voice at a glance, suggested lines ---------- */
+/* --- THE VOICE AT A GLANCE, SUGGESTED LINES --- */
 
 .glance { display: flex; flex-direction: column; gap: 8px; margin-bottom: 18px; }
 .glance-row { display: grid; grid-template-columns: 90px 1fr; gap: 12px; align-items: baseline; }
@@ -372,7 +386,7 @@ button.brand:hover h1 { color: var(--accent); }
 .suggested-wrap .fine { margin: 2px 0 8px; }
 .all-lines-head { margin-bottom: 8px; }
 
-/* ---------- coach: checklist, drills, plateau ---------- */
+/* --- COACH: CHECKLIST, DRILLS, PLATEAU --- */
 
 .checklist { counter-reset: step; display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
 .checklist li {
@@ -411,7 +425,7 @@ button.brand:hover h1 { color: var(--accent); }
 .plateau p { margin: 0; }
 .pill.note .icon { font-size: 13px; }
 
-/* ---------- the ladder: from a stranger to the real person ---------- */
+/* --- THE LADDER: FROM A STRANGER TO THE REAL PERSON --- */
 
 .ladder { padding: 0 2px; }
 .ladder-track {
@@ -427,17 +441,17 @@ button.brand:hover h1 { color: var(--accent); }
 .ladder-marks span { position: absolute; transform: translateX(-50%); text-align: center; white-space: nowrap; }
 .ladder-marks span::before { content: ""; position: absolute; top: -10px; left: 50%; width: 1px; height: 6px; background: var(--muted); }
 
-/* ---------- first voice ---------- */
+/* --- FIRST VOICE --- */
 
 .first-voice { display: flex; gap: 10px; margin-top: 26px; max-width: 560px; }
 .first-voice input { flex: 1; min-width: 0; font-size: 16px; padding: 11px 14px; }
 
-/* ---------- a voice ---------- */
+/* --- A VOICE --- */
 
 .voice-page { display: flex; flex-direction: column; gap: 16px; }
 .pane { display: flex; flex-direction: column; gap: 16px; }
 
-/* ---------- tabs ---------- */
+/* --- TABS --- */
 
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
 .tabs button {
@@ -453,7 +467,7 @@ button.brand:hover h1 { color: var(--accent); }
 .tabs button:hover { color: var(--text); }
 .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 
-/* ---------- the line page: the guide and results beside the coach ---------- */
+/* --- THE LINE PAGE: THE GUIDE AND RESULTS BESIDE THE COACH --- */
 
 .line-grid { display: flex; flex-direction: column; gap: 14px; }
 .line-main, .line-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
@@ -511,7 +525,7 @@ button.brand:hover h1 { color: var(--accent); }
 .rec-text small.error { color: var(--bad); }
 .recording .btn { flex: 0 0 auto; }
 
-/* ---------- starting from a link; progress; speakers ---------- */
+/* --- STARTING FROM A LINK; PROGRESS; SPEAKERS --- */
 
 .lead { font-size: 17px; margin: 0 0 6px; max-width: 620px; }
 .empty .first-voice { margin: 14px 0 26px; }
@@ -547,7 +561,7 @@ button.brand:hover h1 { color: var(--accent); }
 .tag.speaker-tag.s2 { background: var(--good-bg); color: var(--good); }
 .tag.speaker-tag.s3 { background: var(--mid-bg); color: var(--mid); }
 
-/* ---------- warnings, a stuck part, progress ---------- */
+/* --- WARNINGS, A STUCK PART, PROGRESS --- */
 
 .warning { margin: 0 0 14px; padding: 10px 14px; border-radius: 8px; background: var(--mid-bg); color: var(--text); border-left: 4px solid var(--mid); }
 .coach-stuck { margin: 0; font-size: 13px; color: var(--muted); }
@@ -567,7 +581,7 @@ button.brand:hover h1 { color: var(--accent); }
 .progress-chart .dot.c5 { fill: var(--text); }
 .progress-parts li { grid-template-columns: 96px 1fr 30px 38px; }
 
-/* ---------- training one part ---------- */
+/* --- TRAINING ONE PART --- */
 
 .train { display: flex; flex-direction: column; gap: 14px; }
 .train > .crumb { align-self: flex-start; }
@@ -613,7 +627,7 @@ button.brand:hover h1 { color: var(--accent); }
 .train-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .train-line p { margin: 0; }
 
-/* ---------- the voice check ---------- */
+/* --- THE VOICE CHECK --- */
 
 .check-banner { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; border-left: 4px solid var(--accent); }
 .check-text { flex: 1; min-width: 220px; }
@@ -650,7 +664,7 @@ button.brand:hover h1 { color: var(--accent); }
 .check-result .components li { grid-template-columns: 96px 1fr 30px; }
 .check-result .coach p { margin: 0 0 6px; }
 
-/* ---------- narrow screens ---------- */
+/* --- NARROW SCREENS --- */
 
 @media (max-width: 760px) {
   .app { grid-template-columns: 1fr; }
@@ -671,6 +685,8 @@ button.brand:hover h1 { color: var(--accent); }
   .first-voice { flex-direction: column; }
 }
 
+/* --- LIVE RESONANCE --- */
+
 /* Live resonance: a ring that follows your voice on the trainer's map, and a hollow mark on the meters. */
 .map-live { fill: var(--panel); fill-opacity: 0.6; stroke: var(--accent); stroke-width: 3; }
 .map-trail { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; opacity: 0.35; }
@@ -678,6 +694,8 @@ button.brand:hover h1 { color: var(--accent); }
 .live-res { margin-top: 8px; max-width: 520px; }
 .live-res .zone { left: 43.4%; width: 13.2%; } /* within 3.3%: where a word scores 90 or more */
 .pill.on { border-color: var(--accent); color: var(--accent); }
+
+/* --- MICROPHONE BOX AND VERSION --- */
 
 /* The sidebar's microphone box. */
 .mic-box { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 14px 6px 0; border-top: 1px solid var(--line); }

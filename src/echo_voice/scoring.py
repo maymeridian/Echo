@@ -1,25 +1,28 @@
-"""Compare a take against a target and say what to change.
-
-`measure` takes the raw distances. The take is time-aligned to the target first,
-so pitch, formants and timing compare the same moment of the line in both
-recordings; that part only works when both say the same words. Voice doesn't
-depend on the words: it's the rating listeners would likely give the pair
-(similarity.py, trained on VoxSim).
-
-The alignment is dynamic time warping over what a speech recogniser hears
-(line.sounds), not over MFCCs. MFCCs carry the voice as much as the words: on
-RAVDESS a stranger saying the right line was as far from the target (0.364) as
-the right actor saying the other sentence (0.368), and a real take against a
-breathy target sat past both, so Articulation read 0 whatever was said. The
-recogniser's frames put a stranger (0.17) between a retake (0.11) and another
-sentence (0.23), and they line takes up better: carried along the alignment,
-a line's words landed a median 50 ms from where the take's own transcript has
-them, against 80 ms, and over 200 ms off for 6% of words against 16%
-(cache/experiments/articulation, 2026-11).
-
-`compare` maps each distance to 0-100 with curves from calibration.json (see
-tools/calibrate.py) and writes the details and hints.
-"""
+'''
+src/echo_voice/scoring.py
+Author: maymeridian
+Description: Compares a take with its target line, scores it 0-100 and says what to change.
+             - measure takes the raw distances. The take is time-aligned to the target first,
+               so pitch, formants and timing compare the same moment of the line in both
+               recordings; that part only works when both say the same words. Voice doesn't
+               depend on the words: it's the rating listeners would likely give the pair
+               (similarity.py, trained on VoxSim).
+             - Alignment: dynamic time warping over what a speech recogniser hears
+               (line.sounds), not over MFCCs. MFCCs carry the voice as much as the words: on
+               RAVDESS a stranger saying the right line was as far from the target (0.364) as
+               the right actor saying the other sentence (0.368), and a real take against a
+               breathy target sat past both, so Articulation read 0 whatever was said. The
+               recogniser's frames put a stranger (0.17) between a retake (0.11) and another
+               sentence (0.23), and they line takes up better: carried along the alignment, a
+               line's words landed a median 50 ms from where the take's own transcript has
+               them, against 80 ms, and over 200 ms off for 6% of words against 16%
+               (cache/experiments/articulation, 2026-11).
+             - compare maps each distance to 0-100 with curves from calibration.json (see
+               tools/calibrate.py) and writes the details and hints.
+             - Also here: each word's scores (word_breakdown), one word practised on its own
+               (word_drill), what to work on next (coach) and one score across several lines
+               (voice_check).
+'''
 
 from __future__ import annotations
 
@@ -58,6 +61,7 @@ CEILING_SPREAD = (-500.0, -250.0, 0.0, 250.0, 500.0)  # Hz around the shared cei
 FRY_UNDER = 7.0
 FRY_GAP = 0.15  # a difference in share worth a hint
 
+# The curves, weights and thresholds fitted by tools/calibrate.py.
 CALIBRATION = json.loads((Path(__file__).parent / "calibration.json").read_text("utf-8"))
 # Which scoring a result came from. It goes up whenever the same take would
 # score differently, and saved takes from an earlier one are scored again
@@ -68,16 +72,21 @@ CALIBRATION = json.loads((Path(__file__).parent / "calibration.json").read_text(
 SCORING = 3
 
 
+# --- MEASURING ---
+
+
 @dataclass
 class Measures:
+    """The raw distances between a take and its target, and the alignment they were read along."""
+
     ti: np.ndarray  # the alignment on the 10 ms grid: every target frame...
     ki: np.ndarray  # ...and the take frame that matches it
     identity: float  # cosine similarity of speaker embeddings, -1..1
     listener: float  # rating listeners would likely give, 1 (different) .. 6 (same)
-    articulation: float  # mean cosine distance between aligned recogniser frames that both have sound
+    articulation: float  # mean cosine distance of aligned recogniser frames where both have sound
     tempo: float  # log2 of take / target length, first to last voiced sound
     timing: float  # how far the alignment strays from an even stretch between those, 0..1
-    si: np.ndarray | None = None  # the alignment as found, on the recogniser's 20 ms frames: target...
+    si: np.ndarray | None = None  # the alignment as found, on 20 ms recogniser frames: target...
     sj: np.ndarray | None = None  # ...and take
     step: np.ndarray | None = None  # the distance at each of its steps
     ceiling: float | None = None  # the formant ceiling Resonance was read around
@@ -101,17 +110,24 @@ class Measures:
 
 
 def _semitones(ratio):
+    """A frequency ratio (or an array of them) in semitones."""
     return 12.0 * np.log2(ratio)
 
 
 def _cosine_steps(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return 1 - (a * b).sum(axis=1) / np.maximum(np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-9)
+    """Cosine distance between each row of `a` and the same row of `b`."""
+    norms = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    return 1 - (a * b).sum(axis=1) / np.maximum(norms, 1e-9)
 
 
 def resonance_ceilings(target: Voice, take: Voice) -> tuple[float, list[float]]:
     """The ceiling both sides are read at, and the ones around it."""
-    middle = take.steady_ceiling if take.steady_ceiling and take.steady_ceiling == target.steady_ceiling else None
-    middle = middle or shared_ceiling(target.formant_ceiling, take.formant_ceiling)
+    # Both steadied at one speaker ceiling: that one. Otherwise the middle of the two
+    # recordings' own picks.
+    middle = take.steady_ceiling
+    if not middle or middle != target.steady_ceiling:
+        middle = shared_ceiling(target.formant_ceiling, take.formant_ceiling)
+    # Each kept within 4000-7000 Hz.
     return middle, sorted({min(7000.0, max(4000.0, middle + d)) for d in CEILING_SPREAD})
 
 
@@ -125,7 +141,12 @@ def align(target: Voice, take: Voice) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return si, sj, _cosine_steps(target.sounds[si], take.sounds[sj])
 
 
-def on_grid(target: Voice, take: Voice, si: np.ndarray, sj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def on_grid(
+    target: Voice,
+    take: Voice,
+    si: np.ndarray,
+    sj: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     """That alignment on the 10 ms grid pitch and formants are on: the take
     frame for every target frame, through the middle of each recogniser
     frame's run."""
@@ -134,11 +155,18 @@ def on_grid(target: Voice, take: Voice, si: np.ndarray, sj: np.ndarray) -> tuple
     last = np.searchsorted(si, np.arange(n_s), side="right") - 1
     middle = (sj[first] + sj[last]) / 2
     ti = np.arange(n_t)
-    ki = np.clip(np.round(np.interp(ti, 2 * np.arange(n_s) + 0.5, 2 * middle + 0.5)).astype(int), 0, n_k - 1)
+    # A 20 ms recogniser frame covers two 10 ms frames: frame s is centred at 2s + 0.5.
+    along = np.interp(ti, 2 * np.arange(n_s) + 0.5, 2 * middle + 0.5)
+    ki = np.clip(np.round(along).astype(int), 0, n_k - 1)
     return ti, ki
 
 
-def read_resonance(target: Voice, take: Voice, ti: np.ndarray, ki: np.ndarray) -> tuple[float, float | None, float | None]:
+def read_resonance(
+    target: Voice,
+    take: Voice,
+    ti: np.ndarray,
+    ki: np.ndarray,
+) -> tuple[float, float | None, float | None]:
     """Resonance along an alignment: the ceiling it was read around, the mean
     |shift| of F2 and F3 in semitones, and their signed mean shift (None when
     there is too little voiced sound in common)."""
@@ -153,24 +181,29 @@ def read_resonance(target: Voice, take: Voice, ti: np.ndarray, ki: np.ndarray) -
             readings.append((float(np.abs(per_formant).mean()), float(per_formant.mean())))
     if not readings:
         return middle, None, None
-    return middle, float(np.median([r[0] for r in readings])), float(np.median([r[1] for r in readings]))
+    size = float(np.median([r[0] for r in readings]))
+    shift = float(np.median([r[1] for r in readings]))
+    return middle, size, shift
 
 
 def measure(target: Voice, take: Voice) -> Measures:
+    """The raw distances between a take and its target, along their alignment."""
+    # 1. Line the take up with the target. Only where both have sound counts: a pause,
+    #    a silent tail, the gaps a gated microphone leaves and the click on Stop are not
+    #    part of the line. With fewer than 5 such steps, every step counts.
     si, sj, step = align(target, take)
-    # Only where both have sound: a pause, a silent tail, the gaps a gated
-    # microphone leaves and the click on Stop are not part of the line.
     on = target.sound[si] & take.sound[sj]
     if on.sum() < 5:
         on = np.ones(len(si), dtype=bool)
-    # The line in each recording runs from its first to its last voiced sound
-    # (Voice.spoken): a breath after the last word has sound, and lined up
-    # against the end of the target it read as part of the line (takes that
-    # ran 10% long by their own word timings read 50% long).
-    # Timing: how far the take runs ahead of or behind an even stretch of the
-    # line between those, read at TIMING_POINTS stretches of it and not step
-    # by step. The alignment wanders by a frame or two with any change in the
-    # sound, and the whole curve from 90 to 20 is a few hundredths wide.
+
+    # 2. Timing. The line in each recording runs from its first to its last voiced
+    #    sound (Voice.spoken): a breath after the last word has sound, and lined up
+    #    against the end of the target it read as part of the line (takes that ran 10%
+    #    long by their own word timings read 50% long). Timing is how far the take runs
+    #    ahead of or behind an even stretch of the line between those, read at
+    #    TIMING_POINTS stretches of it and not step by step. The alignment wanders by a
+    #    frame or two with any change in the sound, and the whole curve from 90 to 20
+    #    is a few hundredths wide.
     per = round(line.SOUND_STEP * SR / HOP)  # 10 ms frames in one recogniser frame
     ts, ks = target.spoken, take.spoken
     ta, ka = si * per, sj * per
@@ -180,7 +213,13 @@ def measure(target: Voice, take: Voice) -> Measures:
         along = (ta[inside] - ts.start) / max(1, ts.stop - ts.start)
         there = (ka[inside] - ks.start) / max(1, ks.stop - ks.start)
         stretch = np.minimum((along * TIMING_POINTS).astype(int), TIMING_POINTS - 1)
-        drift = [abs(float(along[stretch == i].mean() - there[stretch == i].mean())) for i in range(TIMING_POINTS) if (stretch == i).sum() >= 2]
+        drift = [
+            abs(float(along[stretch == i].mean() - there[stretch == i].mean()))
+            for i in range(TIMING_POINTS)
+            if (stretch == i).sum() >= 2
+        ]
+
+    # 3. Voice, Articulation and tempo, and the alignment on the 10 ms grid
     ti, ki = on_grid(target, take, si, sj)
     m = Measures(
         ti=ti,
@@ -195,9 +234,11 @@ def measure(target: Voice, take: Voice) -> Measures:
         step=step,
     )
 
+    # 4. Pitch: the gap between the two medians
     if target.median_f0 is not None and take.median_f0 is not None:
         m.pitch = float(_semitones(take.median_f0 / target.median_f0))
 
+    # 5. Melody: the contours' shapes where both are voiced
     both = target.voiced[ti] & take.voiced[ki]
     if both.sum() >= MIN_VOICED_FRAMES:
         a = _semitones(target.f0[ti][both])
@@ -210,16 +251,18 @@ def measure(target: Voice, take: Voice) -> Measures:
             float(np.percentile(b, 95) - np.percentile(b, 5)),
         )
 
+    # 6. Resonance
     m.ceiling, m.resonance, m.resonance_shift = read_resonance(target, take, ti, ki)
     return m
 
 
-# ---------- distances to scores ----------
+# --- DISTANCES TO SCORES ---
 
 
 def curve(distance: float, at90: float, at20: float) -> float:
     """0-100 on a log-logistic curve: 100 at zero distance, 90 at `at90`
     (the real person retaking the line) and 20 at `at20` (a stranger)."""
+    # At 90 the odds are 9 to 1 and at 20 they are 1 to 4: 36 times apart.
     k = math.log(36) / math.log(at20 / at90)
     d50 = at20 / 4 ** (1 / k)
     return 100.0 / (1.0 + (max(distance, 0.0) / d50) ** k)
@@ -230,10 +273,9 @@ def component_scores(distances: dict[str, float | None], calibration: dict = CAL
     whole line) and timing (the pace inside it) by how well each tells a
     retake from a stranger: timing barely does, and at half of Rhythm its
     steep curve made Rhythm jump."""
-    s = {
-        k: None if v is None else curve(v, **calibration["curves"][k])
-        for k, v in distances.items()
-    }
+    curves = calibration["curves"]
+    s = {k: None if v is None else curve(v, **curves[k]) for k, v in distances.items()}
+    # Half each, when the calibration doesn't say.
     mix = calibration.get("rhythm", {"tempo": 0.5, "timing": 0.5})
     s["rhythm"] = mix["tempo"] * s.pop("tempo") + mix["timing"] * s.pop("timing")
     return s
@@ -254,6 +296,8 @@ def overall(scores: dict[str, float | None], calibration: dict = CALIBRATION) ->
 
 @dataclass
 class Component:
+    """One row of the result: a part's score, what was measured and what to change."""
+
     key: str
     label: str
     score: float | None  # None when it couldn't be measured
@@ -288,17 +332,25 @@ def compare(
     `usual`: the usual pitch of the target's voice and of whoever made the
     take, in Hz, when they are known. With both, the result says how much of
     each recording is vocal fry."""
+    # 1. Measure, and check the words when both transcripts are there
     m = measure(target, take)
     check = None
     if target_words and len(target_words) >= 2 and take_words is not None:
         check = line.compare_words(target_words, take_words)
+
+    # 2. Score each part
     scores = component_scores(m.distances())
     if pitch_unreliable:
         scores["pitch"] = scores["melody"] = None
+        pitch, melody = _unreliable("pitch", "Pitch"), _unreliable("melody", "Melody")
+    else:
+        pitch, melody = _pitch(target, take, m, scores["pitch"]), _melody(m, scores["melody"])
+
+    # 3. The rows, and the parts under 80 with a hint, weakest first
     components = [
         _identity(m, scores["identity"]),
-        _unreliable("pitch", "Pitch") if pitch_unreliable else _pitch(target, take, m, scores["pitch"]),
-        _unreliable("melody", "Melody") if pitch_unreliable else _melody(m, scores["melody"]),
+        pitch,
+        melody,
         _resonance(m, scores["resonance"]),
         _articulation(m, scores["articulation"]),
         _rhythm(m, scores["rhythm"], None if check is None else not check.flagged),
@@ -309,6 +361,16 @@ def compare(
         components.append(_fry(*fry))
     scored = [c for c in components if c.score is not None]
     weakest = sorted((c for c in scored if c.hint and c.score < 80), key=lambda c: c.score)
+
+    # 4. The result
+    said = None
+    if check is not None:
+        said = {
+            "target": " ".join(check.target),
+            "take": " ".join(check.take),
+            "match": round(check.match_rate, 2),
+            "flagged": check.flagged,
+        }
     return {
         "scoring": SCORING,
         "overall": round(overall(scores), 1),
@@ -329,7 +391,8 @@ def compare(
         # How female or male each reads, 0-100 (gender.py). Shown beside the
         # parts; not part of the headline, which already counts pitch and resonance.
         "gender": {"target": gender.score(target), "take": gender.score(take)},
-        # The share of each recording's voiced sound that is vocal fry, when the usual pitches are known.
+        # The share of each recording's voiced sound that is vocal fry, when the
+        # usual pitches are known.
         "fry": None if None in fry else {"target": round(fry[0], 3), "take": round(fry[1], 3)},
         # The raw gaps, so progress can be followed across lines of one voice.
         "measures": {
@@ -344,20 +407,21 @@ def compare(
             "ceiling_used": m.ceiling,
         },
         "hints": (_line_hints(check) + [c.hint for c in weakest])[:3],
-        "line": None if check is None else {
-            "target": " ".join(check.target),
-            "take": " ".join(check.take),
-            "match": round(check.match_rate, 2),
-            "flagged": check.flagged,
-        },
+        "line": said,
         "contour": _contour(target, take, m.ti, m.ki),
     }
 
 
-# ---------- word by word ----------
+# --- WORD BY WORD ---
 
 WORD_PARTS = ("pitch", "melody", "resonance", "articulation")
 MIN_WORD_FRAMES = 5  # aligned voiced frames before a word's pitch or formants count
+
+
+def _part_scores(row: dict, parts: tuple[str, ...]) -> dict[str, float | None]:
+    """Each of `parts` in a word's row scored on the line's curves, None where unmeasured."""
+    curves = CALIBRATION["curves"]
+    return {k: None if row[k] is None else round(curve(abs(row[k]), **curves[k]), 1) for k in parts}
 
 
 def word_breakdown(target: Voice, take: Voice, m: Measures, word_times: list[dict]) -> list[dict]:
@@ -378,13 +442,13 @@ def word_breakdown(target: Voice, take: Voice, m: Measures, word_times: list[dic
     heard = target.sound[m.si] & take.sound[m.sj]
     starts = m.si * line.SOUND_STEP  # where each step of the alignment falls in the target
     fa_all, fb_all = target.at(m.ceiling)[1:], take.at(m.ceiling)[1:]
-    curves = CALIBRATION["curves"]
     hop = float(target.times[1] - target.times[0]) if len(target.times) > 1 else 0.01
 
+    # 1. Pitch, resonance and articulation, word by word
     out = []
     for w in word_times:
         on = (target.times[ti] >= w["start"]) & (target.times[ti] < w["end"])
-        if on.sum() < 3:
+        if on.sum() < 3:  # under 30 ms of the alignment: too little to read
             continue
         row = {
             "text": w["text"],
@@ -411,24 +475,28 @@ def word_breakdown(target: Voice, take: Voice, m: Measures, word_times: list[dic
         fa, fb = fa_all[:, tf], fb_all[:, kf]
         fa, fb = fa[:, np.isfinite(fa).all(axis=0)], fb[:, np.isfinite(fb).all(axis=0)]
         if min(fa.shape[1], fb.shape[1]) >= MIN_WORD_FRAMES:
-            row["resonance"] = round(float(_semitones(np.median(fb, axis=1) / np.median(fa, axis=1)).mean()), 2)
+            shift = float(_semitones(np.median(fb, axis=1) / np.median(fa, axis=1)).mean())
+            row["resonance"] = round(shift, 2)
         out.append(row)
-    # Melody: each word's pitch gap against the typical gap over the line, so a
-    # take that is simply higher throughout has no melody error.
+
+    # 2. Melody: each word's pitch gap against the typical gap over the line, so a
+    #    take that is simply higher throughout has no melody error.
     gaps = [w["pitch"] for w in out if w["pitch"] is not None]
     if len(gaps) >= 2:
         typical = float(np.median(gaps))
         for w in out:
             if w["pitch"] is not None:
                 w["melody"] = round(w["pitch"] - typical, 2)
+
+    # 3. Scores, and each word's worst part
     for w in out:
-        w["scores"] = {k: None if w[k] is None else round(curve(abs(w[k]), **curves[k]), 1) for k in WORD_PARTS}
+        w["scores"] = _part_scores(w, WORD_PARTS)
         scored = {k: s for k, s in w["scores"].items() if s is not None}
         w["worst"] = min(scored, key=scored.get) if scored else None
     return out
 
 
-# ---------- training one part on one word ----------
+# --- TRAINING ONE PART ON ONE WORD ---
 
 DRILL_PARTS = ("resonance", "pitch", "articulation")
 
@@ -444,44 +512,57 @@ def word_drill(target: Voice, word: dict, attempt: Voice) -> dict:
     each vowel has formants of its own. Formants on single words are what
     Hillenbrand et al. (1995) measured, and where per-recording ceilings cut
     F2/F3 errors over 15% to 1.5%/2.8% (tools/validate.py formant-lines)."""
+    # 1. The word's frames in the target, and the attempt's spoken frames
     on = np.flatnonzero((target.times >= word["start"]) & (target.times < word["end"]))
     spoken = np.arange(len(attempt.times))[attempt.spoken]
-    out = {"scoring": SCORING, "text": word["text"], "pitch": None, "resonance": None, "percent": None, "articulation": None}
+    out = {
+        "scoring": SCORING,
+        "text": word["text"],
+        "pitch": None,
+        "resonance": None,
+        "percent": None,
+        "articulation": None,
+    }
     if on.size < 3 or spoken.size < 3:
         return out | {"scores": dict.fromkeys(DRILL_PARTS), "voiced": False}
 
+    # 2. Pitch
     a = target.f0[on][target.voiced[on]]
     b = attempt.f0[spoken][attempt.voiced[spoken]]
     voiced = b.size >= MIN_WORD_FRAMES
     if a.size >= MIN_WORD_FRAMES and voiced:
         out["pitch"] = round(float(np.median(_semitones(b)) - np.median(_semitones(a))), 2)
+
+    # 3. Resonance
     fa, fb = target.resonance_formants[1:, on], attempt.resonance_formants[1:, spoken]
     fa, fb = fa[:, np.isfinite(fa).all(axis=0)], fb[:, np.isfinite(fb).all(axis=0)]
     if min(fa.shape[1], fb.shape[1]) >= MIN_WORD_FRAMES:
         shift = float(_semitones(np.median(fb, axis=1) / np.median(fa, axis=1)).mean())
         out["resonance"] = round(shift, 2)
         out["percent"] = round((2 ** (shift / 12) - 1) * 100, 1)
-    # The target's word is heard by itself, as the attempt is: the recogniser
-    # hears a sound differently with the rest of a sentence around it.
+
+    # 4. Articulation. The target's word is heard by itself (with 30 ms either side), as
+    #    the attempt is: the recogniser hears a sound differently with the rest of a
+    #    sentence around it.
     heard = target.tracks.setdefault("words", {})
     key = (round(word["start"], 2), round(word["end"], 2))
     if key not in heard:
-        cut = target.y[max(0, int((word["start"] - 0.03) * SR)) : int((word["end"] + 0.03) * SR)]
-        heard[key] = line.sounds(cut)
+        start = max(0, int((word["start"] - 0.03) * SR))
+        heard[key] = line.sounds(target.y[start : int((word["end"] + 0.03) * SR)])
     a, b = heard[key], attempt.sounds
     _, path = librosa.sequence.dtw(X=a.T, Y=b.T, metric="cosine")
     steps = _cosine_steps(a[path[:, 0]], b[path[:, 1]])
     said = attempt.sound[path[:, 1]]
     out["articulation"] = round(float(steps[said].mean() if said.sum() >= 2 else steps.mean()), 3)
 
-    curves = CALIBRATION["curves"]
-    out["scores"] = {k: None if out[k] is None else round(curve(abs(out[k]), **curves[k]), 1) for k in DRILL_PARTS}
+    # 5. Scores, and the attempt's length against the word's (at least 50 ms)
+    out["scores"] = _part_scores(out, DRILL_PARTS)
     out["voiced"] = voiced
     out["duration"] = round(attempt.spoken_duration / max(0.05, word["end"] - word["start"]), 2)
     return out
 
 
-# ---------- coaching: one thing at a time ----------
+# --- COACHING: ONE THING AT A TIME ---
 
 FOCUSABLE = ("pitch", "melody", "resonance", "articulation", "rhythm")
 GOOD_ENOUGH = 80  # a part at or above this stops being the focus
@@ -490,7 +571,8 @@ STUCK_TAKES = 3  # a part this low on this many takes in a row...
 STUCK_SCORE = 15  # ...without rising: it isn't answering to effort right now
 PLATEAU_TAKES = 4  # this many takes in a row...
 PLATEAU_SPREAD = 6.0  # ...within this many points, and none a new best: time for another line
-MASTERED = 85.0
+MASTERED = 85.0  # a headline at or above this: the line is mastered
+WEAK_WORD = 70  # a word under this on the focus part is named in the advice
 
 
 def coach(
@@ -510,24 +592,28 @@ def coach(
     `progress` reports the part this take was meant to work on. `history` is
     the line's earlier headline scores, oldest first: with it, the coach says
     when the line has stopped improving, so another line would help more."""
+    # 1. What each part would add to the headline
     scores = {c["key"]: c["score"] for c in result["components"]}
     hints = {c["key"]: c.get("hint") for c in result["components"]}
     labels = {c["key"]: c["label"] for c in result["components"]}
     weights = CALIBRATION["weights"]
     gains = {k: weights[k] * (100 - scores[k]) for k in FOCUSABLE if scores.get(k) is not None}
-    # A part that has sat near the bottom for several takes without rising
-    # isn't answering to effort, often because it measures something the
-    # take can't change much right now (a target's breathy delivery, say).
-    # Advice that isn't working is worse than none: work on the parts that move.
+
+    # 2. A part that has sat near the bottom for several takes without rising
+    #    isn't answering to effort, often because it measures something the take
+    #    can't change much right now (a target's breathy delivery, say). Advice
+    #    that isn't working is worse than none: work on the parts that move.
     stuck = []
     for k in list(gains):
-        recent = [s for s in (part_history or {}).get(k, [])[-(STUCK_TAKES - 1):] if s is not None] + [scores[k]]
+        earlier = (part_history or {}).get(k, [])[-(STUCK_TAKES - 1) :]
+        recent = [s for s in earlier if s is not None] + [scores[k]]
         if len(recent) >= STUCK_TAKES and max(recent) < STUCK_SCORE and k != chosen:
             stuck.append(k)
     if stuck and len(stuck) < len(gains):
         for k in stuck:
             gains.pop(k)
 
+    # 3. How the last focus went
     last = (previous or {}).get("coach") or {}
     last_focus = chosen if chosen in labels else last.get("focus")
     before = None
@@ -542,6 +628,7 @@ def coach(
             "after": scores[last_focus],
         }
 
+    # 4. The focus
     if chosen in gains:
         focus, why = chosen, "chosen"
     elif not gains:
@@ -556,35 +643,40 @@ def coach(
         else:
             focus, why = max(weak, key=weak.get), "new"
 
+    # 5. The weakest words on it, and what to say
     words = []
     if focus in WORD_PARTS:
-        ranked = sorted(
-            (w for w in result.get("words", []) if w["scores"].get(focus) is not None and w["scores"][focus] < 70),
-            key=lambda w: w["scores"][focus],
-        )
+        low = [
+            w
+            for w in result.get("words", [])
+            if w["scores"].get(focus) is not None and w["scores"][focus] < WEAK_WORD
+        ]
+        ranked = sorted(low, key=lambda w: w["scores"][focus])
         words = [w["text"] for w in ranked[:3]]
-    if focus is None:
-        message = (
-            "Every part is close. Go for the Voice score, try the line faster or slower, or pick another line."
-            if why == "all good"
-            else None
-        )
-    else:
+    message = None
+    if focus is not None:
         message = hints.get(focus) or f"Work on {labels[focus].lower()}."
+    elif why == "all good":
+        message = (
+            "Every part is close. Go for the Voice score, try the line faster or slower, "
+            "or pick another line."
+        )
+
+    # 6. Has the line stopped improving?
     plateau = False
-    overall = result.get("overall")
-    if history and overall is not None and len(history) + 1 >= PLATEAU_TAKES:
-        recent = history[-(PLATEAU_TAKES - 1):] + [overall]
+    headline = result.get("overall")
+    if history and headline is not None and len(history) + 1 >= PLATEAU_TAKES:
+        recent = history[-(PLATEAU_TAKES - 1) :] + [headline]
         earlier_best = max(history[: -(PLATEAU_TAKES - 1)], default=-1.0)
         plateau = (
             max(recent) - min(recent) <= PLATEAU_SPREAD
             and max(recent) <= max(earlier_best, recent[0]) + 1
-            and overall < MASTERED
+            and headline < MASTERED
         )
     return {
         "plateau": plateau,
         "stuck": stuck,
-        "mastered": overall is not None and overall >= MASTERED,
+        "mastered": headline is not None and headline >= MASTERED,
         "focus": focus,
         "label": labels.get(focus) if focus else None,
         "score": scores.get(focus) if focus else None,
@@ -595,10 +687,10 @@ def coach(
     }
 
 
-# ---------- the voice check: several lines, one take each ----------
+# --- THE VOICE CHECK: SEVERAL LINES, ONE TAKE EACH ---
 
-MIN_CHECK_LINES = 3
-CHECK_LINES = 5
+MIN_CHECK_LINES = 3  # a voice check needs at least this many different lines
+CHECK_LINES = 5  # lines in a voice check, unless the voice's own choice says otherwise
 
 
 def voice_check(rows: list[dict]) -> dict:
@@ -615,32 +707,43 @@ def voice_check(rows: list[dict]) -> dict:
 
     `rows`: one per line, with `target`, `take`, `line`, `overall`, `parts`
     (part -> score) and `measures` (from `compare`)."""
-    overall = np.array([r["overall"] for r in rows], dtype=float)
+    # 1. Each part's mean over the lines, and the one that would lift the voice most
+    headlines = np.array([r["overall"] for r in rows], dtype=float)
     weights = CALIBRATION["weights"]
     parts = {}
     for key in weights:
         values = [r["parts"].get(key) for r in rows if r["parts"].get(key) is not None]
         parts[key] = round(float(np.mean(values)), 1) if values else None
     gains = {
-        k: weights[k] * (100 - v) for k, v in parts.items() if k in FOCUSABLE and v is not None and v < GOOD_ENOUGH
+        k: weights[k] * (100 - v)
+        for k, v in parts.items()
+        if k in FOCUSABLE and v is not None and v < GOOD_ENOUGH
     }
+
+    # 2. The raw gaps, each the median over the lines
     habits = {}
     for key in ("pitch", "resonance", "tempo", "take_f0", "target_f0"):
-        values = [r["measures"][key] for r in rows if (r.get("measures") or {}).get(key) is not None]
+        values = [
+            r["measures"][key] for r in rows if (r.get("measures") or {}).get(key) is not None
+        ]
         habits[key] = round(float(np.median(values)), 2) if values else None
     return {
-        "average": round(float(overall.mean()), 1),
-        "low": round(float(overall.min()), 1),
-        "high": round(float(overall.max()), 1),
+        "average": round(float(headlines.mean()), 1),
+        "low": round(float(headlines.min()), 1),
+        "high": round(float(headlines.max()), 1),
         "lines": rows,
         "parts": parts,
         "focus": max(gains, key=gains.get) if gains else None,
         "habits": habits,
-        "weakest": rows[int(np.argmin(overall))]["target"],
+        "weakest": rows[int(np.argmin(headlines))]["target"],
     }
 
 
+# --- DETAILS AND HINTS ---
+
+
 def _phrase(words: str) -> str:
+    """Words without the punctuation and spaces around them."""
     return words.strip(".,!?;:\"'“”‘’…-– ")
 
 
@@ -650,9 +753,13 @@ def _line_hints(check: line.LineCheck | None) -> list[str]:
     if check is None or not check.flagged:
         return []
     if check.match_rate < 0.5:
+        has = _phrase(" ".join(check.target))
         said = _phrase(" ".join(check.take)) or "…"
-        return [f"That doesn't sound like the target's line. It says “{_phrase(' '.join(check.target))}”; you said “{said}”."]
-    hints = [f"You said “{_phrase(said)}” where the line has “{_phrase(has)}”." for has, said in check.swaps()]
+        return [f"That doesn't sound like the target's line. It says “{has}”; you said “{said}”."]
+    hints = [
+        f"You said “{_phrase(said)}” where the line has “{_phrase(has)}”."
+        for has, said in check.swaps()
+    ]
     hints += [f"You left out “{_phrase(w)}”." for w in check.runs("miss")]
     hints += [f"You added “{_phrase(w)}”." for w in check.runs("extra")]
     return hints[:2]
@@ -666,8 +773,14 @@ def _gender(target: Voice, take: Voice) -> Component:
     if a is None or b is None:
         return Component("gender", "Gender read", None, "not enough voiced sound to measure")
     gap = b - a
-    how = "the same as the target" if abs(gap) < 5 else f"{abs(gap):.0f} more {'female' if gap > 0 else 'male'} than the target"
-    detail = f"you read {b:.0f} ({gender.describe(b)}), the target {a:.0f} ({gender.describe(a)}): {how}; 0 is male, 100 female"
+    if abs(gap) < 5:  # within 5 points reads the same
+        how = "the same as the target"
+    else:
+        how = f"{abs(gap):.0f} more {'female' if gap > 0 else 'male'} than the target"
+    detail = (
+        f"you read {b:.0f} ({gender.describe(b)}), the target {a:.0f} ({gender.describe(a)}): "
+        f"{how}; 0 is male, 100 female"
+    )
     return Component("gender", "Gender read", max(0.0, 100.0 - abs(gap)), detail)
 
 
@@ -680,22 +793,27 @@ def _fry(target: float, take: float) -> Component:
     hint = None
     if gap <= -FRY_GAP:
         hint = (
-            f"The target drops into vocal fry (a low creak) for about {target:.0%} of this line and you for {take:.0%}. "
+            f"The target drops into vocal fry (a low creak) for about {target:.0%} of this line "
+            f"and you for {take:.0%}. "
             "Let the ends of phrases fall low and crackle, as the target does."
         )
     elif gap >= FRY_GAP:
         hint = (
-            f"You drop into vocal fry (a low creak) for about {take:.0%} of this line and the target for {target:.0%}. "
+            f"You drop into vocal fry (a low creak) for about {take:.0%} of this line "
+            f"and the target for {target:.0%}. "
             "Keep the ends of phrases on the note."
         )
     return Component("fry", "Vocal fry", max(0.0, 100.0 - 100.0 * abs(gap)), detail, hint)
 
 
 def _unreliable(key: str, label: str) -> Component:
-    return Component(key, label, None, "not scored: the target's pitch reading is unreliable on this line")
+    """A row left unscored because the target's pitch can't be trusted on this line."""
+    reason = "not scored: the target's pitch reading is unreliable on this line"
+    return Component(key, label, None, reason)
 
 
 def _unmeasured(key: str, label: str) -> Component:
+    """A row left unscored for want of voiced sound."""
     return Component(key, label, None, "not enough voiced sound to measure")
 
 
@@ -711,6 +829,7 @@ LISTENER_LABELS = (
 
 
 def _identity(m: Measures, score: float) -> Component:
+    """The Voice row: what listeners would likely say of the pair."""
     label = LISTENER_LABELS[min(5, max(0, round(m.listener) - 1))]
     detail = f"listeners would likely say: {label} ({m.listener:.1f} of 6)"
     return Component(
@@ -724,10 +843,11 @@ def _identity(m: Measures, score: float) -> Component:
 
 
 def _pitch(target: Voice, take: Voice, m: Measures, score: float | None) -> Component:
+    """The Pitch row: how far the take's median pitch sits from the target's."""
     if m.pitch is None:
         return _unmeasured("pitch", "Pitch")
     t, k = target.median_f0, take.median_f0
-    if abs(m.pitch) < 0.25:
+    if abs(m.pitch) < 0.25:  # within a quarter semitone
         return Component("pitch", "Pitch", score, f"on target, around {t:.0f} Hz")
     way, fix = ("higher", "lower") if m.pitch > 0 else ("lower", "higher")
     return Component(
@@ -741,10 +861,12 @@ def _pitch(target: Voice, take: Voice, m: Measures, score: float | None) -> Comp
 
 
 def _melody(m: Measures, score: float | None) -> Component:
+    """The Melody row: how the contour's shape and range compare."""
     if m.melody is None:
         return _unmeasured("melody", "Melody")
     span_t, span_k = m.melody_span
     spans = f"the target's pitch moves over {span_t:.0f} semitones and yours over {span_k:.0f}"
+    # Under 70% or over 140% of the target's range: the range is the thing to change.
     if span_k < 0.7 * span_t:
         hint = f"Exaggerate the rises and falls — {spans}."
     elif span_k > 1.4 * span_t:
@@ -754,16 +876,18 @@ def _melody(m: Measures, score: float | None) -> Component:
             "Your pitch range is right but the ups and downs land in different "
             "places — listen for which words the target lifts and drops."
         )
-    return Component(
-        "melody", "Melody", score, f"contour typically off by {m.melody:.1f} semitones", hint
-    )
+    detail = f"contour typically off by {m.melody:.1f} semitones"
+    return Component("melody", "Melody", score, detail, hint)
 
 
 def _resonance(m: Measures, score: float | None) -> Component:
+    """The Resonance row: whether the take's formants sit higher or lower than the target's."""
     if m.resonance is None:
         return _unmeasured("resonance", "Resonance")
     shift = m.resonance_shift
     percent = abs(2 ** (shift / 12) - 1) * 100
+    # Under 0.4 semitones of overall shift is level; then a mean |shift| of 0.5 or
+    # more means the vowels differ one by one.
     if abs(shift) < 0.4:
         detail = "formants level with the target" if m.resonance < 0.5 else "vowel shapes differ"
         hint = (
@@ -786,6 +910,7 @@ def _resonance(m: Measures, score: float | None) -> Component:
 
 
 def _articulation(m: Measures, score: float) -> Component:
+    """The Articulation row: how far apart the sounds themselves are."""
     return Component(
         "articulation",
         "Articulation",
@@ -797,11 +922,13 @@ def _articulation(m: Measures, score: float) -> Component:
 
 
 def _rhythm(m: Measures, score: float, words_complete: bool | None = None) -> Component:
-    """`words_complete`: the word check found every word (True), found words
+    """The Rhythm row: how the take's length and pace compare.
+
+    `words_complete`: the word check found every word (True), found words
     missing or added (False), or didn't run (None)."""
     ratio = 2**m.tempo
     percent = abs(ratio - 1) * 100
-    big = ratio > 1.35 or ratio < 0.75
+    big = ratio > 1.35 or ratio < 0.75  # over 35% longer or 25% shorter
     if big and words_complete is False:
         # The word hints already explain the length; don't guess at a second cause.
         way = "longer" if ratio > 1 else "shorter"
@@ -843,6 +970,7 @@ def _contour(target: Voice, take: Voice, ti: np.ndarray, ki: np.ndarray) -> dict
     step = 2  # 20 ms is plenty for a chart
 
     def series(values: np.ndarray) -> list[float | None]:
+        """Every `step`-th value to 0.1 Hz, None where unvoiced."""
         return [round(float(v), 1) if np.isfinite(v) else None for v in values[::step]]
 
     return {

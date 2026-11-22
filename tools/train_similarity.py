@@ -1,15 +1,16 @@
-"""Train the listener-similarity model (src/echo_voice/similarity.py) on VoxSim.
-
-    python tools/train_similarity.py --voxsim cache/voxsim --audio cache/voxceleb1
-
-Uses VoxSim training pairs whose clips are in --audio (fetch them with
-`tools/validate.py voxsim-fetch`) and reports results on the VoxSim test split,
-which training never sees. Writes src/echo_voice/similarity_model.json: the
-fitted trees as plain JSON, checked to give the same predictions as
-scikit-learn, so the app needs no pickle and no scikit-learn.
-
-VoxSim ratings: Ahn et al., Interspeech 2024, CC BY 4.0.
-"""
+'''
+tools/train_similarity.py
+Author: maymeridian
+Description: Trains the listener-similarity model (src/echo_voice/similarity.py) on VoxSim.
+             - Usage: python tools/train_similarity.py --voxsim cache/voxsim --audio cache/voxceleb1
+             - Uses VoxSim training pairs whose clips are in --audio (fetch them with
+               `tools/validate.py voxsim-fetch`) and reports results on the VoxSim test split,
+               which training never sees.
+             - Writes src/echo_voice/similarity_model.json: the fitted trees as plain JSON,
+               checked to give the same predictions as scikit-learn, so the app needs no pickle
+               and no scikit-learn.
+             - VoxSim ratings: Ahn et al., Interspeech 2024, CC BY 4.0.
+'''
 
 from __future__ import annotations
 
@@ -31,10 +32,14 @@ from echo_voice import similarity
 from echo_voice.analysis import MAX_SECONDS, SR, AnalysisError, analyze, load
 
 OUT = Path(__file__).parents[1] / "src" / "echo_voice" / "similarity_model.json"
-MONOTONIC = [1, -1, -1, -1, -1]  # see similarity.FEATURES
+# Which way each feature may move the predicted rating (similarity.FEATURES): up with embedding
+# similarity, down with the pitch gap and each formant gap.
+MONOTONIC = [1, -1, -1, -1, -1]
 
 
 def _low_priority():
+    """Pool initializer: run workers below normal priority on Windows (0x4000 is
+    BELOW_NORMAL_PRIORITY_CLASS), so the machine stays usable."""
     if sys.platform == "win32":
         import ctypes
 
@@ -47,10 +52,16 @@ def _analyse(path: str):
         v = analyze(load(path)[: int((MAX_SECONDS - 1) * SR)])
     except AnalysisError:
         return path, None
-    return path, SimpleNamespace(embedding=v.embedding, median_f0=v.median_f0, median_formants=v.median_formants)
+    return path, SimpleNamespace(
+        embedding=v.embedding,
+        median_f0=v.median_f0,
+        median_formants=v.median_formants,
+    )
 
 
 def clip_features(paths: list[str], cache: Path, workers: int) -> dict:
+    """What each clip needs for similarity.features ({path: clip, None if it can't be
+    analysed}), from `cache` where it has them, saved back every 2000 clips analysed."""
     done = pickle.loads(cache.read_bytes()) if cache.exists() else {}
     todo = [p for p in paths if p not in done]
     if todo:
@@ -65,6 +76,8 @@ def clip_features(paths: list[str], cache: Path, workers: int) -> dict:
 
 
 def table(pairs, clips, audio: Path):
+    """The pairs whose clips were both analysed, as features X, ratings y and whether the two
+    clips are the same speaker."""
     X, y, same = [], [], []
     for p in pairs:
         a, b = clips.get(str(audio / p["a"])), clips.get(str(audio / p["b"]))
@@ -82,19 +95,22 @@ def export(model) -> dict:
     trees = []
     for (predictor,) in model._predictors:
         n = predictor.nodes
-        trees.append({
-            "feature": n["feature_idx"].tolist(),
-            "threshold": n["num_threshold"].tolist(),
-            "missing_left": n["missing_go_to_left"].astype(bool).tolist(),
-            "left": n["left"].tolist(),
-            "right": n["right"].tolist(),
-            "leaf": n["is_leaf"].astype(bool).tolist(),
-            "value": n["value"].tolist(),
-        })
+        trees.append(
+            {
+                "feature": n["feature_idx"].tolist(),
+                "threshold": n["num_threshold"].tolist(),
+                "missing_left": n["missing_go_to_left"].astype(bool).tolist(),
+                "left": n["left"].tolist(),
+                "right": n["right"].tolist(),
+                "leaf": n["is_leaf"].astype(bool).tolist(),
+                "value": n["value"].tolist(),
+            }
+        )
     return {"baseline": float(np.ravel(model._baseline_prediction)[0]), "trees": trees}
 
 
 def _speaker(clip: str) -> str:
+    """The VoxCeleb1 speaker a clip belongs to: the first part of its path."""
     return clip.split("/")[0]
 
 
@@ -109,70 +125,123 @@ def tune(train: list[dict], clips, audio: Path) -> dict:
 
     from sklearn.ensemble import HistGradientBoostingRegressor
 
+    # 1. The fitting and validation sets.
     speakers = sorted({_speaker(c) for p in train for c in (p["a"], p["b"])})
     held = set(random.Random(0).sample(speakers, len(speakers) // 10))
     fit = [p for p in train if _speaker(p["a"]) not in held and _speaker(p["b"]) not in held]
     val = [p for p in train if _speaker(p["a"]) in held and _speaker(p["b"]) in held]
     Xf, yf, _ = table(fit, clips, audio)
     Xv, yv, sv = table(val, clips, audio)
-    print(f"tuning: fit on {len(yf)} pairs, validate on {len(yv)} pairs from {len(held)} held-out speakers")
+    print(
+        f"tuning: fit on {len(yf)} pairs, "
+        f"validate on {len(yv)} pairs from {len(held)} held-out speakers"
+    )
+
+    # 2. Every combination of depth, iterations, learning rate and leaf size.
     best = None
-    for depth, iters, rate, leaf in itertools.product((2, 3, 4, 6), (200, 500), (0.03, 0.1), (20, 100)):
-        params = {"max_depth": depth, "max_iter": iters, "learning_rate": rate, "min_samples_leaf": leaf}
-        model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params).fit(Xf, yf)
+    grid = itertools.product((2, 3, 4, 6), (200, 500), (0.03, 0.1), (20, 100))
+    for depth, iters, rate, leaf in grid:
+        params = {
+            "max_depth": depth,
+            "max_iter": iters,
+            "learning_rate": rate,
+            "min_samples_leaf": leaf,
+        }
+        model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params)
+        model.fit(Xf, yf)
         pred = model.predict(Xv)
         # Both jobs count: ranking everyone, and ranking strangers.
         score = (spearmanr(pred, yv)[0] + spearmanr(pred[~sv], yv[~sv])[0]) / 2
         if best is None or score > best[0]:
             best = (score, params)
-    print(f"  best on validation: {best[1]} (mean of all-pairs and stranger Spearman {best[0]:.3f})")
+    print(
+        f"  best on validation: {best[1]} (mean of all-pairs and stranger Spearman {best[0]:.3f})"
+    )
     return best[1]
 
 
+# The --help text.
+HELP = """Train the listener-similarity model (src/echo_voice/similarity.py) on VoxSim.
+
+    python tools/train_similarity.py --voxsim cache/voxsim --audio cache/voxceleb1
+
+Uses VoxSim training pairs whose clips are in --audio (fetch them with
+`tools/validate.py voxsim-fetch`) and reports results on the VoxSim test split,
+which training never sees. Writes src/echo_voice/similarity_model.json: the
+fitted trees as plain JSON, checked to give the same predictions as
+scikit-learn, so the app needs no pickle and no scikit-learn.
+
+VoxSim ratings: Ahn et al., Interspeech 2024, CC BY 4.0.
+"""
+
+
 def main() -> None:
+    """Analyse the clips, tune and fit the trees, check the export, report and write it."""
     from sklearn.ensemble import HistGradientBoostingRegressor
 
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--voxsim", type=Path, required=True)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--analyse-only", action="store_true",
-                        help="just analyse the clips that are there (to warm the cache during a download)")
+    parser.add_argument(
+        "--analyse-only",
+        action="store_true",
+        help="just analyse the clips that are there (to warm the cache during a download)",
+    )
     args = parser.parse_args()
 
-    train = [p for p in voxsim_pairs(args.voxsim, "train")
-             if (args.audio / p["a"]).exists() and (args.audio / p["b"]).exists()]
+    # 1. The pairs, and every clip there is analysed.
+    train = [
+        p
+        for p in voxsim_pairs(args.voxsim, "train")
+        if (args.audio / p["a"]).exists() and (args.audio / p["b"]).exists()
+    ]
     test = voxsim_pairs(args.voxsim, "test")
     paths = sorted({str(args.audio / c) for p in train + test for c in (p["a"], p["b"])})
-    clips = clip_features([p for p in paths if Path(p).exists()], args.audio / "clips.pkl", args.workers)
+    present = [p for p in paths if Path(p).exists()]
+    clips = clip_features(present, args.audio / "clips.pkl", args.workers)
     if args.analyse_only:
         print(f"{len(clips)} clips analysed")
         return
+
+    # 2. Tune, then fit on every training pair.
     params = tune(train, clips, args.audio)
     Xtr, ytr, _ = table(train, clips, args.audio)
     Xte, yte, ste = table(test, clips, args.audio)
     print(f"training on {len(ytr)} VoxSim training pairs, testing on {len(yte)} test pairs")
+    model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params)
+    model.fit(Xtr, ytr)
 
-    model = HistGradientBoostingRegressor(monotonic_cst=MONOTONIC, random_state=0, **params).fit(Xtr, ytr)
+    # 3. The exported trees must predict what scikit-learn does.
     exported = export(model)
     ours = np.array([similarity.predict(x, exported) for x in Xtr])
     theirs = np.clip(model.predict(Xtr), 1, 6)
     assert np.max(np.abs(ours - theirs)) < 1e-9, "exported trees disagree with scikit-learn"
 
+    # 4. Results on the test split, against the embedding similarity alone.
     pred = np.array([similarity.predict(x, exported) for x in Xte])
     cos = Xte[:, 0]
     print("Pearson / Spearman with listeners on the VoxSim test split:")
     for label, v in (("embedding similarity alone", cos), ("listener-similarity model", pred)):
         cells = []
         for sel in (slice(None), ~ste, ste):
-            cells.append(f"{pearsonr(v[sel], yte[sel])[0]:.3f} / {spearmanr(v[sel], yte[sel])[0]:.3f}")
+            pearson = pearsonr(v[sel], yte[sel])[0]
+            spearman = spearmanr(v[sel], yte[sel])[0]
+            cells.append(f"{pearson:.3f} / {spearman:.3f}")
         print(f"  {label:28s} all {cells[0]}   strangers {cells[1]}   same speaker {cells[2]}")
+
+    # 5. The model the app uses.
     exported.update(
         source=f"VoxSim, {len(ytr)} training pairs (tools/train_similarity.py)",
         params=params,
         features=list(similarity.FEATURES),
-        test_spearman={"all": round(float(spearmanr(pred, yte)[0]), 3),
-                       "strangers": round(float(spearmanr(pred[~ste], yte[~ste])[0]), 3)},
+        test_spearman={
+            "all": round(float(spearmanr(pred, yte)[0]), 3),
+            "strangers": round(float(spearmanr(pred[~ste], yte[~ste])[0]), 3),
+        },
     )
     OUT.write_text(json.dumps(exported, separators=(",", ":")) + "\n", "utf-8")
     print(f"wrote {OUT} ({OUT.stat().st_size // 1024} KB, {len(exported['trees'])} trees)")

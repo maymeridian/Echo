@@ -1,30 +1,30 @@
-"""Long recordings: a YouTube video, a podcast, a compilation of a game
-character's voice lines. Echo scores one line at a time, so a long recording is
-transcribed once and split into lines to pick from.
-
-A background job (`python -m echo_voice.sources <folder>`, started by the app
-or by `echo-voice import`) does this:
-
-1. Downloads the audio of a link (YouTube and the other sites yt-dlp
-   supports), or takes the uploaded file.
-2. Decodes it to 16 kHz mono FLAC, the rate everything else works at.
-3. Transcribes it with Whisper (the same base.en as `line.py`), with voice
-   activity filtering and word timestamps.
-4. Splits the words into lines at sentence ends and pauses, and splits long
-   sentences at a comma or a pause near the middle.
-5. Measures each line: how much of it is voiced (a whisper has no pitch to
-   compare), how sure Whisper was of the words, and whether it is the
-   recording's main voice.
-
-The voice is separated from music only for the line that gets picked
-(`clean.py`). On the CPU separation runs at about 1.8x real time, which is
-too slow for hours of audio, while Whisper does 25 minutes in about 35 s.
-
-There is no background-noise flag. The level between words is a poor guide:
-on a 25-minute video of one soft-spoken speaker it called 136 of 200 lines noisy, but separating
-a sample of them took out ambience 8-12 dB under the voice, which the
-separation handles (clean.py: music as loud as the voice comes out clean).
-"""
+'''
+src/echo_voice/sources.py
+Author: maymeridian
+Description: Splits a long recording into lines to pick from, transcribing it once.
+             - Long recordings: a YouTube video, a podcast, a compilation of a game character's
+               voice lines. Echo scores one line at a time, so a long recording is transcribed
+               once and split into lines to pick from.
+             - A background job (`python -m echo_voice.sources <folder>`, started by the app or
+               by `echo-voice import`) does this:
+               1. Downloads the audio of a link (YouTube and the other sites yt-dlp supports), or
+                  takes the uploaded file.
+               2. Decodes it to 16 kHz mono FLAC, the rate everything else works at.
+               3. Transcribes it with Whisper (the same base.en as `line.py`), with voice
+                  activity filtering and word timestamps.
+               4. Splits the words into lines at sentence ends and pauses, and splits long
+                  sentences at a comma or a pause near the middle.
+               5. Measures each line: how much of it is voiced (a whisper has no pitch to
+                  compare), how sure Whisper was of the words, and whether it is the recording's
+                  main voice.
+             - The voice is separated from music only for the line that gets picked
+               (`clean.py`). On the CPU separation runs at about 1.8x real time, which is too
+               slow for hours of audio, while Whisper does 25 minutes in about 35 s.
+             - There is no background-noise flag. The level between words is a poor guide: on a
+               25-minute video of one soft-spoken speaker it called 136 of 200 lines noisy, but
+               separating a sample of them took out ambience 8-12 dB under the voice, which the
+               separation handles (clean.py: music as loud as the voice comes out clean).
+'''
 
 from __future__ import annotations
 
@@ -40,11 +40,12 @@ import soundfile as sf
 
 from .analysis import HOP, PITCH_CEILING, PITCH_FLOOR, SR
 
-MAX_HOURS = 4
-AUDIO = "audio.flac"
-LINES = "lines.json"
-META = "meta.json"
-LOCK = "job.lock"
+MAX_HOURS = 4  # the longest recording taken
+# The files in a recording's folder.
+AUDIO = "audio.flac"  # the whole recording, 16 kHz mono
+LINES = "lines.json"  # the lines found in it
+META = "meta.json"  # its name, link and the job's status
+LOCK = "job.lock"  # held by the job working on it, for as long as it runs
 
 # Line splitting.
 PAUSE = 0.7  # s of silence that always ends a line
@@ -68,18 +69,36 @@ EMBED_MIN_SECONDS = 1.5  # shorter lines get no speaker check
 SPEAKER_SIMILARITY = 0.4  # average cosine at which groups of lines stop merging into one speaker
 MIN_SPEAKER_SHARE = 0.05  # a smaller group isn't called a speaker
 
+# Suggestions.
+TYPICAL_PITCH = 4.0  # semitones from the voice's median that a suggested line may sit
+
 
 class SourceError(RuntimeError):
     """The recording can't be used; the message is safe to show the user."""
 
 
-# ---------- getting the audio ----------
+# --- GETTING THE AUDIO ---
 
 
 MAX_DOWNLOAD_BYTES = 2 * 1024**3  # a long video's audio is a few hundred MB
+# YouTube needs a JavaScript runtime to unlock its formats; yt-dlp is told to use any of
+# these that's installed (its default is Deno only).
+JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
+
+
+def _yt_dlp():
+    """The yt_dlp module; a SourceError saying how to install it if it's missing."""
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise SourceError(
+            'Links need yt-dlp: run  .venv\\Scripts\\pip install "yt-dlp[default]"'
+        ) from exc
+    return yt_dlp
 
 
 def is_link(text: str) -> bool:
+    """Is this a web address (http or https, no spaces)?"""
     return bool(re.match(r"^https?://\S+$", text.strip()))
 
 
@@ -90,12 +109,10 @@ def download(url: str, folder: Path, progress=lambda share: None) -> tuple[Path,
     YouTube changes often and old yt-dlp versions stop working; when links
     start failing, update it:  .venv\\Scripts\\pip install -U "yt-dlp[default]"
     """
-    try:
-        import yt_dlp
-    except ImportError as exc:
-        raise SourceError('Links need yt-dlp: run  .venv\\Scripts\\pip install "yt-dlp[default]"') from exc
+    yt_dlp = _yt_dlp()
 
     def hook(d):
+        """Pass yt-dlp's progress on as a share of the file downloaded."""
         total = d.get("total_bytes") or d.get("total_bytes_estimate")
         if d.get("status") == "downloading" and total:
             progress(min(1.0, d.get("downloaded_bytes", 0) / total))
@@ -104,9 +121,7 @@ def download(url: str, folder: Path, progress=lambda share: None) -> tuple[Path,
         "format": "bestaudio/best",
         "outtmpl": str(folder / "download.%(ext)s"),
         "noplaylist": True,
-        # YouTube needs a JavaScript runtime to unlock its formats; use any
-        # that's installed (yt-dlp's default is Deno only).
-        "js_runtimes": {name: {} for name in ("deno", "node", "bun", "quickjs")},
+        "js_runtimes": {name: {} for name in JS_RUNTIMES},
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -115,14 +130,19 @@ def download(url: str, folder: Path, progress=lambda share: None) -> tuple[Path,
     }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
+            # 1. Look at the page first: one video, not live, not too long.
             info = ydl.extract_info(url, download=False)
             if info.get("_type") == "playlist":
                 raise SourceError("That's a playlist; paste the link of one video.")
-            if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming", "post_live"):
+            live = info.get("live_status") in ("is_live", "is_upcoming", "post_live")
+            if info.get("is_live") or live:
                 # A stream has no end to wait for, and its length isn't known.
-                raise SourceError("That's a live stream; paste a link to a video once it's been published.")
+                raise SourceError(
+                    "That's a live stream; paste a link to a video once it's been published."
+                )
             if (info.get("duration") or 0) > MAX_HOURS * 3600:
                 raise SourceError(f"That video is over {MAX_HOURS} hours long.")
+            # 2. Download it.
             info = ydl.process_ie_result(info, download=True)
     except yt_dlp.utils.DownloadError as exc:
         message = re.sub(r"^ERROR:\s*", "", str(exc)).strip()
@@ -136,15 +156,12 @@ def download(url: str, folder: Path, progress=lambda share: None) -> tuple[Path,
 
 def video_info(url: str) -> tuple[str, str | None]:
     """A video page's title and channel, without downloading it."""
-    try:
-        import yt_dlp
-    except ImportError as exc:
-        raise SourceError('Links need yt-dlp: run  .venv\\Scripts\\pip install "yt-dlp[default]"') from exc
+    yt_dlp = _yt_dlp()
     options = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "js_runtimes": {name: {} for name in ("deno", "node", "bun", "quickjs")},
+        "js_runtimes": {name: {} for name in JS_RUNTIMES},
     }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -193,6 +210,7 @@ def decode(path: Path, out: Path, progress=lambda share: None) -> float:
         with sf.SoundFile(out, "w", SR, 1, subtype="PCM_16", format="FLAC") as f:
 
             def write(frames):
+                """Average the frames' channels and append them to the FLAC file."""
                 nonlocal written
                 for frame in frames:
                     block = frame.to_ndarray().reshape(frame.layout.nb_channels, -1).mean(axis=0)
@@ -204,9 +222,9 @@ def decode(path: Path, out: Path, progress=lambda share: None) -> float:
                     write(resampler.resample(frame))
                     if total and frame.time is not None:
                         progress(min(1.0, frame.time / total))
-            except av.error.FFmpegError:
+            except av.error.FFmpegError as exc:
                 if written < SR:  # a damaged tail is fine; a file that won't start isn't
-                    raise SourceError("Couldn't read that file as audio or video.")
+                    raise SourceError("Couldn't read that file as audio or video.") from exc
             write(resampler.resample(None))
     if written < SR:
         raise SourceError("That recording is under a second long.")
@@ -215,7 +233,16 @@ def decode(path: Path, out: Path, progress=lambda share: None) -> float:
     return written / SR
 
 
-# ---------- words and lines ----------
+def read_audio(folder: Path, start: float = 0.0, end: float | None = None) -> np.ndarray:
+    """The recording's samples from `start` to `end` in seconds (to its end if None)."""
+    with sf.SoundFile(folder / AUDIO) as f:
+        a = max(0, int(start * SR))
+        f.seek(min(a, f.frames))
+        count = -1 if end is None else max(0, int(end * SR) - a)
+        return f.read(count, dtype="float32")
+
+
+# --- WORDS AND LINES ---
 
 
 def transcribe_words(y: np.ndarray, progress=lambda share: None) -> list[dict]:
@@ -226,8 +253,13 @@ def transcribe_words(y: np.ndarray, progress=lambda share: None) -> list[dict]:
 
     model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=4)
     segments, _ = model.transcribe(
-        np.ascontiguousarray(y, dtype=np.float32), language="en", beam_size=5,
-        vad_filter=True, condition_on_previous_text=False, word_timestamps=True, temperature=TEMPERATURE,
+        np.ascontiguousarray(y, dtype=np.float32),
+        language="en",
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        word_timestamps=True,
+        temperature=TEMPERATURE,
     )
     words, duration = [], len(y) / SR
     for segment in segments:
@@ -235,7 +267,14 @@ def transcribe_words(y: np.ndarray, progress=lambda share: None) -> list[dict]:
         for w in segment.words or []:
             text = w.word.strip()
             if normalise(text) and w.end > w.start:
-                words.append({"start": float(w.start), "end": float(w.end), "text": text, "p": float(w.probability)})
+                words.append(
+                    {
+                        "start": float(w.start),
+                        "end": float(w.end),
+                        "text": text,
+                        "p": float(w.probability),
+                    }
+                )
     return glue(words)
 
 
@@ -247,7 +286,7 @@ def split_lines(words: list[dict]) -> list[list[dict]]:
             gap = w["start"] - current[-1]["end"]
             ended = SENTENCE_END.search(current[-1]["text"])
             # A sentence of one or two words ("Ready?") runs on into the next
-            # one when there's barely a breath between them.
+            # one when there's barely a breath (under 0.25 s) between them.
             if gap >= PAUSE or (ended and (len(current) >= 3 or gap >= 0.25)):
                 lines.append(current)
                 current = []
@@ -271,6 +310,9 @@ def _shorten(line: list[dict]) -> list[list[dict]]:
         right = line[-1]["end"] - line[i]["start"]
         if min(left, right) < MIN_PIECE:
             continue
+        # The cost of splitting before word i: how far from the middle, as a share of the
+        # line, less 0.4 after a sentence end or 0.3 after a clause end, and less half the
+        # pause (counted up to 0.6 s).
         gap = line[i]["start"] - line[i - 1]["end"]
         prev = line[i - 1]["text"]
         mark = 0.4 if SENTENCE_END.search(prev) else 0.3 if CLAUSE_END.search(prev) else 0.0
@@ -297,7 +339,7 @@ def spans(lines: list[list[dict]], duration: float) -> list[tuple[float, float]]
     return out
 
 
-# ---------- measuring lines ----------
+# --- MEASURING LINES ---
 
 
 def measure(y: np.ndarray, lines: list[list[dict]]) -> list[dict]:
@@ -308,7 +350,11 @@ def measure(y: np.ndarray, lines: list[list[dict]]) -> list[dict]:
     for line, (start, end) in zip(lines, spans(lines, len(y) / SR)):
         clip = y[int(start * SR) : int(end * SR)]
         snd = parselmouth.Sound(clip.astype(np.float64), sampling_frequency=SR)
-        pitch = snd.to_pitch_ac(time_step=HOP / SR, pitch_floor=PITCH_FLOOR, pitch_ceiling=PITCH_CEILING)
+        pitch = snd.to_pitch_ac(
+            time_step=HOP / SR,
+            pitch_floor=PITCH_FLOOR,
+            pitch_ceiling=PITCH_CEILING,
+        )
         f0 = pitch.selected_array["frequency"]
         t = start + pitch.xs()
         # Voicing is counted only inside words, so pauses don't make a line
@@ -324,6 +370,7 @@ def measure(y: np.ndarray, lines: list[list[dict]]) -> list[dict]:
                 "text": " ".join(w["text"] for w in line),
                 "confidence": round(float(np.mean([w["p"] for w in line])), 2),
                 "voiced": round(float(voiced.sum() / spoken.sum()), 2) if spoken.any() else 0.0,
+                # A pitch needs at least 20 voiced frames (0.2 s).
                 "pitch": round(float(np.median(f0[voiced]))) if voiced.sum() >= 20 else None,
                 "same_voice": None,
             }
@@ -350,7 +397,8 @@ def _main_voice(rows: list[dict], emb: dict[int, np.ndarray]) -> None:
 
     The main voice's centre is the average embedding of the half of the lines
     that agree best with all the others, so a few lines by someone else, or a
-    song in the background, don't pull it."""
+    song in the background, don't pull it. With fewer than 4 lines to judge,
+    no line is given a reading."""
     keep = sorted(emb)
     if len(keep) < 4:
         return
@@ -362,7 +410,11 @@ def _main_voice(rows: list[dict], emb: dict[int, np.ndarray]) -> None:
         rows[i]["same_voice"] = round(float(s), 2)
 
 
-def find_speakers(rows: list[dict], emb: dict[int, np.ndarray], threshold: float | None = None) -> list[dict]:
+def find_speakers(
+    rows: list[dict],
+    emb: dict[int, np.ndarray],
+    threshold: float | None = None,
+) -> list[dict]:
     """Who speaks in the recording: each line's `speaker` (0 is the one with
     the most speech; None for a line too short to judge or not clearly anyone's),
     and one summary per speaker.
@@ -372,7 +424,7 @@ def find_speakers(rows: list[dict], emb: dict[int, np.ndarray], threshold: float
     least `threshold` (SPEAKER_SIMILARITY; tools/validate.py speakers). A group
     of fewer than 3 lines, or under 5% of them, is too small to call a
     speaker: its lines join the nearest speaker if they're that close to it,
-    and are left unsure if not."""
+    and are left unsure if not. Fewer than 4 lines are taken as one speaker."""
     from scipy.cluster.hierarchy import fcluster, linkage
 
     threshold = SPEAKER_SIMILARITY if threshold is None else threshold
@@ -381,19 +433,30 @@ def find_speakers(rows: list[dict], emb: dict[int, np.ndarray], threshold: float
     keep = sorted(emb)
     if not keep:
         return []
+    # 1. Group the lines.
     vectors = np.stack([emb[i] for i in keep])
     if len(keep) < 4:
         labels = np.ones(len(keep), dtype=int)
     else:
-        labels = fcluster(linkage(vectors, method="average", metric="cosine"), t=1 - threshold, criterion="distance")
+        labels = fcluster(
+            linkage(vectors, method="average", metric="cosine"),
+            t=1 - threshold,
+            criterion="distance",
+        )
+    # 2. The groups big enough to be speakers, the one with the most speech first.
     seconds = np.array([rows[i]["end"] - rows[i]["start"] for i in keep])
     groups = {label: np.flatnonzero(labels == label) for label in np.unique(labels)}
-    big = [g for g in groups.values() if len(g) >= min(3, len(keep)) and len(g) >= MIN_SPEAKER_SHARE * len(keep)]
+    big = [
+        g
+        for g in groups.values()
+        if len(g) >= min(3, len(keep)) and len(g) >= MIN_SPEAKER_SHARE * len(keep)
+    ]
     big.sort(key=lambda g: -seconds[g].sum())
     centres = []
     for g in big:
         c = vectors[g].mean(axis=0)
         centres.append(c / np.linalg.norm(c))
+    # 3. Each line's speaker: its group's, else the nearest speaker if it's close enough.
     member = {int(j): k for k, g in enumerate(big) for j in g}
     for j, i in enumerate(keep):
         if j in member:
@@ -408,18 +471,25 @@ def find_speakers(rows: list[dict], emb: dict[int, np.ndarray], threshold: float
 def speaker_summary(rows: list[dict]) -> list[dict]:
     """One entry per speaker found: how many lines and seconds, typical pitch,
     and a sample line to play (clear, near 3.5 s long)."""
+
+    def clarity(i: int) -> float:
+        """How good line i is to play as a sample: voiced, clear, and near 3.5 s long."""
+        seconds = rows[i]["end"] - rows[i]["start"]
+        return rows[i]["voiced"] + rows[i]["confidence"] - 0.2 * abs(seconds - 3.5)
+
     out = []
     for k in sorted({r["speaker"] for r in rows if r.get("speaker") is not None}):
         mine = [i for i, r in enumerate(rows) if r.get("speaker") == k]
         pitches = [rows[i]["pitch"] for i in mine if rows[i]["pitch"]]
-        sample = max(mine, key=lambda i: rows[i]["voiced"] + rows[i]["confidence"] - 0.2 * abs(rows[i]["end"] - rows[i]["start"] - 3.5))
-        out.append({
-            "speaker": k,
-            "lines": len(mine),
-            "seconds": round(sum(rows[i]["end"] - rows[i]["start"] for i in mine), 1),
-            "pitch": round(float(np.median(pitches))) if pitches else None,
-            "sample": sample,
-        })
+        out.append(
+            {
+                "speaker": k,
+                "lines": len(mine),
+                "seconds": round(sum(rows[i]["end"] - rows[i]["start"] for i in mine), 1),
+                "pitch": round(float(np.median(pitches))) if pitches else None,
+                "sample": max(mine, key=clarity),
+            }
+        )
     return out
 
 
@@ -435,7 +505,16 @@ def flags(row: dict) -> list[str]:
     return out
 
 
-TYPICAL_PITCH = 4.0  # semitones from the voice's median that a suggested line may sit
+def find_lines(y: np.ndarray, progress=lambda share: None) -> list[dict]:
+    """A whole recording's lines, measured and flagged: transcribed, split and measured."""
+    words = transcribe_words(y, progress)
+    rows = measure(y, split_lines(words))
+    for row in rows:
+        row["flags"] = flags(row)
+    return rows
+
+
+# --- SUGGESTING LINES ---
 
 
 def line_flags(row: dict, speaker: int = 0) -> list[str]:
@@ -458,22 +537,28 @@ def rank(rows: list[dict], speaker: int = 0) -> list[tuple[float, int]]:
     head), clearly voiced, sure of the words, most like the recording's main
     voice, a whole sentence rather than a piece of one (its own start and
     ending make its tune), and in the voice's usual range: within 4 semitones
-    of its median pitch. A line far outside it is usually creaky voice or a pitch tracker
-    off by an octave, and makes a poor target either way. On a 25-minute
-    video of one soft-spoken speaker that rules out 19 of 185 untagged lines,
-    including two of the five it suggested before, both at 98-99 Hz against a
-    typical 191."""
+    of its median pitch. A line far outside it is usually creaky voice or a
+    pitch tracker off by an octave, and makes a poor target either way. On a
+    25-minute video of one soft-spoken speaker that rules out 19 of 185
+    untagged lines, including two of the five it suggested before, both at
+    98-99 Hz against a typical 191."""
     clean = [r["pitch"] for r in rows if not line_flags(r, speaker) and r["pitch"]]
     typical = float(np.median(clean)) if len(clean) >= 5 else None
     ranked = []
     for i, r in enumerate(rows):
+        # 1. Leave out flagged lines, ones under three words or outside 1.5 to 8 s, and ones
+        #    outside the voice's usual range.
         seconds = r["end"] - r["start"]
         if line_flags(r, speaker) or len(r["text"].split()) < 3 or not 1.5 <= seconds <= 8:
             continue
         if typical and (not r["pitch"] or abs(12 * np.log2(r["pitch"] / typical)) > TYPICAL_PITCH):
             continue
+        # 2. Fit: length, voicing, confidence and likeness to the main voice (0.5 when that
+        #    isn't known), each up to 1, then 0.3 for ending a sentence and 0.1 for starting
+        #    with a capital.
         length = 1 - min(abs(seconds - 3.5) / 3.5, 1)
-        fit = length + r["voiced"] + r["confidence"] + (r["same_voice"] if r["same_voice"] is not None else 0.5)
+        same = r["same_voice"] if r["same_voice"] is not None else 0.5
+        fit = length + r["voiced"] + r["confidence"] + same
         text = r["text"].strip()
         fit += 0.3 * bool(SENTENCE_END.search(text)) + 0.1 * text[:1].isupper()  # a whole sentence
         ranked.append((round(fit, 3), i))
@@ -489,12 +574,14 @@ def summary(rows: list[dict]) -> dict | None:
     """The voice at a glance, from its untagged lines: typical pitch and range
     (10th to 90th percentile of the lines' medians), pace in words a second,
     and how much of the speech is voiced. Read speech (CMU ARCTIC) is voiced
-    on 53-60% of its word frames; a soft, breathy voice on about 45%."""
+    on 53-60% of its word frames; a soft, breathy voice on about 45%. With
+    fewer than 3 pitches there is no pitch or range."""
     good = [r for r in rows if not r["flags"]] or rows
     pitches = [r["pitch"] for r in good if r["pitch"]]
     if not good:
         return None
     words = sum(len(r["text"].split()) for r in good)
+    # Speech time: each line's span less its lead-in and tail, at least 0.3 s a line.
     seconds = sum(max(0.3, r["end"] - r["start"] - LEAD - TAIL) for r in good)
     out = {
         "pitch": None,
@@ -509,29 +596,14 @@ def summary(rows: list[dict]) -> dict | None:
     return out
 
 
-def find_lines(y: np.ndarray, progress=lambda share: None) -> list[dict]:
-    words = transcribe_words(y, progress)
-    rows = measure(y, split_lines(words))
-    for row in rows:
-        row["flags"] = flags(row)
-    return rows
-
-
-def read_audio(folder: Path, start: float = 0.0, end: float | None = None) -> np.ndarray:
-    with sf.SoundFile(folder / AUDIO) as f:
-        a = max(0, int(start * SR))
-        f.seek(min(a, f.frames))
-        count = -1 if end is None else max(0, int(end * SR) - a)
-        return f.read(count, dtype="float32")
-
-
-# ---------- the job ----------
+# --- THE JOB ---
 
 
 def _lock(folder: Path):
     """Hold the folder's lock for as long as this process runs; the OS lets go
     when the process ends, however it ends. None if another process has it."""
-    handle = open(folder / LOCK, "a+b")  # noqa: SIM115 (kept open on purpose: the lock lasts as long as the handle)
+    # Kept open on purpose: the lock lasts as long as the handle.
+    handle = open(folder / LOCK, "a+b")  # noqa: SIM115
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -549,6 +621,7 @@ def _lock(folder: Path):
 
 
 def job_running(folder: Path) -> bool:
+    """Is a job (from this app or another process) working on the folder now?"""
     handle = _lock(folder)
     if handle is None:
         return True
@@ -557,12 +630,14 @@ def job_running(folder: Path) -> bool:
 
 
 def _write_meta(folder: Path, meta: dict) -> None:
+    """Write the recording's meta.json whole."""
     _write_whole(folder / META, json.dumps(meta, indent=2))
 
 
 def _write_whole(path: Path, text: str) -> None:
     """Write a file whole or not at all: a job can be stopped at any moment
-    (the computer shuts down), and half a lines.json would fail every retry."""
+    (the computer shuts down), and half a lines.json would fail every retry.
+    The swap is tried for up to a second (20 tries 50 ms apart)."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, "utf-8")
     for attempt in range(20):
@@ -590,35 +665,43 @@ def _name_voice(folder: Path, meta: dict) -> None:
             return
         if not voice.get("name_pending"):
             return
-        name = meta.get("channel") or meta.get("name")
+        channel = meta.get("channel")
+        name = channel or meta.get("name")
         if not name:
             return
-        existing = next(
-            (v for v in store.list_voices() if v["name"] == name and v["id"] != voice["id"] and meta.get("channel")),
-            None,
-        )
+        voices = store.list_voices()
+        same = (v for v in voices if v["name"] == name and v["id"] != voice["id"] and channel)
+        existing = next(same, None)
         if existing:
             store.update_voice(voice["id"], merged_into=existing["id"], name_pending=False)
             meta["voice_id"] = existing["id"]
             meta["joined"] = True  # pick some of its lines even if the voice has five already
         else:
             store.update_voice(
-                voice["id"], name=name, name_pending=False, named_from="channel" if meta.get("channel") else "title"
+                voice["id"],
+                name=name,
+                name_pending=False,
+                named_from="channel" if channel else "title",
             )
     elif meta.get("name"):
         meta["voice_id"] = store.voice_named(meta["name"])["id"]
 
 
 def run(folder: Path, report=lambda step, share: None) -> int:
-    """Process one source folder, keeping meta.json's status up to date."""
+    """Process one source folder, keeping meta.json's status up to date.
+    `report(step, share)` hears each status written. Returns 0 when done, or
+    when another process is already on it, and 1 if the recording can't be
+    used (SourceError); any other error is raised once it's recorded."""
     folder = Path(folder)
     lock = _lock(folder)
     if lock is None:
         return 0  # another process is already on it
     meta = json.loads((folder / META).read_text("utf-8"))
-    last = [0.0]
+    last = [0.0]  # when the status was last written
 
     def status(step: str, share: float | None = None, force: bool = False):
+        """Write the job's step and how far through it is (0 to 1), at most
+        once a second unless `force`."""
         now = time.monotonic()
         if not force and now - last[0] < 1.0:
             return
@@ -628,11 +711,16 @@ def run(folder: Path, report=lambda step, share: None) -> int:
         report(step, share)
 
     try:
+        # 1. The audio, decoded once to 16 kHz mono FLAC.
         if not (folder / AUDIO).is_file():
             owned = True  # a download or upload copy, deleted once decoded
             if meta.get("link"):
                 status("downloading", 0.0, force=True)
-                path, title, channel = download(meta["link"], folder, lambda s: status("downloading", s))
+                path, title, channel = download(
+                    meta["link"],
+                    folder,
+                    lambda s: status("downloading", s),
+                )
                 if not meta.get("name"):
                     meta["name"] = clean_title(title)
                 meta["title"] = title
@@ -650,6 +738,7 @@ def run(folder: Path, report=lambda step, share: None) -> int:
                 path.unlink()
         y = read_audio(folder)
         meta["duration"] = round(len(y) / SR, 2)
+        # 2. The lines.
         rows = None
         if (folder / LINES).is_file():
             # Found before (the job stopped part-way, or the recording is
@@ -663,43 +752,55 @@ def run(folder: Path, report=lambda step, share: None) -> int:
             status("transcribing", 0.0, force=True)
             rows = find_lines(y, lambda s: status("transcribing", s))
             _write_whole(folder / LINES, json.dumps(rows))
+        # 3. Who speaks in each line.
         if any("speaker" not in r for r in rows):
             status("speakers", None, force=True)
             find_speakers(rows, embed_lines(y, rows))
             _write_whole(folder / LINES, json.dumps(rows))
-        meta.update(count=len(rows), good=sum(1 for r in rows if not line_flags(r, meta.get("speaker") or 0)), error=None)
+        # 4. What was found, and the voice it is for.
+        meta.update(
+            count=len(rows),
+            good=sum(1 for r in rows if not line_flags(r, meta.get("speaker") or 0)),
+            error=None,
+        )
         meta["speakers"] = len(speaker_summary(rows))
         if not meta.get("voice_id"):
             _name_voice(folder, meta)
+        # 5. Give the voice its best lines, so practice can start at once.
         if meta.get("voice_id"):
-            # Give the voice its best lines, so practice can start at once.
             status("picking", 0.0, force=True)
             try:
                 from . import autopick
                 from .store import Store
 
                 store = Store(folder.parent.parent)
+                voice_id = meta["voice_id"]
                 want = None
-                if meta.pop("joined", False):  # a new video for a voice that has lines: some of its own
-                    have = sum(1 for t in store.list_targets() if t.get("voice_id") == meta["voice_id"])
+                # A new video for a voice that has lines: 3 of its own on top of them.
+                if meta.pop("joined", False):
+                    have = sum(1 for t in store.list_targets() if t.get("voice_id") == voice_id)
                     want = max(autopick.CHECK_LINES, have + 3)
 
                 def picked(done, total):
-                    # Picking notes the lines it had to skip in this file. Keep them: `meta` is written whole.
+                    """Report picking's progress, keeping the lines it skipped."""
+                    # Picking notes the lines it had to skip in this file. Keep them:
+                    # `meta` is written whole.
                     skipped = store.source_meta(folder.name).get("skipped")
                     if skipped:
                         meta["skipped"] = skipped
                     status("picking", done / total)
 
-                autopick.pick(store, meta["voice_id"], want or autopick.CHECK_LINES, report=picked)
-            except Exception as exc:  # noqa: BLE001 (the lines are found either way; picking is a bonus)
+                autopick.pick(store, voice_id, want or autopick.CHECK_LINES, report=picked)
+            except Exception as exc:  # noqa: BLE001
+                # The lines are found either way; picking is a bonus.
                 print(f"Couldn't pick lines: {exc!r}", file=sys.stderr, flush=True)
         status("ready", None, force=True)
         return 0
     except Exception as exc:  # the job must always leave a status the page can show
-        meta["error"] = str(exc) if isinstance(exc, SourceError) else f"Something went wrong: {exc!r}"
+        known = isinstance(exc, SourceError)
+        meta["error"] = str(exc) if known else f"Something went wrong: {exc!r}"
         status("failed", None, force=True)
-        if not isinstance(exc, SourceError):
+        if not known:
             raise
         return 1
     finally:
@@ -710,5 +811,6 @@ if __name__ == "__main__":
     if sys.platform == "win32":  # stay out of the way of games and other work
         import ctypes
 
+        # 0x4000 is BELOW_NORMAL_PRIORITY_CLASS.
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
     sys.exit(run(Path(sys.argv[1])))

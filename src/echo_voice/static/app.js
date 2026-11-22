@@ -1,24 +1,32 @@
+/*
+src/echo_voice/static/app.js
+Author: maymeridian
+Description: The page: records takes, plays clips, draws the results and talks to the local server.
+             - The browser's jobs are capturing the microphone, playing clips, drawing, and
+               turning any clip into 16 kHz mono WAV.
+             - Everything that is scored is measured on the server. The browser measures only
+               what it shows while you speak (your pitch, pitch.js, and your resonance,
+               formants.js) and hears when you have finished, so a take stops by itself
+               (ending.js).
+             - Pages: home, a voice (its score, lines and recordings), a recording (its lines to
+               pick from), a line (listen, record, improve), and a voice check's result.
+             - A voice check walks through the voice's ticked lines on the line page, one take
+               each.
+*/
+
 import { Ending, spoken, waitFor } from "./ending.js";
 import { Listener, alignedShift, shift, track, typical } from "./formants.js";
 import { yin } from "./pitch.js";
 
-// The browser's jobs are capturing the microphone, playing clips, drawing, and
-// turning any clip into 16 kHz mono WAV. Everything that is scored is measured
-// on the server; the browser measures only what it shows while you speak (your
-// pitch, pitch.js, and your resonance, formants.js) and hears when you have
-// finished, so a take stops by itself (ending.js).
-//
-// The pages: home, a voice (its score, lines and recordings), a recording (its
-// lines to pick from), a line (listen, record, improve), and a voice check's
-// result. A voice check walks through the voice's ticked lines on the line
-// page, one take each.
+// --- SETUP ---
 
-const SR = 16000;
-const MAX_SECONDS = 30;
+const SR = 16000; // Hz: the rate every clip is sent to the server at, mono
+const MAX_SECONDS = 30; // the longest take, recorded clip or trimmed line
 const MAX_TRIM_SECONDS = 600; // longer clips can be opened, then trimmed to the line
 const LONG_SECONDS = 60; // uploads longer than this are split into lines on the server
 const CONTEXT_SECONDS = 1.5; // shown either side of a line from a recording, to adjust its ends
-const WARMUP_SECONDS = 120;
+const WARMUP_SECONDS = 120; // a warm-up stops by itself after this long
+// The parts of a take's score, as [key, label], in the order they are shown.
 const PARTS = [
   ["pitch", "Pitch"],
   ["melody", "Melody"],
@@ -26,18 +34,32 @@ const PARTS = [
   ["articulation", "Articulation"],
   ["rhythm", "Rhythm"],
 ];
-const ALL_PARTS = [["identity", "Voice"], ...PARTS];
-const WORD_PARTS = ["pitch", "melody", "resonance", "articulation"];
+const ALL_PARTS = [["identity", "Voice"], ...PARTS]; // with the overall likeness first
+const WORD_PARTS = ["pitch", "melody", "resonance", "articulation"]; // the parts scored per word
+const SVG_NS = "http://www.w3.org/2000/svg"; // the namespace SVG elements are made in
+
+// The first element matching a CSS selector.
 const $ = (selector) => document.querySelector(selector);
 
+/** A new element with these properties and children (null and undefined ones are skipped). */
 function el(tag, props = {}, ...children) {
   const node = Object.assign(document.createElement(tag), props);
   node.append(...children.filter((c) => c != null));
   return node;
 }
 
+/** A new SVG element with these attributes. */
+function svgEl(tag, attrs) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+}
+
+// --- STORAGE ---
+
 // Per-viewer conveniences only; the page works the same without storage.
 const stored = {
+  /** The stored value, or null when there is none or storage is blocked. */
   get(key) {
     try {
       return localStorage.getItem(key);
@@ -45,6 +67,7 @@ const stored = {
       return null;
     }
   },
+  /** Store a value; null or "" removes the key. Fails silently when storage is blocked. */
   set(key, value) {
     try {
       if (value == null || value === "") localStorage.removeItem(key);
@@ -52,6 +75,8 @@ const stored = {
     } catch {}
   },
 };
+
+// --- STATE ---
 
 let voices = []; // every voice, as listed
 let voice = null; // the open voice, with its lines, recordings and checks
@@ -67,28 +92,35 @@ let session = null; // { kind: "take" | "target" | "warmup", recorder, timer, ta
 // attempt (which can take seconds: the browser may ask first), and while a take
 // or attempt is being scored, nothing else may start: a second start would open
 // a second recorder that nothing stops, and a stray take would be scored too.
-let opening = null;
-let measuring = false;
+let opening = null; // what the microphone is opening for, or null
+let measuring = false; // a take or a trainer attempt is being scored
 let page = 0; // goes up whenever a page is left, so work started on it can tell
 let live = null; // { points: [{t, f0, f}], started, onset, done, listener, target }
-let targetTrack = null; // the open line's F1-F3 through time, as the browser reads them: { id, ceiling, frames }
-let check = null; // a voice check under way: { voiceId, voiceName, lines, index, results }
-let selectedWord = null;
-let speed = 1;
+// The open line's F1-F3 through time, as the browser reads them: { id, ceiling, frames }.
+let targetTrack = null;
+let check = null; // a voice check under way: { voiceId, lines, index, results }
+let selectedWord = null; // the index of the word picked on the line page
+let speed = 1; // the playback rate of the target and the take
 let playhead = null; // where playback is, on the target's timeline
 
+// --- PAGE HELPERS ---
+
+// The page's views, by element id; one shows at a time.
 const VIEWS = ["empty", "home", "voice", "trim", "source", "practice", "train", "check-result"];
 
+/** Show one view, hide the rest, and scroll to the top. */
 function show(view) {
   for (const id of VIEWS) $(`#${id}`).hidden = id !== view;
   window.scrollTo(0, 0);
 }
 
+/** Put a message in the status line, red when it is an error. */
 function setStatus(message, isError = false) {
   $("#status").textContent = message;
   $("#status").classList.toggle("error", isError);
 }
 
+// The note names, from C, by semitone.
 const NOTES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
 
 // The nearest note name, such as G3 for 196 Hz.
@@ -97,51 +129,80 @@ function noteName(hz) {
   return `${NOTES[((n % 12) + 12) % 12]}${Math.floor(n / 12) - 1}`;
 }
 
+// A part's label, such as "Pitch" for "pitch"; the key itself when it isn't a known part.
 const partLabel = (key) => ALL_PARTS.find(([k]) => k === key)?.[1] ?? key;
+// A line's words, or its name when no words were recognised.
 const lineText = (t) => (t.words?.length ? t.words.join(" ") : t.name);
+// "1 line", "2 lines".
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+// The listed voice with this id.
 const voiceOf = (id) => voices.find((v) => v.id === id);
+// A word without the punctuation around it, for labels and quotes.
+const bareWord = (text) => text.replace(/[.,!?;:"“”]+/g, "");
 
+/** A short local date and time, such as "Mar 4, 3:05 PM". */
 function when(iso) {
-  return new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  return new Date(iso).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
-// ---------- server ----------
+// --- SERVER ---
 
 // What went wrong, from an error response: the server's `detail` (a list of
 // problems when FastAPI itself turned the request down), else its status.
 async function problem(res) {
   try {
     const { detail } = await res.json();
-    if (Array.isArray(detail)) return detail.map((d) => d?.msg ?? String(d)).join("; ") || res.statusText;
+    if (Array.isArray(detail)) {
+      return detail.map((d) => d?.msg ?? String(d)).join("; ") || res.statusText;
+    }
     return detail || res.statusText;
   } catch {
     return res.statusText || `Error ${res.status}`;
   }
 }
 
+/** Fetch from the server: its JSON answer, or null for 204; throws what went wrong. */
 async function api(path, options) {
   const res = await fetch(path, options);
   if (!res.ok) throw new Error(await problem(res));
   return res.status === 204 ? null : res.json();
 }
 
+// Send a JSON body with this method.
 const send = (path, method, body) =>
-  api(path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  api(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
+// POST a WAV blob.
 const postWav = (path, wav) =>
   api(path, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: wav });
 
+/** Reload every voice, line and recording, and redraw the sidebar. */
 async function refreshLists() {
-  [voices, targets, sources] = await Promise.all([api("/api/voices"), api("/api/targets"), api("/api/sources")]);
+  [voices, targets, sources] = await Promise.all([
+    api("/api/voices"),
+    api("/api/targets"),
+    api("/api/sources"),
+  ]);
   renderSidebar();
 }
 
-// ---------- audio ----------
+// --- AUDIO ---
 
+/** 16-bit PCM WAV at SR, mono, from samples in -1..1 (clipped beyond that). */
 function encodeWav(samples) {
-  const view = new DataView(new ArrayBuffer(44 + samples.length * 2));
-  const text = (offset, s) => [...s].forEach((ch, i) => view.setUint8(offset + i, ch.charCodeAt(0)));
+  const view = new DataView(new ArrayBuffer(44 + samples.length * 2)); // a 44-byte header
+  // Write an ASCII tag at a byte offset.
+  const text = (offset, s) =>
+    [...s].forEach((ch, i) => view.setUint8(offset + i, ch.charCodeAt(0)));
   text(0, "RIFF");
   view.setUint32(4, 36 + samples.length * 2, true);
   text(8, "WAVE");
@@ -162,6 +223,7 @@ function encodeWav(samples) {
   return new Blob([view], { type: "audio/wav" });
 }
 
+/** Any audio file as 16 kHz mono samples; throws when it can't be read or is too long. */
 async function decodeMono(blob, maxSeconds) {
   // decodeAudioData resamples to the context's rate, so a 16 kHz context
   // hands back 16 kHz audio whatever the file was.
@@ -173,7 +235,9 @@ async function decodeMono(blob, maxSeconds) {
     throw new Error("Couldn't read that audio.");
   }
   if (decoded.duration > maxSeconds) {
-    throw new Error(`That clip is ${Math.round(decoded.duration)} s long — the limit is ${maxSeconds} s.`);
+    throw new Error(
+      `That clip is ${Math.round(decoded.duration)} s long — the limit is ${maxSeconds} s.`,
+    );
   }
   const mono = new Float32Array(decoded.length);
   for (let c = 0; c < decoded.numberOfChannels; c++) {
@@ -183,14 +247,15 @@ async function decodeMono(blob, maxSeconds) {
   return mono;
 }
 
+// A recording as the 16 kHz mono WAV the server scores (a second over the limit is let through).
 const toWav = async (blob) => encodeWav(await decodeMono(blob, MAX_SECONDS + 1));
 
-// ---------- the microphone ----------
+// --- MICROPHONE ---
 
 // The browser's call-quality processing reshapes the voice, which is the
 // thing being measured, so all of it is off.
 const MIC = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
-const MIC_IDLE_SECONDS = 15 * 60;
+const MIC_IDLE_SECONDS = 15 * 60; // an open microphone unused this long is let go
 const QUIET = 0.0002; // a microphone whose loudest sample stays under this is giving silence
 
 // One stream, kept open between takes, and asked for by the id of the
@@ -202,32 +267,56 @@ const QUIET = 0.0002; // a microphone whose loudest sample stays under this is g
 //   and headset software add them) that is often one that hears nothing.
 const mic = { stream: null, devices: [], timer: null, note: "", testing: null, opening: null };
 
+// Whether the shared stream is open and still live.
 const micLive = () => Boolean(mic.stream?.getAudioTracks().some((t) => t.readyState === "live"));
-const micLabel = () => mic.stream?.getAudioTracks()[0]?.label || stored.get("echo.mic.label") || "the microphone";
+// The microphone's name, for messages.
+const micLabel = () =>
+  mic.stream?.getAudioTracks()[0]?.label || stored.get("echo.mic.label") || "the microphone";
 
+/** What to tell the person when the microphone wouldn't open, from the browser's error. */
 function micProblem(err) {
   if (err?.name === "NotAllowedError" || err?.name === "SecurityError") {
-    return "The browser is blocking the microphone for this page. Allow it (the microphone icon in the address bar), then try again.";
+    return (
+      "The browser is blocking the microphone for this page. " +
+      "Allow it (the microphone icon in the address bar), then try again."
+    );
   }
-  if (err?.name === "NotFoundError" || err?.name === "OverconstrainedError") return "No microphone was found. Plug one in, then try again.";
+  if (err?.name === "NotFoundError" || err?.name === "OverconstrainedError") {
+    return "No microphone was found. Plug one in, then try again.";
+  }
   if (err?.name === "NotReadableError" || err?.name === "AbortError") {
-    return "The microphone didn't start: another app may be using it. Close that, or choose another microphone on the left.";
+    return (
+      "The microphone didn't start: another app may be using it. " +
+      "Close that, or choose another microphone on the left."
+    );
   }
-  return "Couldn't open the microphone. Choose another one on the left, or allow it for this page, and try again.";
+  return (
+    "Couldn't open the microphone. " +
+    "Choose another one on the left, or allow it for this page, and try again."
+  );
 }
 
+/** List the microphones in the sidebar's box. */
 async function listMics() {
   try {
     const all = await navigator.mediaDevices.enumerateDevices();
-    // Chrome also lists "default" and "communications", which are whatever the system points them at.
-    mic.devices = all.filter((d) => d.kind === "audioinput" && d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications");
+    // Chrome also lists "default" and "communications", which are whatever the
+    // system points them at.
+    mic.devices = all.filter(
+      (d) =>
+        d.kind === "audioinput" &&
+        d.deviceId &&
+        d.deviceId !== "default" &&
+        d.deviceId !== "communications",
+    );
   } catch {
     mic.devices = [];
   }
   renderMic();
 }
 
-// Has the browser been told to always allow the microphone here? Then it won't ask, or say which one it picked.
+// Has the browser been told to always allow the microphone here? Then it won't
+// ask, or say which one it picked.
 async function alwaysAllowed() {
   try {
     return (await navigator.permissions.query({ name: "microphone" })).state === "granted";
@@ -245,12 +334,16 @@ function openMic() {
   return mic.opening;
 }
 
+/** Open the microphone: the one chosen here if it is there, else the browser's pick. */
 async function openMicNow() {
+  // Ask the browser for a stream with these audio constraints.
   const ask = (audio) => navigator.mediaDevices.getUserMedia({ audio });
   const wanted = stored.get("echo.mic");
   const name = stored.get("echo.mic.label");
   mic.note = "";
   let stream = null;
+
+  // 1. The chosen microphone, by its id.
   if (wanted) {
     try {
       stream = await ask({ ...MIC, deviceId: { exact: wanted } });
@@ -258,17 +351,21 @@ async function openMicNow() {
       if (err.name !== "OverconstrainedError" && err.name !== "NotFoundError") throw err;
     }
   }
+
+  // 2. No choice yet, or the chosen microphone isn't there under that id: take
+  //    what the browser gives.
   if (!stream) {
-    // No choice yet, or the chosen microphone isn't there under that id: take what the browser gives.
     const allowed = await alwaysAllowed();
     const before = performance.now();
     stream = await ask(MIC);
-    const asked = !allowed && performance.now() - before > 400; // the browser put its own question, with its own list
+    // A wait of over 400 ms means the browser put its own question, with its own list.
+    const asked = !allowed && performance.now() - before > 400;
     await listMics();
     const got = stream.getAudioTracks()[0];
     const same = name && got.label !== name ? mic.devices.find((d) => d.label === name) : null;
     if (same && !asked) {
-      // The chosen microphone under a new id (a browser hands out new ids when it forgets a site): switch to it.
+      // The chosen microphone under a new id (a browser hands out new ids when
+      // it forgets a site): switch to it.
       try {
         const again = await ask({ ...MIC, deviceId: { exact: same.deviceId } });
         stream.getTracks().forEach((t) => t.stop());
@@ -285,6 +382,8 @@ async function openMicNow() {
       stored.set("echo.mic.label", now.label);
     }
   }
+
+  // 3. Share it, and notice when it goes away.
   mic.stream = stream;
   stream.getAudioTracks()[0].addEventListener("ended", () => {
     if (mic.stream !== stream) return;
@@ -304,6 +403,7 @@ function closeMic() {
   renderMic();
 }
 
+// Keep the microphone open for now, and let it go once it has gone unused for MIC_IDLE_SECONDS.
 function restMic() {
   clearTimeout(mic.timer);
   mic.timer = setTimeout(closeMic, MIC_IDLE_SECONDS * 1000);
@@ -329,10 +429,16 @@ function listenTo(stream) {
   return null;
 }
 
+// One recording from the shared microphone, with its level and live pitch read as it goes.
 class Recorder {
-  // `onEnd`: the recording stopped without being asked to, because the
-  // microphone went away (unplugged, or switched off by the system).
+  /**
+   * Start recording. While it records, `onLevel(peak, rms)` is called every animation
+   * frame, and `onPitch(f0, buffer, rate)`, when given, on every frame with any sound.
+   * `onEnd`: the recording stopped without being asked to, because the microphone
+   * went away (unplugged, or switched off by the system).
+   */
   async start(onLevel, onPitch, onEnd = () => {}) {
+    // 1. The microphone, and a MediaRecorder on it.
     this.heard = 0; // the loudest sample so far
     this.ctx = null;
     this.stopping = false;
@@ -357,8 +463,10 @@ class Recorder {
     }
     renderMic();
 
+    // 2. An analyser for the level and the live readouts.
     const wired = listenTo(this.stream);
-    if (!wired) return; // the take still records; only the level and the live readouts are missing
+    // Without it the take still records; only the level and the live readouts are missing.
+    if (!wired) return;
     this.ctx = wired.ctx;
     const rate = this.ctx.sampleRate;
     const analyser = this.ctx.createAnalyser();
@@ -371,6 +479,8 @@ class Recorder {
     wired.source.connect(analyser);
     const buffer = new Float32Array(analyser.fftSize);
     const recent = buffer.subarray(buffer.length - span);
+
+    // 3. Every frame while recording: the level, then the pitch of the latest stretch.
     const tick = () => {
       if (this.media.state !== "recording") return;
       analyser.getFloatTimeDomainData(buffer);
@@ -400,29 +510,40 @@ class Recorder {
   }
 }
 
-const noSound = () => `No sound is coming from “${micLabel()}”. Choose your microphone in the list on the left.`;
+// What to say when the microphone gives nothing at all.
+const noSound = () =>
+  `No sound is coming from “${micLabel()}”. Choose your microphone in the list on the left.`;
 
 // A take, or a scored attempt in the trainer, stops by itself once you have
 // finished speaking (ending.js), unless that is switched off in the sidebar.
 // The button and Space still stop it at any moment.
 const autoStop = () => stored.get("echo.autostop") !== "off";
 
+/** The sidebar's auto-stop box, and the notes that depend on it. */
 function renderAutoStop() {
   $("#auto-stop").checked = autoStop();
   for (const note of document.querySelectorAll(".auto-note")) note.hidden = !autoStop();
   for (const note of document.querySelectorAll(".manual-note")) note.hidden = autoStop();
 }
 
-// The sidebar's microphone box: which one, a level to see that it hears you, and what's going on.
+// The sidebar's microphone box: which one, a level to see that it hears you,
+// and what's going on.
 function renderMic() {
   const select = $("#mic-select");
   const busy = Boolean(session || drillRec);
   const chosen = stored.get("echo.mic") || "";
   const name = stored.get("echo.mic.label");
   const options = [el("option", { value: "", textContent: "The browser's choice" })];
-  mic.devices.forEach((d, i) => options.push(el("option", { value: d.deviceId, textContent: d.label || `Microphone ${i + 1}` })));
-  // The chosen one stays listed while the browser isn't naming its microphones (before it's allowed) or it's unplugged.
-  if (chosen && !mic.devices.some((d) => d.deviceId === chosen)) options.push(el("option", { value: chosen, textContent: name || "The one you chose" }));
+  mic.devices.forEach((d, i) =>
+    options.push(
+      el("option", { value: d.deviceId, textContent: d.label || `Microphone ${i + 1}` }),
+    ),
+  );
+  // The chosen one stays listed while the browser isn't naming its microphones
+  // (before it's allowed) or it's unplugged.
+  if (chosen && !mic.devices.some((d) => d.deviceId === chosen)) {
+    options.push(el("option", { value: chosen, textContent: name || "The one you chose" }));
+  }
   select.replaceChildren(...options);
   select.value = chosen;
   select.disabled = busy || Boolean(mic.testing);
@@ -430,10 +551,17 @@ function renderMic() {
   $("#mic-test").disabled = busy;
   $("#mic-off").hidden = !micLive() || busy || Boolean(mic.testing);
   $("#mic-box").classList.toggle("attention", Boolean(mic.note));
-  const on = micLive() ? `On: ${mic.stream.getAudioTracks()[0].label || "the microphone"}. It stays on between takes, and turns off after 15 minutes unused.` : "";
-  $("#mic-note").textContent = mic.note || on || (chosen ? "" : "If the browser picks the wrong one, choose yours here. Echo remembers it.");
+  const on = micLive()
+    ? `On: ${mic.stream.getAudioTracks()[0].label || "the microphone"}. ` +
+      "It stays on between takes, and turns off after 15 minutes unused."
+    : "";
+  $("#mic-note").textContent =
+    mic.note ||
+    on ||
+    (chosen ? "" : "If the browser picks the wrong one, choose yours here. Echo remembers it.");
 }
 
+/** Use the microphone with this id ("" for the browser's choice), and test it. */
 async function chooseMic(id) {
   const device = mic.devices.find((d) => d.deviceId === id);
   stored.set("echo.mic", id);
@@ -452,6 +580,7 @@ async function testMic() {
   renderMic();
   try {
     await recorder.start(
+      // The bar is full at a peak of about 0.7.
       (peak) => ($("#mic-level").style.width = `${Math.min(100, peak * 140)}%`),
       null,
       () => mic.testing?.recorder === recorder && stopMicTest(),
@@ -463,11 +592,12 @@ async function testMic() {
     return;
   }
   if (mic.testing?.recorder !== recorder) return recorder.stop(); // stopped while it was opening
-  mic.testing.timer = setTimeout(stopMicTest, 8000);
+  mic.testing.timer = setTimeout(stopMicTest, 8000); // a test lasts 8 s
   mic.note = "Say something: the bar should move.";
   renderMic();
 }
 
+/** End a microphone test, saying so if it heard nothing. */
 async function stopMicTest() {
   const test = mic.testing;
   if (!test) return;
@@ -479,27 +609,24 @@ async function stopMicTest() {
   renderMic();
 }
 
-// ---------- shared pieces: a score ring and the scale from a stranger to the real person ----------
+// --- SHARED PIECES ---
+// A score ring, the scale from a stranger to the real person, bars and sparklines.
 
+/** A score out of 100 as a ring, filled that far round. */
 function ring(score) {
-  const ns = "http://www.w3.org/2000/svg";
-  const svg = document.createElementNS(ns, "svg");
-  svg.setAttribute("viewBox", "0 0 80 80");
-  const track = document.createElementNS(ns, "circle");
-  const fill = document.createElementNS(ns, "circle");
-  for (const c of [track, fill]) {
-    c.setAttribute("cx", "40");
-    c.setAttribute("cy", "40");
-    c.setAttribute("r", "34");
-  }
-  track.setAttribute("class", "ring-track");
-  fill.setAttribute("class", "ring-fill");
-  const circumference = 2 * Math.PI * 34;
-  fill.setAttribute("stroke-dasharray", `${(circumference * Math.max(0, score)) / 100} ${circumference}`);
+  const svg = svgEl("svg", { viewBox: "0 0 80 80" });
+  const track = svgEl("circle", { cx: "40", cy: "40", r: "34", class: "ring-track" });
+  const fill = svgEl("circle", { cx: "40", cy: "40", r: "34", class: "ring-fill" });
+  const circumference = 2 * Math.PI * 34; // the circles' radius
+  fill.setAttribute(
+    "stroke-dasharray",
+    `${(circumference * Math.max(0, score)) / 100} ${circumference}`,
+  );
   svg.append(track, fill);
   return el("div", { className: "ring" }, svg);
 }
 
+/** The scale from a stranger (20) to the real person (90), marking a score and the one before. */
 function ladder(score, before = null) {
   const now = el("i", { className: "ladder-now", title: `Now: ${Math.round(score)}` });
   now.style.left = `${score}%`;
@@ -511,39 +638,43 @@ function ladder(score, before = null) {
   }
   track.append(now);
   const marks = el("div", { className: "ladder-marks" });
-  marks.innerHTML = '<span style="left: 20%">20<br>a stranger</span><span style="left: 90%">90<br>the real person</span>';
+  marks.innerHTML =
+    '<span style="left: 20%">20<br>a stranger</span>' +
+    '<span style="left: 90%">90<br>the real person</span>';
   return el("div", { className: "ladder" }, track, marks);
 }
 
+/** A bar filled to a score out of 100 (empty for none). */
 function bar(score) {
   const fill = el("i");
   fill.style.width = `${score ?? 0}%`;
   return el("span", { className: "bar" }, fill);
 }
 
+/** A small line of scores out of 100, skipping the missing ones; empty under two scores. */
 function sparkline(values) {
   const points = values.map((v, i) => [i, v]).filter(([, v]) => v != null);
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 64 20");
-  svg.setAttribute("class", "spark");
-  svg.setAttribute("aria-hidden", "true");
+  const svg = svgEl("svg", { viewBox: "0 0 64 20", class: "spark", "aria-hidden": "true" });
   if (points.length >= 2) {
     const n = values.length - 1;
-    const poly = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-    poly.setAttribute("points", points.map(([i, v]) => `${((i / n) * 62 + 1).toFixed(1)},${(19 - (v / 100) * 18).toFixed(1)}`).join(" "));
-    svg.append(poly);
+    // 1 to 63 across, 19 (0) to 1 (100) up.
+    const xy = ([i, v]) => `${((i / n) * 62 + 1).toFixed(1)},${(19 - (v / 100) * 18).toFixed(1)}`;
+    svg.append(svgEl("polyline", { points: points.map(xy).join(" ") }));
   }
   return svg;
 }
 
+/** A change, rounded: "+3", "−2" or "±0", with a unit; "" if either number is missing. */
 function delta(now, before, unit = "") {
   if (now == null || before == null) return "";
   const d = Math.round(now - before);
   return d > 0 ? `+${d}${unit}` : d < 0 ? `−${-d}${unit}` : `±0${unit}`;
 }
 
-// ---------- the sidebar: just the voices ----------
+// --- SIDEBAR ---
+// Just the voices.
 
+/** The list of voices, with the open one marked. */
 function renderSidebar() {
   const openId = voice?.id ?? current?.voice_id ?? source?.voice_id ?? check?.voiceId ?? null;
   $("#voices").replaceChildren(
@@ -552,7 +683,11 @@ function renderSidebar() {
         "button",
         { type: "button", className: "voice-btn" },
         el("span", { className: "name", textContent: v.name }),
-        el("span", { className: "score", textContent: v.score == null ? "" : Math.round(v.score), title: "Voice score, from the last voice check" }),
+        el("span", {
+          className: "score",
+          textContent: v.score == null ? "" : Math.round(v.score),
+          title: "Voice score, from the last voice check",
+        }),
         el("small", { textContent: v.line_count ? plural(v.line_count, "line") : "no lines yet" }),
       );
       button.setAttribute("aria-current", String(v.id === openId));
@@ -562,12 +697,14 @@ function renderSidebar() {
   );
 }
 
+/** Show or hide the sidebar's box for a new voice. */
 function toggleNewVoice(open) {
   $("#new-voice-form").hidden = !open;
   $("#new-voice").hidden = open;
   if (open) $("#new-voice-name").focus();
 }
 
+// Whether the text is a web link rather than a name.
 const isLink = (text) => /^https?:\/\/\S+$/i.test(text.trim());
 
 // A name makes an empty voice; a link makes a voice from the video.
@@ -578,17 +715,22 @@ async function startVoice(text) {
   else await createVoice(text);
 }
 
+/** A new voice from a video link: the server downloads it and finds the lines. */
 async function createFromLink(url) {
   try {
     const meta = await send("/api/sources/link", "POST", { url });
     await refreshLists();
     await openVoice(meta.voice_id);
-    setStatus("Echo is getting the voice lines from the video. A long video takes a few minutes; you can leave this page meanwhile.");
+    setStatus(
+      "Echo is getting the voice lines from the video. " +
+        "A long video takes a few minutes; you can leave this page meanwhile.",
+    );
   } catch (err) {
     setStatus(err.message, true);
   }
 }
 
+/** A new, empty voice with this name, opened. */
 async function createVoice(name) {
   try {
     const made = await send("/api/voices", "POST", { name });
@@ -601,10 +743,12 @@ async function createVoice(name) {
   }
 }
 
+/** Remember the open page, to come back to it on the next visit. */
 function remember(view) {
   stored.set("echo.view", view);
 }
 
+/** Leave the open page: stop what's playing or recording on it and forget what was open. */
 function leave() {
   page++;
   stopPlayback();
@@ -626,8 +770,9 @@ function leave() {
   voice = null;
 }
 
-// ---------- home ----------
+// --- HOME PAGE ---
 
+/** Open the home page, or the first screen when there are no voices yet. */
 async function goHome() {
   leave();
   remember("home");
@@ -636,7 +781,9 @@ async function goHome() {
   if (voices.length) renderHome();
 }
 
+/** Home: the line practised last, to continue, and a card for each voice. */
 function renderHome() {
+  // 1. The line practised most recently.
   const recent = targets.filter((t) => t.last).sort((a, b) => (a.last < b.last ? 1 : -1))[0];
   $("#continue").hidden = !recent;
   if (recent) {
@@ -648,43 +795,70 @@ function renderHome() {
       el(
         "div",
         { className: "continue-text" },
-        el("p", { className: "eyebrow", textContent: owner ? `Last practised · ${owner.name}` : "Last practised" }),
+        el("p", {
+          className: "eyebrow",
+          textContent: owner ? `Last practised · ${owner.name}` : "Last practised",
+        }),
         el("p", { className: "continue-line", textContent: `“${lineText(recent)}”` }),
-        el("p", { className: "fine", textContent: `${plural(recent.takes, "take")}, best ${Math.round(recent.best)}, last ${Math.round(recent.last_score ?? recent.best)}.${next}` }),
+        el("p", {
+          className: "fine",
+          textContent:
+            `${plural(recent.takes, "take")}, best ${Math.round(recent.best)}, ` +
+            `last ${Math.round(recent.last_score ?? recent.best)}.${next}`,
+        }),
       ),
       go,
     );
   }
+
+  // 2. Every voice, with its score or what it needs for one.
   $("#voice-cards").replaceChildren(
     ...voices.map((v) => {
       const open = el("button", { type: "button", className: "btn", textContent: "Open" });
       open.onclick = () => openVoice(v.id);
+      const unscored =
+        v.line_count >= v.min_check_lines
+          ? "No voice score yet: run a voice check."
+          : `${plural(v.line_count, "line")}. ` +
+            `Add ${v.min_check_lines - v.line_count} more for a voice check.`;
+      const since =
+        v.previous != null ? `, ${delta(v.score, v.previous)} since the check before` : "";
       const score =
         v.score == null
-          ? el("p", { className: "fine", textContent: v.line_count >= v.min_check_lines ? "No voice score yet: run a voice check." : `${plural(v.line_count, "line")}. Add ${v.min_check_lines - v.line_count} more for a voice check.` })
-          : el("p", { className: "voice-card-score" }, el("b", { textContent: Math.round(v.score) }), ` voice score${v.previous != null ? `, ${delta(v.score, v.previous)} since the check before` : ""}`);
+          ? el("p", { className: "fine", textContent: unscored })
+          : el(
+              "p",
+              { className: "voice-card-score" },
+              el("b", { textContent: Math.round(v.score) }),
+              ` voice score${since}`,
+            );
+      const from = v.recording_count ? ` from ${plural(v.recording_count, "recording")}` : "";
       return el(
         "div",
         { className: "card voice-card" },
         el("p", { className: "voice-card-name", textContent: v.name }),
         score,
-        el("p", { className: "fine", textContent: `${plural(v.line_count, "line")}${v.recording_count ? ` from ${plural(v.recording_count, "recording")}` : ""}` }),
+        el("p", { className: "fine", textContent: `${plural(v.line_count, "line")}${from}` }),
         open,
       );
     }),
   );
 }
 
-// ---------- a voice: its score, lines and recordings ----------
+// --- VOICE PAGE ---
+// A voice: its score, lines and recordings.
 
-let voiceTab = "practise"; // which part of the voice's page is showing
-
+/** Show one tab of the voice's page. */
 function setVoiceTab(tab) {
-  voiceTab = tab;
-  for (const b of document.querySelectorAll("#voice-tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const pane of document.querySelectorAll("#voice .pane")) pane.hidden = pane.dataset.pane !== tab;
+  for (const b of document.querySelectorAll("#voice-tabs button")) {
+    b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  }
+  for (const pane of document.querySelectorAll("#voice .pane")) {
+    pane.hidden = pane.dataset.pane !== tab;
+  }
 }
 
+/** Open a voice's page on `tab`; by default "add" if it has no lines yet, else "practise". */
 async function openVoice(id, tab = null) {
   leave();
   try {
@@ -701,6 +875,7 @@ async function openVoice(id, tab = null) {
   show("voice");
 }
 
+/** Reload the open voice, and redraw its page if it is showing. */
 async function refreshVoice() {
   if (!voice) return;
   try {
@@ -710,7 +885,10 @@ async function refreshVoice() {
       // Its video was from a channel that already had a voice: they're one now.
       remember(`voice:${voice.id}`);
       voices = await api("/api/voices");
-      setStatus(`This video is from “${voice.name}”, which already had a voice, so its lines joined that one.`);
+      setStatus(
+        `This video is from “${voice.name}”, which already had a voice, ` +
+          "so its lines joined that one.",
+      );
     }
     voices = voices.map((v) => (v.id === voice.id ? { ...v, ...voice } : v));
     renderSidebar();
@@ -718,6 +896,7 @@ async function refreshVoice() {
   } catch {}
 }
 
+// The steps of processing a video or recording, as [status, label].
 const STEPS = [
   ["downloading", "Download"],
   ["reading", "Read the audio"],
@@ -736,8 +915,12 @@ function renderProgress() {
       const at = steps.findIndex(([key]) => key === s.status);
       const items = steps.map(([key, label], i) => {
         const pct = i === at && s.progress != null ? ` ${Math.round(s.progress * 100)}%` : "";
-        return el("li", { className: at < 0 ? "" : i < at ? "done" : i === at ? "now" : "", textContent: `${label}${pct}` });
+        return el("li", {
+          className: at < 0 ? "" : i < at ? "done" : i === at ? "now" : "",
+          textContent: `${label}${pct}`,
+        });
       });
+      // How far along, counting the step under way as half done when it gives no progress.
       const share = at < 0 ? 0 : (at + (s.progress ?? 0.5)) / steps.length;
       const fill = el("i");
       fill.style.width = `${Math.round(share * 100)}%`;
@@ -747,7 +930,13 @@ function renderProgress() {
         el("h3", { textContent: `Getting voice lines from “${s.name || "the video"}”` }),
         el("span", { className: "bar" }, fill),
         el("ol", { className: "progress-steps" }, ...items),
-        el("p", { className: "fine", textContent: s.status === "queued" ? "Waiting to start…" : "A long video takes a few minutes. You can leave this page; it carries on." }),
+        el("p", {
+          className: "fine",
+          textContent:
+            s.status === "queued"
+              ? "Waiting to start…"
+              : "A long video takes a few minutes. You can leave this page; it carries on.",
+        }),
       );
     }),
   );
@@ -757,13 +946,19 @@ function renderProgress() {
 function videoLink(s) {
   const site = /youtu\.?be/i.test(s.link) ? "YouTube" : "the web";
   const title = s.title || s.name;
-  const a = el("a", { href: s.link, target: "_blank", rel: "noopener", className: "video-link", title: `${title}
-${s.link}` });
+  const a = el("a", {
+    href: s.link,
+    target: "_blank",
+    rel: "noopener",
+    className: "video-link",
+    title: `${title}\n${s.link}`,
+  });
   // The channel first: a long title is cut short at the end.
   a.textContent = `▶ ${s.channel ? `${s.channel} on ${site}` : site}: ${title}`;
   return a;
 }
 
+/** Ask for the link to the video a recording came from, and add it. */
 async function addRecordingLink(s) {
   const url = prompt("Paste the link to the video this recording came from:")?.trim();
   if (!url) return;
@@ -786,14 +981,27 @@ function renderSpeakers() {
       const rows = s.speakers.map((sp) => {
         const play = el("button", { type: "button", className: "play", textContent: "▶" });
         play.setAttribute("aria-label", `Play speaker ${sp.speaker + 1}`);
-        play.onclick = () => playUrl(`/api/sources/${s.id}/audio?start=${sp.sample.start}&end=${sp.sample.end}`, play, "voice");
+        play.onclick = () =>
+          playUrl(
+            `/api/sources/${s.id}/audio?start=${sp.sample.start}&end=${sp.sample.end}`,
+            play,
+            "voice",
+          );
         const inUse = sp.speaker === s.speaker;
         const actions = el("span", { className: "speaker-actions" });
         if (inUse) actions.append(el("span", { className: "in-use", textContent: "This voice" }));
         else {
-          const use = el("button", { type: "button", className: "btn small", textContent: "Use this one" });
+          const use = el("button", {
+            type: "button",
+            className: "btn small",
+            textContent: "Use this one",
+          });
           use.onclick = () => chooseSpeaker(s, sp.speaker, use);
-          const split = el("button", { type: "button", className: "btn small", textContent: "Make a separate voice" });
+          const split = el("button", {
+            type: "button",
+            className: "btn small",
+            textContent: "Make a separate voice",
+          });
           split.onclick = () => splitSpeaker(s, sp.speaker, split);
           actions.append(use, split);
         }
@@ -805,7 +1013,10 @@ function renderSpeakers() {
           el(
             "span",
             { className: "vline-text" },
-            el("span", { className: "name", textContent: `Speaker ${sp.speaker + 1} · ${plural(sp.lines, "line")}${pitch}` }),
+            el("span", {
+              className: "name",
+              textContent: `Speaker ${sp.speaker + 1} · ${plural(sp.lines, "line")}${pitch}`,
+            }),
             el("small", { textContent: `“${sp.sample.text}”` }),
           ),
           actions,
@@ -815,13 +1026,21 @@ function renderSpeakers() {
         "div",
         { className: "speakers" },
         el("h3", { textContent: "Who's speaking" }),
-        el("p", { className: "fine", textContent: `“${s.name}” has ${s.speakers.length} speakers. This voice is speaker ${s.speaker + 1}${s.speaker === 0 ? ", who speaks the most" : ""}; the others' lines are left out of its suggestions. Play each to check.` }),
+        el("p", {
+          className: "fine",
+          textContent:
+            `“${s.name}” has ${s.speakers.length} speakers. ` +
+            `This voice is speaker ${s.speaker + 1}` +
+            `${s.speaker === 0 ? ", who speaks the most" : ""}; ` +
+            "the others' lines are left out of its suggestions. Play each to check.",
+        }),
         el("ol", { className: "speaker-list" }, ...rows),
       );
     }),
   );
 }
 
+/** Make the voice another speaker of a recording; the server re-picks its lines. */
 async function chooseSpeaker(recording, speaker, button) {
   button.disabled = true;
   button.textContent = "Switching…";
@@ -830,13 +1049,20 @@ async function chooseSpeaker(recording, speaker, button) {
     const result = await send(`/api/sources/${recording.id}`, "PATCH", { speaker });
     await refreshLists();
     await refreshVoice();
-    setStatus(`This voice is now speaker ${speaker + 1}: ${plural(result.added.length, "line")} of theirs added${result.removed ? `, ${result.removed} unpractised picks of the other speaker removed` : ""}.`);
+    const removed = result.removed
+      ? `, ${result.removed} unpractised picks of the other speaker removed`
+      : "";
+    setStatus(
+      `This voice is now speaker ${speaker + 1}: ` +
+        `${plural(result.added.length, "line")} of theirs added${removed}.`,
+    );
   } catch (err) {
     setStatus(err.message, true);
     renderSpeakers();
   }
 }
 
+/** Make another speaker of a recording into a voice of their own, and open it. */
 async function splitSpeaker(recording, speaker, button) {
   const name = prompt("Name the new voice:", `${voice.name}, speaker ${speaker + 1}`)?.trim();
   if (!name) return;
@@ -854,7 +1080,9 @@ async function splitSpeaker(recording, speaker, button) {
   }
 }
 
+/** The voice's "Your progress" card: a chart of every take and each part's change. */
 async function renderProgressView() {
+  // 1. Every take on the voice's lines, from the server.
   const id = voice.id;
   let data;
   try {
@@ -868,31 +1096,36 @@ async function renderProgressView() {
   $("#progress-empty").hidden = all.length >= 2;
   if (all.length < 2) return;
 
-  // Every take, oldest to newest, with the average of the last five.
-  const ns = "http://www.w3.org/2000/svg";
-  const make = (tag, attrs) => {
-    const node = document.createElementNS(ns, tag);
-    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
-    return node;
-  };
-  const W = 640;
+  // 2. Every take, oldest to newest, with the average of the last five.
+  const W = 640; // the chart's width and height, in SVG units
   const H = 160;
-  const pad = 26;
+  const pad = 26; // room on the left for the scores
+  // Where take i goes across.
   const x = (i) => pad + (i / Math.max(1, all.length - 1)) * (W - pad - 8);
+  // Where a score goes up.
   const y = (s) => 8 + (1 - s / 100) * (H - 16 - 8);
-  const svg = make("svg", { viewBox: `0 0 ${W} ${H}`, class: "progress-chart", role: "img" });
-  svg.setAttribute("aria-label", "Every take's score, oldest to newest, with the average of the last five");
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "progress-chart", role: "img" });
+  svg.setAttribute(
+    "aria-label",
+    "Every take's score, oldest to newest, with the average of the last five",
+  );
   for (const level of [20, 50, 90]) {
-    svg.append(make("line", { x1: pad, x2: W - 8, y1: y(level), y2: y(level), class: "grid" }));
-    const label = make("text", { x: 2, y: y(level) + 4, class: "axis" });
+    svg.append(svgEl("line", { x1: pad, x2: W - 8, y1: y(level), y2: y(level), class: "grid" }));
+    const label = svgEl("text", { x: 2, y: y(level) + 4, class: "axis" });
     label.textContent = level;
     svg.append(label);
   }
   const lines = [...new Set(all.map((t) => t.target))];
   all.forEach((take, i) => {
-    const dot = make("circle", { cx: x(i), cy: y(take.overall), r: 3.5, class: `dot c${lines.indexOf(take.target) % 6}` });
-    const title = make("title", {});
-    title.textContent = `${Math.round(take.overall)} · “${take.line}” · ${when(take.created)}`;
+    const dot = svgEl("circle", {
+      cx: x(i),
+      cy: y(take.overall),
+      r: 3.5,
+      class: `dot c${lines.indexOf(take.target) % 6}`, // a colour per line, from six
+    });
+    const title = svgEl("title", {});
+    title.textContent =
+      `${Math.round(take.overall)} · “${take.line}” · ${when(take.created)}`;
     dot.append(title);
     svg.append(dot);
   });
@@ -900,10 +1133,16 @@ async function renderProgressView() {
     const window = all.slice(Math.max(0, i - 4), i + 1);
     return window.reduce((s, t) => s + t.overall, 0) / window.length;
   });
-  svg.append(make("polyline", { points: rolling.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" "), class: "trend" }));
+  svg.append(
+    svgEl("polyline", {
+      points: rolling.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" "),
+      class: "trend",
+    }),
+  );
 
-  // Each part: your first five takes against your last five.
+  // 3. Each part: your first five takes against your last five.
   const n = Math.min(5, Math.floor(all.length / 2));
+  // The average score of part k over these takes; null when none has it.
   const avg = (takes, k) => {
     const v = takes.map((t) => t.parts?.[k]).filter((s) => s != null);
     return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
@@ -918,83 +1157,151 @@ async function renderProgressView() {
       el("span", { className: "label", textContent: label }),
       bar(b),
       el("span", { className: "num", textContent: b == null ? "–" : Math.round(b) }),
-      el("span", { className: `delta ${change > 0 ? "up" : change < 0 ? "down" : ""}`, textContent: change == null ? "" : delta(b, a) }),
+      el("span", {
+        className: `delta ${change > 0 ? "up" : change < 0 ? "down" : ""}`,
+        textContent: change == null ? "" : delta(b, a),
+      }),
     );
   });
+
+  // 4. A summary in words, then the card.
   const best = all.reduce((m, t) => (t.overall > m.overall ? t : m), all[0]);
   const first = rolling[Math.min(4, rolling.length - 1)];
   const now = rolling.at(-1);
-  const summary = `${plural(all.length, "take")} over ${plural(data.days.length, "day")}${data.drills ? `, ${plural(data.drills, "trainer attempt")}` : ""}. Your recent average is ${Math.round(now)}${all.length > 5 ? `, ${now >= first ? "up" : "down"} from ${Math.round(first)} at the start` : ""}. Best take: ${Math.round(best.overall)} on “${best.line}”.`;
+  const drills = data.drills ? `, ${plural(data.drills, "trainer attempt")}` : "";
+  const trend =
+    all.length > 5
+      ? `, ${now >= first ? "up" : "down"} from ${Math.round(first)} at the start`
+      : "";
+  const summary =
+    `${plural(all.length, "take")} over ${plural(data.days.length, "day")}${drills}. ` +
+    `Your recent average is ${Math.round(now)}${trend}. ` +
+    `Best take: ${Math.round(best.overall)} on “${best.line}”.`;
   $("#progress-view").replaceChildren(
     el("h3", { textContent: "Your progress" }),
     el("p", { className: "fine", textContent: summary }),
     svg,
-    el("p", { className: "fine", textContent: `Each part, your last ${plural(n, "take")} (and the change since your first ${n}):` }),
+    el("p", {
+      className: "fine",
+      textContent:
+        `Each part, your last ${plural(n, "take")} ` +
+        `(and the change since your first ${n}):`,
+    }),
     el("ul", { className: "components progress-parts" }, ...rows),
   );
 }
 
+/** The whole of the voice's page. */
 function renderVoice() {
+  // 1. Its name, progress and where its recordings came from.
   $("#voice-name").textContent = voice.name;
   renderProgressView();
-  // Where its recordings came from.
   const linked = voice.recordings.filter((s) => s.link);
   $("#voice-links").hidden = !linked.length;
   $("#voice-links").replaceChildren(...linked.map((s) => el("li", {}, videoLink(s))));
-  // Another name to offer, once: the channel (for a YouTuber, the person), or
-  // the video's title when it was named after the channel (for a fan's
-  // compilation of a character, say). Not once it's been named by hand.
+
+  // 2. Another name to offer, once: the channel (for a YouTuber, the person), or
+  //    the video's title when it was named after the channel (for a fan's
+  //    compilation of a character, say). Not once it's been named by hand.
   const video = voice.recordings.find((s) => s.channel || s.link);
   let offer = null;
   if (voice.named_from !== "hand" && video) {
-    if (voice.named_from === "channel") offer = video.name && [video.name, `Named after the channel. Rename it “${video.name}”, after the video?`];
-    else if (video.channel) offer = [video.channel, `Rename it “${video.channel}”, after the channel?`];
+    if (voice.named_from === "channel") {
+      offer =
+        video.name && [
+          video.name,
+          `Named after the channel. Rename it “${video.name}”, after the video?`,
+        ];
+    } else if (video.channel) {
+      offer = [video.channel, `Rename it “${video.channel}”, after the channel?`];
+    }
   }
   $("#channel-rename").hidden = !offer || offer[0] === voice.name;
   if (offer) {
     $("#channel-rename").textContent = offer[1];
     $("#channel-rename").onclick = () => renameVoice(offer[0]);
   }
+
+  // 3. The cards: progress, speakers, score, the voice at a glance, lines and recordings.
   renderProgress();
   renderSpeakers();
   renderScoreCard();
   $("#voice-glance").hidden = !voice.summary && !voice.you;
-  $("#glance-voice").textContent = voice.summary ? describeVoice(voice.summary) : "Add a recording to see how this voice sounds overall.";
+  $("#glance-voice").textContent = voice.summary
+    ? describeVoice(voice.summary)
+    : "Add a recording to see how this voice sounds overall.";
   $("#glance-you").textContent = describeYou(voice.you);
   $("#glance-gender-row").hidden = voice.gender == null;
   if (voice.gender != null) {
-    $("#glance-gender").textContent = `${genderWord(voice.gender)} (${Math.round(voice.gender)} on a scale from 0, male, to 100, female), from the pitch and resonance of its lines.`;
+    $("#glance-gender").textContent =
+      `${genderWord(voice.gender)} ` +
+      `(${Math.round(voice.gender)} on a scale from 0, male, to 100, female), ` +
+      "from the pitch and resonance of its lines.";
   }
   renderVoiceLines();
   renderSuggestions();
   renderRecordings();
 }
 
+/** The lines ticked for the voice check, in the order the server lists them. */
 function checkLines() {
   return voice.check_set.map((id) => voice.lines.find((l) => l.id === id)).filter(Boolean);
 }
 
+/** The voice score card: the score and its trend, or what a first voice check needs. */
 function renderScoreCard() {
+  // 1. The button to run a check, and what a check is.
   const lines = checkLines();
   const enough = lines.length >= voice.min_check_lines;
-  const run = el("button", { type: "button", className: "record", textContent: voice.score == null ? "Run a voice check" : "Run another check" });
+  const run = el("button", {
+    type: "button",
+    className: "record",
+    textContent: voice.score == null ? "Run a voice check" : "Run another check",
+  });
   run.id = "run-check";
   run.disabled = !enough;
   run.onclick = startCheck;
-  const what = `A voice check plays through ${enough ? plural(lines.length, "ticked line") : "the ticked lines"}, one take each with no retries, and averages them. One line can be luck; several show whether the impression holds.`;
+  const what =
+    "A voice check plays through " +
+    `${enough ? plural(lines.length, "ticked line") : "the ticked lines"}, ` +
+    "one take each with no retries, and averages them. " +
+    "One line can be luck; several show whether the impression holds.";
   const need = enough
     ? null
-    : el("p", { className: "need", textContent: voice.line_count < voice.min_check_lines ? `Add ${voice.min_check_lines - voice.line_count} more line${voice.min_check_lines - voice.line_count === 1 ? "" : "s"} for a voice check (it needs ${voice.min_check_lines}).` : `Tick at least ${voice.min_check_lines} lines below for the check.` });
+    : el("p", {
+        className: "need",
+        textContent:
+          voice.line_count < voice.min_check_lines
+            ? `Add ${voice.min_check_lines - voice.line_count} more ` +
+              `line${voice.min_check_lines - voice.line_count === 1 ? "" : "s"} ` +
+              `for a voice check (it needs ${voice.min_check_lines}).`
+            : `Tick at least ${voice.min_check_lines} lines below for the check.`,
+      });
+
+  // 2. No score yet: just that.
   if (voice.score == null) {
     $("#score-card").replaceChildren(
-      el("div", { className: "score-card-text" }, el("h3", { textContent: "Voice score" }), el("p", { className: "big-empty", textContent: "No voice score yet" }), el("p", { className: "fine", textContent: what }), need),
+      el(
+        "div",
+        { className: "score-card-text" },
+        el("h3", { textContent: "Voice score" }),
+        el("p", { className: "big-empty", textContent: "No voice score yet" }),
+        el("p", { className: "fine", textContent: what }),
+        need,
+      ),
       el("div", { className: "score-card-action" }, run),
     );
     return;
   }
+
+  // 3. The score, the last check, and the trend over checks.
   const last = voice.checks.at(-1);
   const before = voice.checks.at(-2);
-  const seeLast = el("button", { type: "button", className: "btn", textContent: "See the last check" });
+  const seeLast = el("button", {
+    type: "button",
+    className: "btn",
+    textContent: "See the last check",
+  });
   seeLast.onclick = () => openCheck(voice.id, last.id);
   $("#score-card").replaceChildren(
     el(
@@ -1005,10 +1312,27 @@ function renderScoreCard() {
         "div",
         { className: "score-text" },
         el("h3", { textContent: "Voice score" }),
-        el("div", { className: "score" }, el("span", { textContent: Math.round(voice.score) }), el("small", { textContent: "/ 100 across lines" })),
-        el("p", { className: "fine", textContent: `Last check ${when(last.created)}: lines from ${Math.round(last.low)} to ${Math.round(last.high)}.${before ? ` ${delta(last.average, before.average)} since the check before.` : ""}` }),
+        el(
+          "div",
+          { className: "score" },
+          el("span", { textContent: Math.round(voice.score) }),
+          el("small", { textContent: "/ 100 across lines" }),
+        ),
+        el("p", {
+          className: "fine",
+          textContent:
+            `Last check ${when(last.created)}: ` +
+            `lines from ${Math.round(last.low)} to ${Math.round(last.high)}.` +
+            `${before ? ` ${delta(last.average, before.average)} since the check before.` : ""}`,
+        }),
       ),
-      voice.checks.length >= 2 ? el("div", { className: "check-trend", title: "Voice score at each check" }, sparkline(voice.checks.map((c) => c.average))) : null,
+      voice.checks.length >= 2
+        ? el(
+            "div",
+            { className: "check-trend", title: "Voice score at each check" },
+            sparkline(voice.checks.map((c) => c.average)),
+          )
+        : null,
     ),
     ...[
       ladder(voice.score, before?.average ?? null),
@@ -1019,8 +1343,9 @@ function renderScoreCard() {
   );
 }
 
-let voicePlayer = null; // { audio, button }
+let voicePlayer = null; // { audio, button }: a clip playing on the voice's page
 
+/** Stop any clip playing from a list of lines, on the voice's page or a recording's. */
 function stopLinePlayback() {
   for (const player of [linePlayer, voicePlayer]) {
     if (!player) continue;
@@ -1030,6 +1355,8 @@ function stopLinePlayback() {
   linePlayer = voicePlayer = null;
 }
 
+// Play a clip on a list's ▶ button, which turns into ■; a second click, or
+// another clip, stops it. `which` is "voice" (the voice's page) or "line" (a recording's).
 function playUrl(url, button, which) {
   const again = (which === "voice" ? voicePlayer : linePlayer)?.button === button;
   stopLinePlayback();
@@ -1039,6 +1366,7 @@ function playUrl(url, button, which) {
   if (which === "voice") voicePlayer = player;
   else linePlayer = player;
   button.textContent = "■";
+  // Back to ▶ when it ends or won't play, unless another clip has taken over.
   const done = () => (voicePlayer === player || linePlayer === player) && stopLinePlayback();
   audio.onended = done;
   audio.play().catch(done);
@@ -1052,9 +1380,18 @@ function pickMoreRows() {
     .filter((s) => s.status === "ready")
     .map((s) => {
       const added = voice.lines.filter((l) => l.source === s.id).length;
-      const button = el("button", { type: "button", className: "btn more-btn", textContent: `Pick by hand from “${s.name}”` });
+      const button = el("button", {
+        type: "button",
+        className: "btn more-btn",
+        textContent: `Pick by hand from “${s.name}”`,
+      });
       button.onclick = () => openSource(s);
-      return el("li", { className: "more" }, button, el("small", { textContent: `${s.count} lines found in it, ${added} added.` }));
+      return el(
+        "li",
+        { className: "more" },
+        button,
+        el("small", { textContent: `${s.count} lines found in it, ${added} added.` }),
+      );
     });
 }
 
@@ -1064,6 +1401,8 @@ function renderSuggestions() {
   const ready = voice.recordings.some((s) => s.status === "ready");
   $("#suggest-wrap").hidden = !ready;
   if (!ready) return;
+
+  // 1. Auto-pick, for as many lines as the check is short of.
   const busy = voice.recordings.some((s) => s.status === "picking");
   const list = voice.suggestions ?? [];
   const missing = Math.max(0, CHECK_LINES - voice.lines.length);
@@ -1071,29 +1410,53 @@ function renderSuggestions() {
   const count = Math.min(missing, list.length);
   auto.hidden = (!count || busy) && !picking;
   auto.disabled = picking;
-  auto.textContent = picking ? "Picking…" : `Auto-pick the ${count === 1 ? "best line" : `${count} best lines`}`;
-  auto.title = `Adds the best suggested lines until the voice has ${CHECK_LINES}, enough for a steady voice check.`;
+  auto.textContent = picking
+    ? "Picking…"
+    : `Auto-pick the ${count === 1 ? "best line" : `${count} best lines`}`;
+  auto.title =
+    `Adds the best suggested lines until the voice has ${CHECK_LINES}, ` +
+    "enough for a steady voice check.";
+
+  // 2. A row per suggested line.
   const rows = list.map((s) => {
     const play = el("button", { type: "button", className: "play", textContent: "▶" });
     play.setAttribute("aria-label", "Play this line");
-    play.onclick = () => playUrl(`/api/sources/${s.source}/audio?start=${s.start}&end=${s.end}`, play, "voice");
+    play.onclick = () =>
+      playUrl(`/api/sources/${s.source}/audio?start=${s.start}&end=${s.end}`, play, "voice");
     const key = `${s.source}:${s.start}`;
-    const add = el("button", { type: "button", className: "btn practise", textContent: adding.has(key) ? "Adding…" : "Add" });
+    const add = el("button", {
+      type: "button",
+      className: "btn practise",
+      textContent: adding.has(key) ? "Adding…" : "Add",
+    });
     add.disabled = busy || picking || adding.has(key);
     add.onclick = () => addSuggested(s);
     return el(
       "li",
       { className: "vline suggestion" },
       play,
-      el("span", { className: "vline-text" }, el("span", { className: "words-text", textContent: `“${s.text}”` }), el("small", { textContent: `${s.recording} · ${clock(s.start)} · ${(s.end - s.start).toFixed(1)} s` })),
+      el(
+        "span",
+        { className: "vline-text" },
+        el("span", { className: "words-text", textContent: `“${s.text}”` }),
+        el("small", {
+          textContent: `${s.recording} · ${clock(s.start)} · ${(s.end - s.start).toFixed(1)} s`,
+        }),
+      ),
       add,
     );
   });
+
+  // 3. A note while lines are being added or when none are left, then the rows
+  //    to pick by hand.
   const note = busy
     ? el("li", { className: "none", textContent: "Adding the best lines from a new recording…" })
     : list.length
       ? null
-      : el("li", { className: "none", textContent: "Every clear line of its recordings is added." });
+      : el("li", {
+          className: "none",
+          textContent: "Every clear line of its recordings is added.",
+        });
   $("#suggestions").replaceChildren(...[note, ...rows, ...pickMoreRows()].filter(Boolean));
 }
 
@@ -1102,6 +1465,7 @@ function renderSuggestions() {
 const adding = new Set(); // "<recording>:<start>" of suggested lines being added
 let picking = false; // auto-pick is running
 
+/** Add one suggested line to the voice; the server cleans it of the background first. */
 async function addSuggested(s) {
   const key = `${s.source}:${s.start}`;
   if (adding.has(key) || picking) return;
@@ -1121,16 +1485,27 @@ async function addSuggested(s) {
   }
 }
 
+/** Add the best suggested lines until the voice has CHECK_LINES. */
 async function autoPick() {
   if (picking) return;
   picking = true;
   renderSuggestions();
-  setStatus("Picking the best lines: each is separated from the background first, a few seconds a line…");
+  setStatus(
+    "Picking the best lines: each is separated from the background first, a few seconds a line…",
+  );
   try {
-    const { added } = await send(`/api/voices/${voice.id}/autopick`, "POST", { want: CHECK_LINES });
+    const { added } = await send(`/api/voices/${voice.id}/autopick`, "POST", {
+      want: CHECK_LINES,
+    });
     await refreshLists();
     await refreshVoice();
-    setStatus(added.length ? `Added ${plural(added.length, "line")}. ${voice.check_set.length >= voice.min_check_lines ? "You can run a voice check now." : ""}` : "There was nothing left to add.");
+    setStatus(
+      added.length
+        ? `Added ${plural(added.length, "line")}. ${
+            voice.check_set.length >= voice.min_check_lines ? "You can run a voice check now." : ""
+          }`
+        : "There was nothing left to add.",
+    );
   } catch (err) {
     setStatus(err.message, true);
   } finally {
@@ -1139,12 +1514,20 @@ async function autoPick() {
   }
 }
 
+/** The voice's lines, each to play, tick for the voice check, or practise. */
 function renderVoiceLines() {
   const ticked = new Set(voice.check_set);
-  $("#lines-head").textContent = voice.lines.length ? `Your lines (${voice.lines.length})` : "Your lines";
+  $("#lines-head").textContent = voice.lines.length
+    ? `Your lines (${voice.lines.length})`
+    : "Your lines";
   if (!voice.lines.length) {
     $("#voice-lines").replaceChildren(
-      el("li", { className: "none", textContent: voice.recordings.length ? "No lines added yet: pick from the suggested lines below." : "No lines yet. Add a recording or a clip below." }),
+      el("li", {
+        className: "none",
+        textContent: voice.recordings.length
+          ? "No lines added yet: pick from the suggested lines below."
+          : "No lines yet. Add a recording or a clip below.",
+      }),
     );
     return;
   }
@@ -1155,17 +1538,35 @@ function renderVoiceLines() {
       play.onclick = () => playUrl(`/api/targets/${line.id}/audio`, play, "voice");
       const box = el("input", { type: "checkbox", checked: ticked.has(line.id) });
       box.onchange = () => toggleCheckLine(line.id, box.checked);
-      const tick = el("label", { className: "in-check", title: "Use this line in the voice check" }, box, " check");
-      const practise = el("button", { type: "button", className: "btn practise", textContent: line.takes ? "Practise" : "Start" });
+      const tick = el(
+        "label",
+        { className: "in-check", title: "Use this line in the voice check" },
+        box,
+        " check",
+      );
+      const practise = el("button", {
+        type: "button",
+        className: "btn practise",
+        textContent: line.takes ? "Practise" : "Start",
+      });
       practise.onclick = () => openLine(line);
       const stats =
-        (line.takes ? `best ${Math.round(line.best)} · last ${Math.round(line.last_score ?? line.best)} · ${plural(line.takes, "take")}` : "not practised yet") +
+        (line.takes
+          ? `best ${Math.round(line.best)} · ` +
+            `last ${Math.round(line.last_score ?? line.best)} · ` +
+            `${plural(line.takes, "take")}`
+          : "not practised yet") +
         (line.pitch_suspect ? " · pitch unreliable: a poor line to train pitch on" : "");
       return el(
         "li",
         { className: "vline" },
         play,
-        el("span", { className: "vline-text" }, el("span", { className: "words-text", textContent: `“${lineText(line)}”` }), el("small", { textContent: stats })),
+        el(
+          "span",
+          { className: "vline-text" },
+          el("span", { className: "words-text", textContent: `“${lineText(line)}”` }),
+          el("small", { textContent: stats }),
+        ),
         tick,
         practise,
       );
@@ -1173,8 +1574,11 @@ function renderVoiceLines() {
   );
 }
 
+/** Tick or untick a line for the voice check. */
 async function toggleCheckLine(id, on) {
-  const ids = voice.lines.map((l) => l.id).filter((i) => (i === id ? on : voice.check_set.includes(i)));
+  const ids = voice.lines
+    .map((l) => l.id)
+    .filter((i) => (i === id ? on : voice.check_set.includes(i)));
   try {
     const card = await send(`/api/voices/${voice.id}`, "PATCH", { check_lines: ids });
     voice.check_set = card.check_set;
@@ -1184,6 +1588,7 @@ async function toggleCheckLine(id, on) {
   }
 }
 
+/** The voice's recordings: how far each has got, and a button to pick lines from it. */
 function renderRecordings() {
   $("#recordings-wrap").hidden = !voice.recordings.length;
   $("#recordings").replaceChildren(
@@ -1193,11 +1598,20 @@ function renderRecordings() {
       open.onclick = () => openSource(s);
       const added = voice.lines.filter((l) => l.source === s.id).length;
       const speakers = s.speakers?.length > 1 ? ` · ${s.speakers.length} speakers` : "";
-      const note = s.status === "ready" ? `${s.count} lines found · ${added} added${speakers}` : s.status === "failed" ? s.error || "didn't work" : `${stepText(s)}…`;
+      const note =
+        s.status === "ready"
+          ? `${s.count} lines found · ${added} added${speakers}`
+          : s.status === "failed"
+            ? s.error || "didn't work"
+            : `${stepText(s)}…`;
       let source;
       if (s.link) source = videoLink(s);
       else if (s.status === "ready") {
-        source = el("button", { type: "button", className: "link add-link", textContent: "Add its YouTube link" });
+        source = el("button", {
+          type: "button",
+          className: "link add-link",
+          textContent: "Add its YouTube link",
+        });
         source.onclick = () => addRecordingLink(s);
       }
       return el(
@@ -1216,6 +1630,8 @@ function renderRecordings() {
   );
 }
 
+// Rename the open voice: to `to` when it is a name, else to what the person types.
+// (As a click handler it is handed the click event, which isn't a name.)
 async function renameVoice(to = null) {
   const name = (typeof to === "string" ? to : prompt("Rename this voice:", voice.name))?.trim();
   if (!name || name === voice.name) return;
@@ -1230,6 +1646,7 @@ async function renameVoice(to = null) {
   }
 }
 
+/** Delete the open voice, once confirmed, with everything in it. */
 async function deleteVoice() {
   if (!confirm(`Delete "${voice.name}" with all its lines, takes and recordings?`)) return;
   try {
@@ -1241,43 +1658,79 @@ async function deleteVoice() {
   }
 }
 
+/** How the voice sounds overall, in words: its pitch, pace and how full or breathy it is. */
 function describeVoice(s) {
   const parts = [];
-  if (s.pitch) parts.push(`around ${s.pitch} Hz (${noteName(s.pitch)}), usually ${s.low}–${s.high} Hz`);
+  if (s.pitch) {
+    parts.push(`around ${s.pitch} Hz (${noteName(s.pitch)}), usually ${s.low}–${s.high} Hz`);
+  }
   if (s.rate != null) parts.push(`about ${s.rate} words a second`);
   // Read speech is voiced on 53-60% of its word frames; a soft, breathy voice on about 45%.
-  if (s.voiced != null) parts.push(s.voiced >= 0.52 ? "a full, clear voice" : s.voiced >= 0.38 ? "soft, with some breath in it" : "breathy, often close to a whisper");
+  if (s.voiced != null) {
+    parts.push(
+      s.voiced >= 0.52
+        ? "a full, clear voice"
+        : s.voiced >= 0.38
+          ? "soft, with some breath in it"
+          : "breathy, often close to a whisper",
+    );
+  }
   return `${parts.join(" · ")}.`;
 }
 
+/** "brighter (formants 6% higher)" or "darker (...)", from a resonance gap in semitones. */
+function formantText(semitones) {
+  const percent = Math.round(Math.abs(2 ** (semitones / 12) - 1) * 100);
+  const way = semitones > 0 ? "higher" : "lower";
+  return `${semitones > 0 ? "brighter" : "darker"} (formants ${percent}% ${way})`;
+}
+
+/** The habits worth naming in these averages over takes: pitch, resonance and pace. */
 function habitList(h) {
   const habits = [];
+  // At least a semitone off in pitch, 0.4 semitones in formants, or 10% in pace.
   if (h.pitch != null && Math.abs(h.pitch) >= 1) {
-    habits.push(`${Math.abs(h.pitch).toFixed(1)} semitones ${h.pitch > 0 ? "high" : "low"}${h.take_f0 ? ` (you average ${Math.round(h.take_f0)} Hz, ${noteName(h.take_f0)})` : ""}`);
+    const average = h.take_f0
+      ? ` (you average ${Math.round(h.take_f0)} Hz, ${noteName(h.take_f0)})`
+      : "";
+    const way = h.pitch > 0 ? "high" : "low";
+    habits.push(`${Math.abs(h.pitch).toFixed(1)} semitones ${way}${average}`);
   }
-  if (h.resonance != null && Math.abs(h.resonance) >= 0.4) {
-    const percent = Math.round(Math.abs(2 ** (h.resonance / 12) - 1) * 100);
-    habits.push(`${h.resonance > 0 ? "brighter" : "darker"} (formants ${percent}% ${h.resonance > 0 ? "higher" : "lower"})`);
+  if (h.resonance != null && Math.abs(h.resonance) >= 0.4) habits.push(formantText(h.resonance));
+  if (h.tempo != null && Math.abs(h.tempo - 1) >= 0.1) {
+    habits.push(`${Math.round(Math.abs(h.tempo - 1) * 100)}% ${h.tempo > 1 ? "slower" : "faster"}`);
   }
-  if (h.tempo != null && Math.abs(h.tempo - 1) >= 0.1) habits.push(`${Math.round(Math.abs(h.tempo - 1) * 100)}% ${h.tempo > 1 ? "slower" : "faster"}`);
   return habits;
 }
 
+/** What you do the same way in all of the voice's lines, from your recent takes. */
 function describeYou(you) {
-  if (!you) return "Practise a few of its lines and this shows what you do the same way in all of them: the habits worth fixing first.";
+  if (!you) {
+    return (
+      "Practise a few of its lines and this shows what you do the same way in all of them: " +
+      "the habits worth fixing first."
+    );
+  }
   const habits = habitList(you);
   const over = `Over your last ${plural(you.takes, "take")} on its lines`;
-  if (!habits.length) return `${over}, no habit stands out: pitch, brightness and pace are all close on average.`;
-  return `${over}: ${habits.join(" · ")}. That shows up in every line, so fixing it lifts them all.`;
+  if (!habits.length) {
+    return `${over}, no habit stands out: pitch, brightness and pace are all close on average.`;
+  }
+  return (
+    `${over}: ${habits.join(" · ")}. ` +
+    "That shows up in every line, so fixing it lifts them all."
+  );
 }
 
-// ---------- adding lines to the open voice ----------
+// --- ADDING LINES ---
+// To the open voice: a file, a link or a recorded clip.
 
 // How long a file plays for, from its header alone; null when the browser can't tell.
 function mediaDuration(file) {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(file);
     const media = document.createElement("video"); // reads audio files too
+    // Answer once with the duration; the object URL is let go.
     const done = (value) => {
       URL.revokeObjectURL(url);
       resolve(value);
@@ -1285,14 +1738,17 @@ function mediaDuration(file) {
     media.preload = "metadata";
     media.onloadedmetadata = () => done(Number.isFinite(media.duration) ? media.duration : null);
     media.onerror = () => done(null);
-    setTimeout(() => done(null), 5000);
+    setTimeout(() => done(null), 5000); // give up after 5 s
     media.src = url;
   });
 }
 
+// A file for the open voice: a short one opens to be trimmed to the line; a
+// long one is uploaded and split into lines on the server.
 async function addFile(file) {
   const name = file.name.replace(/\.[^.]+$/, "").slice(0, 80);
   const seconds = await mediaDuration(file);
+  // Without a duration, a file over 20 MB counts as long.
   const long = seconds == null ? file.size > 20e6 : seconds > LONG_SECONDS;
   if (!long) return openTrim(file, { name, back: "voice", extra: { voice: voice.id } });
   setStatus(`Uploading ${file.name}…`);
@@ -1300,13 +1756,17 @@ async function addFile(file) {
     const params = new URLSearchParams({ name, filename: file.name, voice: voice.id });
     const meta = await api(`/api/sources?${params}`, { method: "POST", body: file });
     sources.push(meta);
-    setStatus("Finding the lines in it. That takes a minute or two for a long video; you can practise meanwhile.");
+    setStatus(
+      "Finding the lines in it. " +
+        "That takes a minute or two for a long video; you can practise meanwhile.",
+    );
     await refreshVoice();
   } catch (err) {
     setStatus(err.message, true);
   }
 }
 
+/** Add a video link to the open voice: the server downloads it and splits it into lines. */
 async function addLink(event) {
   event.preventDefault();
   const url = $("#new-link").value.trim();
@@ -1315,17 +1775,26 @@ async function addLink(event) {
     const meta = await send("/api/sources/link", "POST", { url, voice: voice.id });
     $("#new-link").value = "";
     sources.push(meta);
-    setStatus("Downloading it and finding the lines. That takes a minute or two; you can practise meanwhile.");
+    setStatus(
+      "Downloading it and finding the lines. " +
+        "That takes a minute or two; you can practise meanwhile.",
+    );
     await refreshVoice();
   } catch (err) {
     setStatus(err.message, true);
   }
 }
 
+// Add a clip as a new line, with `extra` saying whose it is and where it came
+// from, then open it.
 async function createTarget(samples, name, extra = {}) {
-  setStatus("Adding the line: separating the voice from any music, which can take a little while…");
+  setStatus(
+    "Adding the line: separating the voice from any music, which can take a little while…",
+  );
   const params = new URLSearchParams({ name: name || "Clip" });
-  for (const key of ["voice", "source", "line_start"]) if (extra[key] != null) params.set(key, extra[key]);
+  for (const key of ["voice", "source", "line_start"]) {
+    if (extra[key] != null) params.set(key, extra[key]);
+  }
   try {
     const target = await postWav(`/api/targets?${params}`, encodeWav(samples));
     await refreshLists();
@@ -1336,16 +1805,22 @@ async function createTarget(samples, name, extra = {}) {
   }
 }
 
-// ---------- a recording: its lines to pick from ----------
+// --- RECORDING PAGE ---
+// A recording: its lines to pick from.
 
+// What each flag the server puts on a line means, shown when hovering the tag.
 const FLAG_NOTES = {
-  whispered: "Mostly whispered: there's little pitch to compare, so Pitch, Melody and Resonance can't be scored.",
+  whispered:
+    "Mostly whispered: there's little pitch to compare, so Pitch, Melody and Resonance " +
+    "can't be scored.",
   "other voice": "Sounds like a different person from most of the recording.",
   unclear: "The speech recogniser wasn't sure of the words; check the line after adding it.",
 };
 
+// Whether a recording is still being processed.
 const unfinished = (s) => s.status !== "ready" && s.status !== "failed";
 
+/** A time in seconds as m:ss, or h:mm:ss from an hour. */
 function clock(seconds) {
   const s = Math.floor(seconds);
   const parts = [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60];
@@ -1353,6 +1828,7 @@ function clock(seconds) {
   return parts[0] ? `${parts[0]}:${mmss.padStart(5, "0")}` : mmss;
 }
 
+/** Where a recording has got to, in a few words, such as "finding lines 40%". */
 function stepText(s) {
   const pct = s.progress == null ? "" : ` ${Math.round(s.progress * 100)}%`;
   const steps = {
@@ -1369,6 +1845,7 @@ function stepText(s) {
   return steps[s.status] ?? s.status;
 }
 
+/** Open a recording's page; its lines follow from the server. */
 async function openSource(meta) {
   leave();
   source = { ...meta, lines: null };
@@ -1382,6 +1859,7 @@ async function openSource(meta) {
   await refreshSource();
 }
 
+/** Reload the open recording and every line, and redraw its page. */
 async function refreshSource() {
   const id = source?.id;
   if (!id) return;
@@ -1398,27 +1876,44 @@ async function refreshSource() {
   }
 }
 
+// The recording's page: its status, speakers, suggested lines and, with
+// `withLines`, the full list (left as it is otherwise).
 function renderSource(withLines = true) {
+  // 1. Its name, link and status.
   $("#source-name").textContent = source.name || "New video";
   $("#source-link").hidden = !source.link;
-  if (source.link) $("#source-link").replaceWith(Object.assign(videoLink(source), { id: "source-link" }));
+  if (source.link) {
+    $("#source-link").replaceWith(Object.assign(videoLink(source), { id: "source-link" }));
+  }
   let text;
   if (source.status === "failed") text = source.error || "That didn't work.";
   else if (unfinished(source)) {
     const step = stepText(source);
-    text = `${step[0].toUpperCase()}${step.slice(1)}… A long video takes a minute or two. You can practise something else meanwhile.`;
+    text =
+      `${step[0].toUpperCase()}${step.slice(1)}… ` +
+      "A long video takes a minute or two. You can practise something else meanwhile.";
   } else {
     text =
-      `${source.count} lines in ${clock(source.duration)}, ${source.good} of them good to practise on. ` +
-      "Pick one, check where it starts and ends, and it's cleaned of music and background and added to the voice.";
+      `${source.count} lines in ${clock(source.duration)}, ` +
+      `${source.good} of them good to practise on. ` +
+      "Pick one, check where it starts and ends, " +
+      "and it's cleaned of music and background and added to the voice.";
   }
   $("#source-status").textContent = text;
   $("#source-status").classList.toggle("error", source.status === "failed");
+
+  // 2. Its speakers, when there is more than one.
   const many = source.speakers?.length > 1;
   $("#source-speakers").hidden = !many;
   if (many) {
-    $("#source-speakers").textContent = `${source.speakers.length} speakers. The voice is speaker ${source.speaker + 1}; the others' lines are tagged “other voice”. Change it under “Who's speaking” on the voice's page.`;
+    $("#source-speakers").textContent =
+      `${source.speakers.length} speakers. ` +
+      `The voice is speaker ${source.speaker + 1}; ` +
+      "the others' lines are tagged “other voice”. " +
+      "Change it under “Who's speaking” on the voice's page.";
   }
+
+  // 3. The suggested lines, then all of them.
   const suggested = (source.suggested ?? []).map((i) => source.lines?.[i]).filter(Boolean);
   $("#suggested-wrap").hidden = !suggested.length;
   $("#suggested").replaceChildren(...suggested.map(lineItem));
@@ -1428,8 +1923,11 @@ function renderSource(withLines = true) {
   else if (withLines) renderLines();
 }
 
-const searchable = (text) => text.toLowerCase().replace(/[^a-z0-9' ]+/g, " ").replace(/\s+/g, " ").trim();
+// Text reduced to lowercase words, for searching lines.
+const searchable = (text) =>
+  text.toLowerCase().replace(/[^a-z0-9' ]+/g, " ").replace(/\s+/g, " ").trim();
 
+/** The recording's full list of lines, filtered by the search box and "only good". */
 function renderLines() {
   if (!source?.lines) return;
   const query = searchable($("#line-search").value);
@@ -1440,31 +1938,62 @@ function renderLines() {
   $("#lines").replaceChildren(...lines.map(lineItem));
   if (!lines.length) {
     $("#lines").append(
-      el("li", { className: "none", textContent: query ? "No line has those words." : "Every line has a flag; untick the box to see them." }),
+      el("li", {
+        className: "none",
+        textContent: query
+          ? "No line has those words."
+          : "Every line has a flag; untick the box to see them.",
+      }),
     );
   }
 }
 
-// A line already added from this recording, if any.
+// A line already added from this recording, if any (its start within 50 ms).
 const practised = (line, rec = source) =>
-  targets.find((t) => t.source === rec.id && t.line_start != null && Math.abs(t.line_start - line.start) < 0.05);
+  targets.find(
+    (t) =>
+      t.source === rec.id && t.line_start != null && Math.abs(t.line_start - line.start) < 0.05,
+  );
 
-let linePlayer = null; // { audio, button }
+let linePlayer = null; // { audio, button }: a clip playing on a recording's page
 
+/** A row for one of the recording's lines: play it, its tags, and Add or Open. */
 function lineItem(line) {
   const play = el("button", { type: "button", className: "play", textContent: "▶" });
   play.setAttribute("aria-label", "Play this line");
-  play.onclick = () => playUrl(`/api/sources/${source.id}/audio?start=${line.start}&end=${line.end}`, play, "line");
+  play.onclick = () =>
+    playUrl(`/api/sources/${source.id}/audio?start=${line.start}&end=${line.end}`, play, "line");
   const text = el("span", { className: "text", textContent: line.text });
   if (source.speakers?.length > 1 && line.speaker != null) {
-    text.append(" ", el("i", { className: `tag speaker-tag s${line.speaker % 4}`, textContent: `speaker ${line.speaker + 1}` }));
+    text.append(
+      " ",
+      el("i", {
+        className: `tag speaker-tag s${line.speaker % 4}`, // a colour per speaker, from four
+        textContent: `speaker ${line.speaker + 1}`,
+      }),
+    );
   }
-  for (const flag of line.flags) text.append(" ", el("i", { className: "tag", textContent: flag, title: FLAG_NOTES[flag] ?? "" }));
+  for (const flag of line.flags) {
+    text.append(
+      " ",
+      el("i", { className: "tag", textContent: flag, title: FLAG_NOTES[flag] ?? "" }),
+    );
+  }
   const done = practised(line);
   if (done) {
-    text.append(" ", el("i", { className: "tag done", textContent: done.best == null ? "added" : `best ${Math.round(done.best)}` }));
+    text.append(
+      " ",
+      el("i", {
+        className: "tag done",
+        textContent: done.best == null ? "added" : `best ${Math.round(done.best)}`,
+      }),
+    );
   }
-  const use = el("button", { type: "button", className: "btn practise", textContent: done ? "Open" : "Add" });
+  const use = el("button", {
+    type: "button",
+    className: "btn practise",
+    textContent: done ? "Open" : "Add",
+  });
   use.title = done ? "Practise this line" : "Add this line to the voice and practise it";
   use.onclick = () => (done ? openLine(done) : practiseLine(line));
   return el(
@@ -1498,6 +2027,7 @@ async function practiseLine(line, rec = source) {
   }
 }
 
+/** Delete the open recording, once confirmed; the lines added from it stay. */
 async function deleteSource() {
   if (!confirm(`Delete the recording "${source.name}"? Lines you've already added stay.`)) return;
   const owner = source.voice_id;
@@ -1511,13 +2041,18 @@ async function deleteSource() {
   }
 }
 
-// ---------- trimming a new clip to the line ----------
+// --- TRIM PAGE ---
+// Trimming a new clip to the line.
 
 let trimming = null; // { samples, name, back, extra }
-let trimPlayer = null;
+let trimPlayer = null; // the AudioContext playing the selection
 
-// `start` and `end` preselect a part; `back` is the page Cancel returns to.
-async function openTrim(blob, { start = 0, end = null, name = "", back = null, extra = {} } = {}) {
+// Open a clip to trim. `start` and `end` preselect a part; `back` is the page
+// Cancel returns to; `extra` goes with the new line (see createTarget).
+async function openTrim(
+  blob,
+  { start = 0, end = null, name = "", back = null, extra = {} } = {},
+) {
   let samples;
   try {
     samples = await decodeMono(blob, MAX_TRIM_SECONDS);
@@ -1537,6 +2072,7 @@ async function openTrim(blob, { start = 0, end = null, name = "", back = null, e
   renderTrim();
 }
 
+/** The selection, [start, end] in seconds, whichever way round the boxes are. */
 function trimRange() {
   let a = Number($("#trim-start").value);
   let b = Number($("#trim-end").value);
@@ -1544,17 +2080,21 @@ function trimRange() {
   return [a, b];
 }
 
+/** The selection's length, whether it can be used (0.5 s to MAX_SECONDS), and the waveform. */
 function renderTrim() {
   if (!trimming) return;
   const [a, b] = trimRange();
   const length = b - a;
   const ok = length >= 0.5 && length <= MAX_SECONDS;
-  $("#trim-len").textContent = ok ? `${length.toFixed(1)} s selected` : `${length.toFixed(1)} s — pick 0.5 to ${MAX_SECONDS} s`;
+  $("#trim-len").textContent = ok
+    ? `${length.toFixed(1)} s selected`
+    : `${length.toFixed(1)} s — pick 0.5 to ${MAX_SECONDS} s`;
   $("#trim-len").classList.toggle("error", !ok);
   $("#trim-use").disabled = !ok;
   drawWave(a, b);
 }
 
+/** The clip's waveform, with the selection from a to b seconds in the accent colour. */
 function drawWave(a, b) {
   const canvas = $("#trim-wave");
   const { samples } = trimming;
@@ -1585,6 +2125,7 @@ function drawWave(a, b) {
   }
 }
 
+/** Stop playing the selection. */
 function stopTrimPlayback() {
   if (trimPlayer) {
     trimPlayer.close();
@@ -1592,6 +2133,7 @@ function stopTrimPlayback() {
   }
 }
 
+/** Play the selection. */
 function playTrim() {
   stopTrimPlayback();
   const [a, b] = trimRange();
@@ -1607,6 +2149,7 @@ function playTrim() {
   trimPlayer = ctx;
 }
 
+/** Leave the trim page for the page it was opened from, or the nearest one still open. */
 function closeTrim() {
   stopTrimPlayback();
   const back = trimming?.back;
@@ -1617,6 +2160,7 @@ function closeTrim() {
   else show(voices.length ? "home" : "empty");
 }
 
+/** Add the selection as a new line. */
 async function useTrim() {
   const [a, b] = trimRange();
   const part = trimming.samples.slice(Math.round(a * SR), Math.round(b * SR));
@@ -1625,13 +2169,19 @@ async function useTrim() {
   await createTarget(part, name, extra);
 }
 
-// ---------- a line: listen, record, improve ----------
+// --- LINE PAGE ---
+// A line: listen, record, improve.
 
+// The part picked by hand to work on for the open line ("" for Auto).
 const chosenFocus = () => (current && stored.get(`echo.focus.${current.id}`)) || "";
+// The part being worked on: picked by hand, else the coach's pick for the take on screen.
 const currentFocus = () => chosenFocus() || shown?.coach?.focus || null;
+// Whether the open line is the one a voice check is on.
 const inCheck = () => Boolean(check && current && check.lines[check.index]?.id === current.id);
 
+/** Open a line's page; `keepCheck` carries a voice check under way onto it. */
 async function openLine(target, { keepCheck = false } = {}) {
+  // 1. Leave the page before, and show this one straight away.
   const running = keepCheck ? check : null;
   leave();
   check = running;
@@ -1654,6 +2204,8 @@ async function openLine(target, { keepCheck = false } = {}) {
   renderNote();
   renderLine();
   setShown(null);
+
+  // 2. Its guide and takes, then the last take, unless another page was opened meanwhile.
   try {
     const [guide, list] = await Promise.all([
       api(`/api/targets/${target.id}/profile`),
@@ -1665,7 +2217,10 @@ async function openLine(target, { keepCheck = false } = {}) {
     renderNote();
     renderPitchWarning();
     // In a voice check the line starts fresh: earlier takes aren't shown.
-    const last = takes.length && !inCheck() ? await api(`/api/targets/${target.id}/takes/${takes.at(-1).id}`) : null;
+    const last =
+      takes.length && !inCheck()
+        ? await api(`/api/targets/${target.id}/takes/${takes.at(-1).id}`)
+        : null;
     if (current?.id !== target.id) return;
     setShown(last);
   } catch (err) {
@@ -1673,6 +2228,7 @@ async function openLine(target, { keepCheck = false } = {}) {
   }
 }
 
+/** Put a take on screen (null for none), and redraw everything that depends on it. */
 function setShown(take) {
   shown = take;
   selectedWord = null;
@@ -1686,24 +2242,32 @@ function setShown(take) {
   drawGuide();
 }
 
+/** A warning when the line's pitch reads far from the voice's usual pitch. */
 function renderPitchWarning() {
   const usual = voiceOf(current?.voice_id);
   $("#pitch-warning").hidden = !profile?.pitch_suspect;
   if (profile?.pitch_suspect) {
     $("#pitch-warning").textContent =
-      `This line's pitch reads ${Math.round(profile.median_f0 ?? 0)} Hz, far from the voice's usual pitch: probably creaky voice, or the pitch tracker off by an octave. ` +
-      `Its Pitch and Melody aren't scored, and it's left out of the voice check. To train pitch, use another line${usual ? ` of ${usual.name}` : ""}.`;
+      `This line's pitch reads ${Math.round(profile.median_f0 ?? 0)} Hz, ` +
+      "far from the voice's usual pitch: " +
+      "probably creaky voice, or the pitch tracker off by an octave. " +
+      "Its Pitch and Melody aren't scored, and it's left out of the voice check. " +
+      `To train pitch, use another line${usual ? ` of ${usual.name}` : ""}.`;
   }
 }
 
+/** The line's words, with the button to edit them. */
 function renderLine() {
-  $("#target-line").textContent = current?.words?.length ? `“${current.words.join(" ")}”` : "No words recognised in this clip.";
+  $("#target-line").textContent = current?.words?.length
+    ? `“${current.words.join(" ")}”`
+    : "No words recognised in this clip.";
   $("#target-line").classList.toggle("empty", !current?.words?.length);
   $("#edit-line").textContent = current?.words?.length ? "Edit" : "Add the words";
   $("#line-form").hidden = true;
   $("#edit-line").parentElement.hidden = false;
 }
 
+/** Open the box to correct the line's words. */
 function editLine() {
   $("#line-input").value = (current.words ?? []).join(" ");
   $("#edit-line").parentElement.hidden = true;
@@ -1711,10 +2275,13 @@ function editLine() {
   $("#line-input").focus();
 }
 
+/** Save the corrected words. */
 async function saveLine(event) {
   event.preventDefault();
   try {
-    const meta = await send(`/api/targets/${current.id}`, "PATCH", { line: $("#line-input").value });
+    const meta = await send(`/api/targets/${current.id}`, "PATCH", {
+      line: $("#line-input").value,
+    });
     current.words = meta.words;
     targets = targets.map((t) => (t.id === meta.id ? { ...t, words: meta.words } : t));
     renderLine();
@@ -1724,8 +2291,9 @@ async function saveLine(event) {
   }
 }
 
+/** Delete the open line, once confirmed, with its takes. */
 async function deleteTarget() {
-  if (!confirm(`Delete this line and all its takes?`)) return;
+  if (!confirm("Delete this line and all its takes?")) return;
   const owner = current.voice_id;
   try {
     await api(`/api/targets/${current.id}`, { method: "DELETE" });
@@ -1746,6 +2314,7 @@ function steps() {
   }
 }
 
+/** Count one more of a step done on the open line, and tick it off on the checklist. */
 function markStep(key) {
   if (!current) return;
   const done = steps();
@@ -1754,18 +2323,26 @@ function markStep(key) {
   if (!takes.length) renderCoach();
 }
 
-// ---------- listening: the target, your take, one word of each ----------
+// --- LISTENING ---
+// The target, your take, one word of each.
 
 let playing = null; // { kind, cancelled }
 
+/** Show which of the line's play buttons is playing. */
 function updatePlayButtons() {
-  for (const [id, kind] of [["#play-target", "target"], ["#play-take", "take"], ["#play-both", "both"]]) {
+  const buttons = [
+    ["#play-target", "target"],
+    ["#play-take", "take"],
+    ["#play-both", "both"],
+  ];
+  for (const [id, kind] of buttons) {
     const on = playing?.kind === kind;
     $(id).classList.toggle("on", on);
     $(id).querySelector(".icon").textContent = on ? "■" : "▶";
   }
 }
 
+/** Stop the target and the take, and take the playhead off the guide. */
 function stopPlayback() {
   if (playing) playing.cancelled = true;
   playing = null;
@@ -1775,14 +2352,20 @@ function stopPlayback() {
   drawGuide();
 }
 
+/** Resolves once the audio element knows its duration; rejects if it can't load. */
 function loaded(audio) {
   if (audio.readyState >= 1) return Promise.resolve();
   return new Promise((resolve, reject) => {
     audio.addEventListener("loadedmetadata", resolve, { once: true });
-    audio.addEventListener("error", () => reject(new Error("Couldn't load that audio.")), { once: true });
+    audio.addEventListener(
+      "error",
+      () => reject(new Error("Couldn't load that audio.")),
+      { once: true },
+    );
   });
 }
 
+// Resolves after `ms` milliseconds.
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Play `audio` from `start` to `end` (seconds; null for the end), moving the
@@ -1795,6 +2378,7 @@ async function playSpan(token, audio, start, end, toGuide) {
   audio.currentTime = start;
   await audio.play();
   await new Promise((resolve) => {
+    // Every frame: move the playhead, until the span ends or is cancelled.
     const tick = () => {
       // Whatever cancelled this has paused the audio already, and may be
       // playing it again: leave it alone.
@@ -1828,6 +2412,7 @@ function takeToTarget(t) {
   return points.at(-1)[1];
 }
 
+// Play the target, the take, or "both", one after the other; a second click stops it.
 async function play(kind) {
   const again = playing?.kind === kind;
   stopPlayback();
@@ -1838,14 +2423,18 @@ async function play(kind) {
   if (kind !== "take") markStep("listened");
   try {
     if (kind !== "take") await playSpan(token, $("#target-audio"), 0, null, (t) => t);
-    if (kind === "both" && !token.cancelled) await wait(450);
-    if (kind !== "target" && !token.cancelled) await playSpan(token, $("#take-audio"), 0, null, takeToTarget);
+    if (kind === "both" && !token.cancelled) await wait(450); // a gap between the two
+    if (kind !== "target" && !token.cancelled) {
+      await playSpan(token, $("#take-audio"), 0, null, takeToTarget);
+    }
   } catch (err) {
-    if (!token.cancelled) setStatus(err.message, true); // a play() cut short by a newer one isn't an error
+    // A play() cut short by a newer one isn't an error.
+    if (!token.cancelled) setStatus(err.message, true);
   }
   if (playing === token) stopPlayback();
 }
 
+/** Play one word of the target, then the same word of the take on screen. */
 async function playWord(index) {
   const word = shownWords()[index];
   stopPlayback();
@@ -1863,6 +2452,25 @@ async function playWord(index) {
   if (playing === token) stopPlayback();
 }
 
+// A soft triangle tone at `hz`: it fades in over 80 ms, holds until `hold`,
+// fades out by `end` and stops at `stop`, in seconds from now.
+function playTone(hz, hold, end, stop) {
+  const ctx = new AudioContext();
+  const tone = ctx.createOscillator();
+  const level = ctx.createGain();
+  tone.type = "triangle";
+  tone.frequency.value = hz;
+  const now = ctx.currentTime;
+  level.gain.setValueAtTime(0, now);
+  level.gain.linearRampToValueAtTime(0.25, now + 0.08);
+  level.gain.setValueAtTime(0.25, now + hold);
+  level.gain.linearRampToValueAtTime(0, now + end);
+  tone.connect(level).connect(ctx.destination);
+  tone.start(now);
+  tone.stop(now + stop);
+  tone.onended = () => ctx.close();
+}
+
 // A soft tone on the target's typical pitch, to hum along to.
 async function playNote() {
   if (!profile && current) {
@@ -1873,28 +2481,18 @@ async function playNote() {
   }
   const hz = profile?.median_f0;
   if (!hz) return;
-  const ctx = new AudioContext();
-  const tone = ctx.createOscillator();
-  const level = ctx.createGain();
-  tone.type = "triangle";
-  tone.frequency.value = hz;
-  const now = ctx.currentTime;
-  level.gain.setValueAtTime(0, now);
-  level.gain.linearRampToValueAtTime(0.25, now + 0.08);
-  level.gain.setValueAtTime(0.25, now + 1.4);
-  level.gain.linearRampToValueAtTime(0, now + 1.8);
-  tone.connect(level).connect(ctx.destination);
-  tone.start(now);
-  tone.stop(now + 1.85);
-  tone.onended = () => ctx.close();
+  playTone(hz, 1.4, 1.8, 1.85);
   markStep("note");
 }
 
+/** The note button: the target's typical pitch, or disabled when the clip has none. */
 function renderNote() {
   const hz = profile?.median_f0;
   $("#play-note").disabled = !hz;
   $("#note-name").textContent = hz ? noteName(hz) : "Note";
-  $("#play-note").title = hz ? `${noteName(hz)}, ${Math.round(hz)} Hz: the target's typical pitch. Play it and hum it.` : "No clear pitch in this clip";
+  $("#play-note").title = hz
+    ? `${noteName(hz)}, ${Math.round(hz)} Hz: the target's typical pitch. Play it and hum it.`
+    : "No clear pitch in this clip";
 }
 
 // Speak along with the target, with the live guide on: nothing is saved.
@@ -1908,6 +2506,8 @@ async function speakAlong() {
   if (session?.along) await stopRecording();
 }
 
+// Pick and play the word furthest off: the coach's first word, else the
+// lowest-scoring one on the part being worked on.
 function playWorstWord() {
   const words = shownWords();
   const name = shown?.coach?.words?.[0];
@@ -1927,24 +2527,32 @@ function playWorstWord() {
   playWord(index);
 }
 
+/** Set the playback rate of the target and the take (1, ¾ or ½). */
 function setSpeed(rate) {
   speed = rate;
-  for (const b of document.querySelectorAll(".speed button")) b.setAttribute("aria-pressed", String(Number(b.dataset.rate) === rate));
+  for (const b of document.querySelectorAll(".speed button")) {
+    b.setAttribute("aria-pressed", String(Number(b.dataset.rate) === rate));
+  }
   for (const id of ["#target-audio", "#take-audio"]) $(id).playbackRate = rate;
 }
 
-// ---------- the guide: the target's pitch, yours over it, live and after ----------
+// --- PITCH GUIDE ---
+// The target's pitch, yours over it, live and after.
 
+/** The value of a CSS custom property on the page, such as a theme colour. */
 function css(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+/** Where the live trace has got to on the target's timeline, in seconds (0 without one). */
 function liveEnd() {
   if (!live?.points.length || live.onset == null || !profile) return 0;
   return profile.onset + (live.points.at(-1).t - live.onset);
 }
 
+/** The pitch guide: the target's contour, the take's or the live trace, the words and playhead. */
 function drawGuide() {
+  // 1. The canvas, at the screen's pixel density.
   const canvas = $("#guide");
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -1961,11 +2569,15 @@ function drawGuide() {
     return;
   }
 
-  const pad = { left: 46, right: 10, top: 10, bottom: 26 };
+  // 2. The scales: the line's length across (longer while a live trace runs
+  //    past it), and every pitch shown up, with 10% to spare and at least an
+  //    octave tall.
+  const pad = { left: 46, right: 10, top: 10, bottom: 26 }; // room for the labels
   const duration = Math.max(profile.duration, liveEnd() + 0.2);
   const target = profile.contour.f0;
   const take = shown?.contour?.take ?? [];
-  const livePoints = live?.onset != null ? live.points.filter((p) => p.f0 && p.t >= live.onset) : [];
+  const livePoints =
+    live?.onset != null ? live.points.filter((p) => p.f0 && p.t >= live.onset) : [];
   const values = [...target, ...take, ...livePoints.map((p) => p.f0)].filter((v) => v);
   let lo = values.length ? Math.min(...values) / 1.1 : 80;
   let hi = values.length ? Math.max(...values) * 1.1 : 300;
@@ -1974,10 +2586,13 @@ function drawGuide() {
     lo = mid / Math.SQRT2;
     hi = mid * Math.SQRT2;
   }
+  // Where a time in seconds goes across.
   const x = (t) => pad.left + (t / duration) * (w - pad.left - pad.right);
-  const y = (hz) => pad.top + (1 - Math.log(hz / lo) / Math.log(hi / lo)) * (h - pad.top - pad.bottom);
+  // Where a pitch in Hz goes up.
+  const y = (hz) =>
+    pad.top + (1 - Math.log(hz / lo) / Math.log(hi / lo)) * (h - pad.top - pad.bottom);
 
-  // Pitch is heard in ratios, so the axis is logarithmic.
+  // 3. The grid. Pitch is heard in ratios, so the axis is logarithmic.
   g.lineWidth = 1;
   for (const hz of [60, 80, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800]) {
     if (hz < lo || hz > hi) continue;
@@ -1990,8 +2605,14 @@ function drawGuide() {
     g.fillText(`${hz} Hz`, 2, y(hz) + 4);
   }
   if (profile.low && profile.high) {
+    // The target's usual pitch band.
     g.fillStyle = css("--band");
-    g.fillRect(pad.left, y(profile.high), w - pad.left - pad.right, y(profile.low) - y(profile.high));
+    g.fillRect(
+      pad.left,
+      y(profile.high),
+      w - pad.left - pad.right,
+      y(profile.low) - y(profile.high),
+    );
   }
   if (profile.median_f0) {
     // The target's typical pitch, the note to find before a take.
@@ -2009,7 +2630,7 @@ function drawGuide() {
     g.fillText(label, w - pad.right - g.measureText(label).width - 2, y(profile.median_f0) - 4);
   }
 
-  // The words along the bottom; the selected one shaded.
+  // 4. The words along the bottom; the selected one shaded.
   const words = shownWords();
   let labelled = -Infinity; // where the last label ended, so the next doesn't sit on it
   words.forEach((word, i) => {
@@ -2024,9 +2645,12 @@ function drawGuide() {
     g.moveTo(a, h - pad.bottom);
     g.lineTo(a, h - pad.bottom + 5);
     g.stroke();
-    let label = word.text.replace(/[.,!?;:"“”]+/g, "");
+    // The label, shortened to fit before the next word; left out if it can't.
+    let label = bareWord(word.text);
     const room = (words[i + 1] ? x(words[i + 1].start) : w - pad.right) - a - 6;
-    while (label.length > 3 && g.measureText(label).width > room) label = `${label.slice(0, -2)}…`;
+    while (label.length > 3 && g.measureText(label).width > room) {
+      label = `${label.slice(0, -2)}…`;
+    }
     if (a + 2 >= labelled && g.measureText(label).width <= room) {
       g.fillStyle = i === selectedWord ? css("--text") : css("--muted");
       g.fillText(label, a + 2, h - 8);
@@ -2034,6 +2658,8 @@ function drawGuide() {
     }
   });
 
+  // 5. The target's pitch, and the take's when no live trace is showing.
+  // Draw a pitch contour, lifting the pen over the unvoiced gaps.
   const line = (times, values, color, width) => {
     g.strokeStyle = color;
     g.lineWidth = width;
@@ -2052,11 +2678,14 @@ function drawGuide() {
   line(profile.contour.t, target, css("--target"), 3);
   if (take.length && !livePoints.length) line(shown.contour.t, take, css("--accent"), 2);
 
-  // While recording, your pitch from when you start speaking, lined up with
-  // where the target starts: sing along to the line.
+  // 6. While recording, your pitch from when you start speaking, lined up with
+  //    where the target starts: sing along to the line.
   g.fillStyle = css("--accent");
-  for (const p of livePoints) g.fillRect(x(profile.onset + p.t - live.onset) - 1.5, y(p.f0) - 1.5, 3, 3);
+  for (const p of livePoints) {
+    g.fillRect(x(profile.onset + p.t - live.onset) - 1.5, y(p.f0) - 1.5, 3, 3);
+  }
 
+  // 7. Where playback is.
   if (playhead != null) {
     g.strokeStyle = css("--text");
     g.globalAlpha = 0.5;
@@ -2069,27 +2698,38 @@ function drawGuide() {
   }
 }
 
-// ---------- the words: where in the line you're furthest off ----------
+// --- WORDS ---
+// Where in the line you're furthest off.
 
-// A take's rows on the line's units. A take from before words said together
-// were grouped has a row per word; those are combined, unit by unit.
+// The last combination takeUnits made, by take and units.
 let unitCache = { key: "", rows: [] };
 
+// A take's rows on the line's units. A take from before words said together
+// were grouped has a row per word; those are combined, unit by unit (a row
+// belongs to the unit its middle falls in, give or take 20 ms).
 function takeUnits(take) {
   const units = profile?.words ?? [];
   const rows = take?.words ?? [];
   if (!rows.length || !units.length) return rows;
-  if (rows.length === units.length && rows.every((r, i) => Math.abs(r.start - units[i].start) < 0.02)) return rows;
+  const same =
+    rows.length === units.length &&
+    rows.every((r, i) => Math.abs(r.start - units[i].start) < 0.02);
+  if (same) return rows;
   const key = `${take.id}:${units.length}:${units[0].start}`;
   if (unitCache.key === key) return unitCache.rows;
+  // The mean of the values there are; null when there are none.
   const mean = (values) => {
     const v = values.filter((x) => x != null);
     return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
   };
   const combined = units.map((u) => {
-    const inside = rows.filter((r) => (r.start + r.end) / 2 >= u.start - 0.02 && (r.start + r.end) / 2 < u.end + 0.02);
+    const inside = rows.filter(
+      (r) => (r.start + r.end) / 2 >= u.start - 0.02 && (r.start + r.end) / 2 < u.end + 0.02,
+    );
     if (!inside.length) return { text: u.text, start: u.start, end: u.end };
-    const scores = Object.fromEntries(WORD_PARTS.map((k) => [k, mean(inside.map((r) => r.scores?.[k]))]));
+    const scores = Object.fromEntries(
+      WORD_PARTS.map((k) => [k, mean(inside.map((r) => r.scores?.[k]))]),
+    );
     const scored = Object.entries(scores).filter(([, s]) => s != null);
     return {
       text: u.text,
@@ -2109,14 +2749,17 @@ function takeUnits(take) {
   return combined;
 }
 
+// The words on screen: the take's, scored, or else the line's.
 const shownWords = () => (shown?.words?.length ? takeUnits(shown) : profile?.words ?? []);
 
+/** A word's score on part `key`, or on its weakest part; null when it has none. */
 function wordScore(word, key) {
   if (!word.scores) return null;
   if (key && word.scores[key] != null) return word.scores[key];
   return word.worst ? word.scores[word.worst] : null;
 }
 
+/** The line's words as buttons, coloured by score, and a note on the selected one. */
 function renderWords() {
   const words = inCheck() ? [] : shownWords();
   $("#words").hidden = !words.length;
@@ -2126,13 +2769,19 @@ function renderWords() {
   $("#words-caption").textContent = !words.length
     ? ""
     : scored
-      ? `Words coloured by ${key ? partLabel(key).toLowerCase() : "their weakest part"}. Click one to hear the target, then you.`
+      ? `Words coloured by ${key ? partLabel(key).toLowerCase() : "their weakest part"}. ` +
+        "Click one to hear the target, then you."
       : "Click a word to hear it.";
   $("#words").replaceChildren(
     ...words.map((word, i) => {
       const score = wordScore(word, key);
+      // Green from 75, amber from 50, red below.
       const grade = score == null ? "" : score >= 75 ? "good" : score >= 50 ? "mid" : "poor";
-      const button = el("button", { type: "button", className: `word ${grade}`, textContent: word.text });
+      const button = el("button", {
+        type: "button",
+        className: `word ${grade}`,
+        textContent: word.text,
+      });
       if (score != null) button.title = `${partLabel(key ?? word.worst)} ${Math.round(score)}`;
       button.setAttribute("aria-pressed", String(i === selectedWord));
       button.onclick = () => {
@@ -2149,34 +2798,48 @@ function renderWords() {
   if (word?.scores) $("#word-note").textContent = wordNote(word);
 }
 
+/** What is off on one word, in a sentence, or that it is close. */
 function wordNote(word) {
   const notes = [];
+  // Named from half a semitone off in pitch, 0.75 in melody, 0.4 in formants,
+  // or an articulation score under 60.
   if (word.pitch != null && Math.abs(word.pitch) >= 0.5) {
-    notes.push(`${Math.abs(word.pitch).toFixed(1)} semitones ${word.pitch > 0 ? "higher" : "lower"} than the target`);
+    const way = word.pitch > 0 ? "higher" : "lower";
+    notes.push(`${Math.abs(word.pitch).toFixed(1)} semitones ${way} than the target`);
   }
   if (word.melody != null && Math.abs(word.melody) >= 0.75) {
-    notes.push(`you lift this word ${word.melody > 0 ? "more" : "less"} than the target does, compared with the rest of the line`);
+    notes.push(
+      `you lift this word ${word.melody > 0 ? "more" : "less"} than the target does, ` +
+        "compared with the rest of the line",
+    );
   }
   if (word.resonance != null && Math.abs(word.resonance) >= 0.4) {
-    const percent = Math.round(Math.abs(2 ** (word.resonance / 12) - 1) * 100);
-    notes.push(`${word.resonance > 0 ? "brighter" : "darker"} (formants ${percent}% ${word.resonance > 0 ? "higher" : "lower"})`);
+    notes.push(formantText(word.resonance));
   }
-  if (word.scores.articulation != null && word.scores.articulation < 60) notes.push("the sounds are shaped differently");
-  const text = word.text.replace(/[.,!?;:"“”]+/g, "");
+  if (word.scores.articulation != null && word.scores.articulation < 60) {
+    notes.push("the sounds are shaped differently");
+  }
+  const text = bareWord(word.text);
   return notes.length ? `“${text}”: ${notes.join("; ")}.` : `“${text}”: close.`;
 }
 
-// ---------- the coach: one thing at a time ----------
+// --- COACH ---
+// One thing at a time.
 
+/** The coach: the part to work on, how the last take went on it, and what to do next. */
 function renderCoach() {
   $("#coach").hidden = inCheck();
   if (inCheck()) return;
+
+  // 1. The chips to pick a part by hand, or Auto.
   const chosen = chosenFocus();
   $("#focus-chips").replaceChildren(
     ...[["", "Auto"], ...PARTS].map(([key, label]) => {
       const chip = el("button", { type: "button", className: "chip", textContent: label });
       chip.setAttribute("aria-pressed", String(key === chosen));
-      chip.title = key ? `Work on ${label.toLowerCase()} until you switch back to Auto` : "Let the coach pick after each take";
+      chip.title = key
+        ? `Work on ${label.toLowerCase()} until you switch back to Auto`
+        : "Let the coach pick after each take";
       chip.onclick = () => {
         stored.set(`echo.focus.${current.id}`, key);
         renderCoach();
@@ -2187,6 +2850,7 @@ function renderCoach() {
     }),
   );
 
+  // 2. How the last take went on the part it worked on (3 points either way counts).
   const coach = shown?.coach;
   const focus = currentFocus();
   const progress = coach?.progress;
@@ -2194,21 +2858,30 @@ function renderCoach() {
   if (progress) {
     const change = progress.after - progress.before;
     const verdict = change >= 3 ? "closer" : change <= -3 ? "further off" : "about the same";
-    $("#coach-progress").className = `coach-progress ${change >= 3 ? "up" : change <= -3 ? "down" : ""}`;
+    $("#coach-progress").className =
+      `coach-progress ${change >= 3 ? "up" : change <= -3 ? "down" : ""}`;
     $("#coach-progress").textContent =
-      `Last take you worked on ${progress.label.toLowerCase()}: ${Math.round(progress.before)} → ${Math.round(progress.after)}, ${verdict}.`;
+      `Last take you worked on ${progress.label.toLowerCase()}: ` +
+      `${Math.round(progress.before)} → ${Math.round(progress.after)}, ${verdict}.`;
   }
 
+  // 3. What to work on, and how.
   let heading;
   let message;
   if (focus) {
     const part = shown?.components.find((c) => c.key === focus);
     const name = partLabel(focus).toLowerCase();
-    heading = chosen ? `Work on ${name} (your pick)` : coach?.why === "keep" ? `Keep working on ${name}` : `Work on ${name}`;
+    heading = chosen
+      ? `Work on ${name} (your pick)`
+      : coach?.why === "keep"
+        ? `Keep working on ${name}`
+        : `Work on ${name}`;
     message =
       (focus === coach?.focus && coach.message) ||
       part?.hint ||
-      (part?.score != null ? `${part.label} is at ${Math.round(part.score)}: ${part.detail}.` : "Listen for it in the target, then record.");
+      (part?.score != null
+        ? `${part.label} is at ${Math.round(part.score)}: ${part.detail}.`
+        : "Listen for it in the target, then record.");
   } else if (coach?.why === "all good") {
     heading = "Every part is close";
     message = coach.message;
@@ -2218,27 +2891,46 @@ function renderCoach() {
   }
   $("#coach-focus").textContent = heading;
   $("#coach-message").textContent = message;
+
+  // 4. The words furthest off on it.
   const words = focus && focus === coach?.focus ? coach.words : [];
   $("#coach-words").hidden = !words?.length;
-  if (words?.length) $("#coach-words").textContent = `Furthest off: ${words.map((w) => `“${w.replace(/[.,!?;:"“”]+/g, "")}”`).join(", ")}. Click them above to compare.`;
+  if (words?.length) {
+    $("#coach-words").textContent =
+      `Furthest off: ${words.map((w) => `“${bareWord(w)}”`).join(", ")}. ` +
+      "Click them above to compare.";
+  }
+
+  // 5. Parts stuck near the bottom, which the coach has moved on from.
   const stuck = (coach?.stuck ?? []).filter((k) => k !== focus);
   $("#coach-stuck").hidden = !stuck.length;
   if (stuck.length) {
     const names = stuck.map((k) => partLabel(k).toLowerCase()).join(" and ");
     $("#coach-stuck").replaceChildren(
-      `${names[0].toUpperCase()}${names.slice(1)} has stayed near the bottom for your last few takes without moving, so the coach is working on the parts that do. `,
-      ...stuck.filter((k) => TRAIN[k]).map((k) => {
-        const b = el("button", { type: "button", className: "link", textContent: `Train ${partLabel(k).toLowerCase()} word by word` });
-        b.onclick = () => openTrainer(k);
-        return b;
-      }),
+      `${names[0].toUpperCase()}${names.slice(1)} has stayed near the bottom ` +
+        "for your last few takes without moving, " +
+        "so the coach is working on the parts that do. ",
+      ...stuck
+        .filter((k) => TRAIN[k])
+        .map((k) => {
+          const b = el("button", {
+            type: "button",
+            className: "link",
+            textContent: `Train ${partLabel(k).toLowerCase()} word by word`,
+          });
+          b.onclick = () => openTrainer(k);
+          return b;
+        }),
     );
   }
+
+  // 6. The checklist, the drill and the plateau note.
   renderChecklist();
   renderDrill(focus);
   renderPlateau();
 }
 
+// The coach's buttons, by key: [label, what it does].
 const ACTIONS = {
   listen: ["▶ Play the line", () => play("target")],
   note: ["♪ Play the note", () => playNote()],
@@ -2251,6 +2943,7 @@ const ACTIONS = {
   both: ["Pitch and resonance together", () => openTrainer("both")],
 };
 
+/** A button for each of these ACTIONS. */
 function actionButtons(keys) {
   return keys.map((key) => {
     const [label, run] = ACTIONS[key];
@@ -2267,19 +2960,36 @@ function renderChecklist() {
   $("#checklist").hidden = !first;
   if (!first) return;
   const done = steps();
+  // [done, what to do, its buttons]
   const items = [
-    [(done.listened ?? 0) >= 2, "Listen to the line two or three times. ¾ and ½ speed slow it down without making it lower.", ["listen"]],
-    [Boolean(done.note) || Boolean(profile && !profile.median_f0), `Find the note${profile?.median_f0 ? ` (${noteName(profile.median_f0)})` : ""}: play it, then Warm up and hum until your dots sit on the dashed line.`, ["note", "warmup"]],
+    [
+      (done.listened ?? 0) >= 2,
+      "Listen to the line two or three times. " +
+        "¾ and ½ speed slow it down without making it lower.",
+      ["listen"],
+    ],
+    [
+      Boolean(done.note) || Boolean(profile && !profile.median_f0),
+      `Find the note${profile?.median_f0 ? ` (${noteName(profile.median_f0)})` : ""}: ` +
+        "play it, then Warm up and hum until your dots sit on the dashed line.",
+      ["note", "warmup"],
+    ],
     [false, "Record your first take, following the blue pitch line as you speak.", ["record"]],
   ];
   const now = items.findIndex(([ok]) => !ok);
   $("#checklist").replaceChildren(
     ...items.map(([ok, text, keys], i) =>
-      el("li", { className: ok ? "done" : i === now ? "now" : "" }, el("span", { className: "check-text", textContent: text }), el("span", { className: "drill-actions" }, ...actionButtons(keys))),
+      el(
+        "li",
+        { className: ok ? "done" : i === now ? "now" : "" },
+        el("span", { className: "check-text", textContent: text }),
+        el("span", { className: "drill-actions" }, ...actionButtons(keys)),
+      ),
     ),
   );
 }
 
+// What to do for each part once a take is on screen: steps, and the coach's buttons for them.
 const DRILLS = {
   pitch: {
     steps: [
@@ -2315,13 +3025,15 @@ const DRILLS = {
   },
   rhythm: {
     steps: [
-      "Speak along with the line a few times (headphones on): pause where it pauses, stretch the words it stretches.",
+      "Speak along with the line a few times (headphones on): " +
+        "pause where it pauses, stretch the words it stretches.",
       "Then record a take without it.",
     ],
     actions: ["along"],
   },
 };
 
+/** The drill for the part being worked on, once there is a take. */
 function renderDrill(focus) {
   const drill = shown && DRILLS[focus];
   $("#drill").hidden = !drill;
@@ -2339,17 +3051,28 @@ function renderPlateau() {
   if (!visible) return;
   $("#plateau").classList.toggle("mastered", Boolean(coach.mastered));
   $("#plateau-text").textContent = coach.mastered
-    ? "This line now scores near the real person. Try it from memory without listening first, or move on: a voice check shows whether it holds on other lines."
-    : `You've been around ${Math.round(shown.overall)} for your last few takes. A fresh line usually helps more than another take of this one; come back to this one later.`;
+    ? "This line now scores near the real person. " +
+      "Try it from memory without listening first, or move on: " +
+      "a voice check shows whether it holds on other lines."
+    : `You've been around ${Math.round(shown.overall)} for your last few takes. ` +
+      "A fresh line usually helps more than another take of this one; come back to this one later.";
   const buttons = [];
   if (current.source && sources.some((s) => s.id === current.source)) {
-    const next = el("button", { type: "button", className: "btn small", textContent: "Try another line" });
+    const next = el("button", {
+      type: "button",
+      className: "btn small",
+      textContent: "Try another line",
+    });
     next.onclick = () => nextLine(current.source);
     buttons.push(next);
   }
   const owner = voiceOf(current.voice_id);
   if (owner) {
-    const back = el("button", { type: "button", className: "btn small", textContent: `Back to ${owner.name}` });
+    const back = el("button", {
+      type: "button",
+      className: "btn small",
+      textContent: `Back to ${owner.name}`,
+    });
     back.onclick = () => openVoice(owner.id);
     buttons.push(back);
   }
@@ -2360,8 +3083,11 @@ function renderPlateau() {
 async function nextLine(sourceId) {
   try {
     const rec = await api(`/api/sources/${sourceId}`);
+    // Whether a line of it isn't added yet.
     const fresh = (line) => !practised(line, rec);
-    const pick = rec.suggested.map((i) => rec.lines[i]).find(fresh) ?? rec.lines.find((l) => !l.flags.length && fresh(l));
+    const pick =
+      rec.suggested.map((i) => rec.lines[i]).find(fresh) ??
+      rec.lines.find((l) => !l.flags.length && fresh(l));
     if (!pick) return setStatus("You've added every clear line of this recording.");
     await practiseLine(pick, rec);
   } catch (err) {
@@ -2369,12 +3095,18 @@ async function nextLine(sourceId) {
   }
 }
 
-// ---------- training one part, word by word ----------
+// --- TRAINER ---
+// Training one part, word by word.
 
+// The parts the trainer takes word by word: what each is, and tips for moving
+// it up (brighter, higher) or down, or either way ("any").
 const TRAIN = {
   resonance: {
     title: "Resonance",
-    what: "Resonance is where your voice rings: the shape of your mouth and throat, heard as brighter or darker. It's measured on the vowels, so each word is compared with the same word.",
+    what:
+      "Resonance is where your voice rings: the shape of your mouth and throat, " +
+      "heard as brighter or darker. " +
+      "It's measured on the vowels, so each word is compared with the same word.",
     tips: {
       up: [
         "Spread the lips a little, as in a slight smile.",
@@ -2392,15 +3124,27 @@ const TRAIN = {
   },
   pitch: {
     title: "Pitch",
-    what: "Pitch is how high or low your voice sits. Each word is compared with the target saying the same word.",
+    what:
+      "Pitch is how high or low your voice sits. " +
+      "Each word is compared with the target saying the same word.",
     tips: {
-      up: ["Play the note and hum it before you speak.", "Start the word on the note, not below it.", "Lift from the chest into the head: lighter, not louder."],
-      down: ["Play the note and hum it before you speak.", "Let the word settle down onto the note.", "Relax the throat and slow down a little; tension pushes pitch up."],
+      up: [
+        "Play the note and hum it before you speak.",
+        "Start the word on the note, not below it.",
+        "Lift from the chest into the head: lighter, not louder.",
+      ],
+      down: [
+        "Play the note and hum it before you speak.",
+        "Let the word settle down onto the note.",
+        "Relax the throat and slow down a little; tension pushes pitch up.",
+      ],
     },
   },
   articulation: {
     title: "Articulation",
-    what: "Articulation is how the sounds themselves are shaped: each vowel and consonant. It's the part most tied to the words, so it's trained word by word.",
+    what:
+      "Articulation is how the sounds themselves are shaped: each vowel and consonant. " +
+      "It's the part most tied to the words, so it's trained word by word.",
     tips: {
       any: [
         "Play the word at ½ speed and copy its vowel exactly.",
@@ -2410,20 +3154,33 @@ const TRAIN = {
     },
   },
 };
+// Pitch and resonance at once; its tips come from bothTips.
 TRAIN.both = {
   title: "Pitch and resonance",
-  what: "Pitch (how high or low) and resonance (how bright or dark) tend to move together: going lower usually drops the larynx and opens the throat, which darkens the sound, and going higher brightens it. Here each attempt is placed on both at once, so you can move one and hold the other. A word counts when both are close.",
+  what:
+    "Pitch (how high or low) and resonance (how bright or dark) tend to move together: " +
+    "going lower usually drops the larynx and opens the throat, which darkens the sound, " +
+    "and going higher brightens it. " +
+    "Here each attempt is placed on both at once, so you can move one and hold the other. " +
+    "A word counts when both are close.",
 };
 const CLOSE_PITCH = 1.0; // semitones: near enough not to need moving
-const CLOSE_RESONANCE = 3; // percent
+const CLOSE_RESONANCE = 3; // percent: likewise
 
 // What to do about pitch and resonance together, from where an attempt (or
 // the last take) landed: lower or higher, darker or brighter, or hold.
 function bothTips(pitch, percent) {
-  const p = pitch == null || Math.abs(pitch) < CLOSE_PITCH ? "hold" : pitch > 0 ? "lower" : "higher";
-  const r = percent == null || Math.abs(percent) < CLOSE_RESONANCE ? "hold" : percent > 0 ? "darker" : "brighter";
+  const p =
+    pitch == null || Math.abs(pitch) < CLOSE_PITCH ? "hold" : pitch > 0 ? "lower" : "higher";
+  const r =
+    percent == null || Math.abs(percent) < CLOSE_RESONANCE
+      ? "hold"
+      : percent > 0
+        ? "darker"
+        : "brighter";
   const lowerBright = [
-    "Lower the pitch but keep the sound forward: tongue high and forward, a slight smile, as if about to say “ee”.",
+    "Lower the pitch but keep the sound forward: " +
+      "tongue high and forward, a slight smile, as if about to say “ee”.",
     "Don't drop the jaw or let the larynx sink to get lower; that's what darkens it.",
     "Hum the note on a bright “ng” first, then open it into the word.",
   ];
@@ -2435,19 +3192,26 @@ function bothTips(pitch, percent) {
   const table = {
     "lower hold": lowerBright,
     "lower brighter": lowerBright,
-    "lower darker": ["Here the two move together: let the voice settle lower and the throat relax.", "Drop the jaw a little and round the lips for the darker sound."],
+    "lower darker": [
+      "Here the two move together: let the voice settle lower and the throat relax.",
+      "Drop the jaw a little and round the lips for the darker sound.",
+    ],
     "higher hold": higherDark,
     "higher darker": higherDark,
-    "higher brighter": ["Here the two move together: lift and brighten at once, with a slight smile, the tongue forward and a lighter voice."],
+    "higher brighter": [
+      "Here the two move together: lift and brighten at once, " +
+        "with a slight smile, the tongue forward and a lighter voice.",
+    ],
     "hold darker": TRAIN.resonance.tips.down,
     "hold brighter": TRAIN.resonance.tips.up,
     "hold hold": ["Both are close: say it the same way three times in a row."],
   };
-  return { key: `${p} ${r}`, tips: table[`${p} ${r}`], pitch: p, resonance: r };
+  const key = `${p} ${r}`;
+  return { key, tips: table[key] };
 }
 
 const PASS = 80; // a word counts as close at this score
-const IN_A_ROW = 3;
+const IN_A_ROW = 3; // a word is done after this many close attempts in a row
 
 let training = null; // { part, order: [word indices], at, attempts: {index: [result]} }
 
@@ -2458,50 +3222,72 @@ function modeScore(r, part) {
   const scores = trainedParts(part).map((k) => r.scores?.[k]);
   return scores.some((s) => s == null) ? null : Math.min(...scores);
 }
-const passedWord = (tries, part) => tries.length >= IN_A_ROW && tries.slice(-IN_A_ROW).every((r) => (modeScore(r, part) ?? 0) >= PASS);
+// Whether a word is done: its last IN_A_ROW attempts all scored PASS or more.
+const passedWord = (tries, part) =>
+  tries.length >= IN_A_ROW &&
+  tries.slice(-IN_A_ROW).every((r) => (modeScore(r, part) ?? 0) >= PASS);
 let drillRec = null; // { recorder, timer, free, index }: the trainer has the microphone open
 
+/** Open the trainer on a part, or the coach's drill for a part that isn't trained by word. */
 async function openTrainer(part) {
   if (!current) return;
+
+  // 1. Melody and rhythm live across the whole line: work on them there.
   if (!TRAIN[part]) {
-    // Melody and rhythm live across the whole line: work on them there.
     stored.set(`echo.focus.${current.id}`, part);
     show("practice");
     setShown(shown);
     $("#coach").scrollIntoView({ behavior: "smooth", block: "center" });
-    setStatus(`Working on ${partLabel(part).toLowerCase()}: it runs across the whole line, so use the drill below: slow it down and speak along.`);
+    setStatus(
+      `Working on ${partLabel(part).toLowerCase()}: it runs across the whole line, ` +
+        "so use the drill below: slow it down and speak along.",
+    );
     return;
   }
+
+  // 2. The words in order, furthest off first on the last take; words with no
+  //    measure last. Attempts are kept when switching between modes.
   const words = profile?.words ?? [];
   const scored = shown ? takeUnits(shown) : [];
+  // Word i's score for this mode on the take on screen, or null.
   const score = (i) => {
     const w = scored.find((x) => x.start === words[i].start);
     return w ? modeScore(w, part) : null;
   };
-  // Furthest off first; words with no measure last.
   const order = words.map((_, i) => i).sort((a, b) => (score(a) ?? 101) - (score(b) ?? 101));
-  training = { part, order, at: 0, attempts: training?.part && training.attempts ? training.attempts : {} };
+  training = {
+    part,
+    order,
+    at: 0,
+    attempts: training?.part && training.attempts ? training.attempts : {},
+  };
   stopPlayback();
   show("train");
   renderTrainer();
+
+  // 3. Attempts from earlier sessions: carry on where you left off.
   if (!Object.keys(training.attempts).length) {
-    // Attempts from earlier sessions: carry on where you left off.
     try {
       const saved = await api(`/api/targets/${current.id}/drills`);
       if (!training) return;
       for (const r of saved) {
         // By position, not number: the line's units may have been regrouped since.
-        const unit = (profile?.words ?? []).findIndex((w) => r.start >= w.start - 0.02 && r.start < w.end);
+        const unit = (profile?.words ?? []).findIndex(
+          (w) => r.start >= w.start - 0.02 && r.start < w.end,
+        );
         if (unit >= 0) (training.attempts[unit] ??= []).push(r);
       }
       // Start at the first word not done yet, unless a word was picked meanwhile.
-      const next = training.order.findIndex((i) => !passedWord(training.attempts[i] ?? [], training.part));
+      const next = training.order.findIndex(
+        (i) => !passedWord(training.attempts[i] ?? [], training.part),
+      );
       if (!training.picked) training.at = Math.max(0, next);
       renderTrainer();
     } catch {}
   }
 }
 
+/** Switch the trainer to another part, keeping the attempts and the word. */
 function switchTrainMode(part) {
   if (!training || training.part === part) return;
   const word = training.order[training.at];
@@ -2513,18 +3299,22 @@ function switchTrainMode(part) {
   renderTrainer();
 }
 
+// From the take on screen: which way to move, overall ("up", "down", or null
+// when it can't tell).
 function trainDirection(part) {
-  // From the take on screen: which way to move, overall.
   const m = shown?.measures;
   const value = part === "resonance" ? m?.resonance : part === "pitch" ? m?.pitch : null;
   if (value == null) return null;
   return value > 0 ? "down" : "up";
 }
 
+/** The whole trainer page, for the part and word being trained. */
 function renderTrainer() {
+  // 1. The buttons, which depend on whether the microphone is open.
   const { part, order, at } = training;
   const info = TRAIN[part];
-  if (drillRec && drillRec.index !== order[at]) stopDrill(); // the word changed under an open microphone
+  // The word changed under an open microphone.
+  if (drillRec && drillRec.index !== order[at]) stopDrill();
   const scoring = Boolean(drillRec && !drillRec.free);
   const trying = Boolean(drillRec?.free);
   $("#train-say").classList.toggle("live", scoring);
@@ -2533,31 +3323,52 @@ function renderTrainer() {
   $("#train-try").classList.toggle("on", trying);
   $("#train-try-label").textContent = trying ? "Stop" : "Try it live";
   $("#train-try").disabled = scoring;
-  for (const b of document.querySelectorAll("#train-modes button")) b.setAttribute("aria-pressed", String(b.dataset.part === part));
+  for (const b of document.querySelectorAll("#train-modes button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.part === part));
+  }
+
+  // 2. What the part is, how the last take did on it, and tips.
   $("#train-crumb").textContent = `‹ “${lineText(current)}”`;
   $("#train-crumb").onclick = leaveTrainer;
   $("#train-title").textContent = `${info.title} on “${lineText(current)}”`;
   $("#train-what").textContent = info.what;
-  const components = trainedParts(part).map((k) => shown?.components.find((c) => c.key === k)).filter((c) => c?.score != null);
+  const components = trainedParts(part)
+    .map((k) => shown?.components.find((c) => c.key === k))
+    .filter((c) => c?.score != null);
   $("#train-now").textContent = components.length
-    ? `On your last take: ${components.map((c) => `${c.label.toLowerCase()} ${Math.round(c.score)}, ${c.detail}`).join("; ")}.`
+    ? `On your last take: ${components
+        .map((c) => `${c.label.toLowerCase()} ${Math.round(c.score)}, ${c.detail}`)
+        .join("; ")}.`
     : "";
   let tips;
   if (part === "both") {
-    // From the latest attempt at this word if there is one, else the last take.
+    // From the latest attempt at this word if there is one, else the last take
+    // (its resonance turned from semitones into percent).
     const latest = (training.attempts[order[at]] ?? []).at(-1);
-    const advice = latest ? bothTips(latest.pitch, latest.percent) : bothTips(shown?.measures?.pitch, shown?.measures?.resonance == null ? null : (2 ** (shown.measures.resonance / 12) - 1) * 100);
+    const advice = latest
+      ? bothTips(latest.pitch, latest.percent)
+      : bothTips(
+          shown?.measures?.pitch,
+          shown?.measures?.resonance == null
+            ? null
+            : (2 ** (shown.measures.resonance / 12) - 1) * 100,
+        );
     tips = advice.tips;
   } else {
+    // Either way, or the way the last take was off, or else two tips of each.
     const way = trainDirection(part);
-    tips = info.tips.any ?? (way ? info.tips[way] : [...info.tips.up.slice(0, 2), ...info.tips.down.slice(0, 2)]);
+    tips =
+      info.tips.any ??
+      (way ? info.tips[way] : [...info.tips.up.slice(0, 2), ...info.tips.down.slice(0, 2)]);
   }
   $("#train-tips").replaceChildren(...tips.map((tip) => el("li", { textContent: tip })));
 
+  // 3. The words to pick from, coloured by how they're going.
   const words = profile?.words ?? [];
   $("#train-card").hidden = !words.length;
   if (!words.length) {
-    $("#train-line-text").textContent = "No words were recognised in this line, so it can't be trained word by word.";
+    $("#train-line-text").textContent =
+      "No words were recognised in this line, so it can't be trained word by word.";
     return;
   }
   const index = order[at];
@@ -2565,7 +3376,11 @@ function renderTrainer() {
     ...order.map((i, k) => {
       const tries = training.attempts[i] ?? [];
       const passed = passedWord(tries, part);
-      const button = el("button", { type: "button", className: `word ${passed ? "good" : tries.length ? "mid" : ""}`, textContent: words[i].text });
+      const button = el("button", {
+        type: "button",
+        className: `word ${passed ? "good" : tries.length ? "mid" : ""}`,
+        textContent: words[i].text,
+      });
       button.setAttribute("aria-pressed", String(k === at));
       button.onclick = () => {
         training.at = k;
@@ -2575,7 +3390,9 @@ function renderTrainer() {
       return button;
     }),
   );
-  $("#train-word").textContent = `“${words[index].text.replace(/[.,!?;:"“”]+/g, "")}”`;
+
+  // 4. The word being trained: its note, the meter and map, and the attempts at it.
+  $("#train-word").textContent = `“${bareWord(words[index].text)}”`;
   const tries = training.attempts[index] ?? [];
   const last = tries.at(-1);
   const wordHz = wordPitch(index);
@@ -2585,49 +3402,50 @@ function renderTrainer() {
   renderDrillMap(part, tries);
   $("#train-mine").disabled = !last?.id;
   $("#train-result").className = "train-result";
-  if (!last) $("#train-result").textContent = "Play the target, then press Say it and say just that.";
-  else $("#train-result").replaceChildren(...drillVerdict(part, last));
+  if (!last) {
+    $("#train-result").textContent = "Play the target, then press Say it and say just that.";
+  } else {
+    $("#train-result").replaceChildren(...drillVerdict(part, last));
+  }
   $("#train-attempts").replaceChildren(
     ...tries.map((r, k) => {
       const s = modeScore(r, part);
-      return el("li", { className: s == null ? "" : s >= PASS ? "good" : s >= 50 ? "mid" : "poor", textContent: s == null ? "–" : Math.round(s), title: `Attempt ${k + 1}` });
+      return el("li", {
+        className: s == null ? "" : s >= PASS ? "good" : s >= 50 ? "mid" : "poor",
+        textContent: s == null ? "–" : Math.round(s),
+        title: `Attempt ${k + 1}`,
+      });
     }),
   );
+
+  // 5. On to the next word once this one is done, or after two tries; how many are close.
   const passed = passedWord(tries, part);
   $("#train-next").hidden = !(passed || tries.length >= 2) || at + 1 >= order.length;
   $("#train-next").classList.toggle("primary", passed);
   const done = order.filter((i) => passedWord(training.attempts[i] ?? [], part)).length;
   $("#train-line-text").textContent = done
-    ? `${done} of ${order.length} words close. When most are, put them back together in the whole line.`
+    ? `${done} of ${order.length} words close. ` +
+      "When most are, put them back together in the whole line."
     : "When the words are close, put them back together in the whole line.";
 }
 
-// The pitch the target uses on one word: the median of its contour over the word.
+// The pitch the target uses on one word: the median of its contour over the
+// word; null with fewer than three voiced frames.
 function wordPitch(index) {
   const word = profile?.words?.[index];
   if (!word) return null;
-  const f0 = profile.contour.t.map((t, i) => (t >= word.start && t < word.end ? profile.contour.f0[i] : null)).filter((v) => v);
+  const f0 = profile.contour.t
+    .map((t, i) => (t >= word.start && t < word.end ? profile.contour.f0[i] : null))
+    .filter((v) => v);
   if (f0.length < 3) return null;
   return f0.sort((a, b) => a - b)[Math.floor(f0.length / 2)];
 }
 
+/** A tone on the trained word's pitch, a little shorter than the line's note. */
 function playWordNote() {
   const hz = wordPitch(training.order[training.at]);
   if (!hz) return;
-  const ctx = new AudioContext();
-  const tone = ctx.createOscillator();
-  const level = ctx.createGain();
-  tone.type = "triangle";
-  tone.frequency.value = hz;
-  const now = ctx.currentTime;
-  level.gain.setValueAtTime(0, now);
-  level.gain.linearRampToValueAtTime(0.25, now + 0.08);
-  level.gain.setValueAtTime(0.25, now + 1.2);
-  level.gain.linearRampToValueAtTime(0, now + 1.6);
-  tone.connect(level).connect(ctx.destination);
-  tone.start(now);
-  tone.stop(now + 1.65);
-  tone.onended = () => ctx.close();
+  playTone(hz, 1.2, 1.6, 1.65);
 }
 
 // Every attempt at the word on pitch (across) and resonance (up), the target in
@@ -2637,27 +3455,38 @@ function renderDrillMap(part, tries) {
   $("#train-map").hidden = !show_;
   mapLive = null;
   if (!show_) return;
-  const ns = "http://www.w3.org/2000/svg";
-  const make = (tag, attrs) => {
-    const node = document.createElementNS(ns, tag);
-    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
-    return node;
-  };
-  const W = 360;
+
+  // 1. The scales, the zone where a word scores well, and the axes.
+  const W = 360; // the map's width and height, in SVG units
   const H = 220;
   const P = 6; // semitones each side
   const R = 25; // percent each side
+  // Where a pitch gap in semitones goes across, clamped to the map.
   const x = (st) => W / 2 + (Math.max(-P, Math.min(P, st)) / P) * (W / 2 - 14);
+  // Where a resonance gap in percent goes up, clamped to the map.
   const y = (pct) => H / 2 - (Math.max(-R, Math.min(R, pct)) / R) * (H / 2 - 14);
-  const svg = make("svg", { viewBox: `0 0 ${W} ${H}`, class: "map", role: "img" });
-  svg.setAttribute("aria-label", "Your attempts: pitch across, resonance up and down, the target in the middle");
-  svg.append(make("rect", { x: 0, y: 0, width: W, height: H, rx: 10, class: "map-bg" }));
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "map", role: "img" });
+  svg.setAttribute(
+    "aria-label",
+    "Your attempts: pitch across, resonance up and down, the target in the middle",
+  );
+  svg.append(svgEl("rect", { x: 0, y: 0, width: W, height: H, rx: 10, class: "map-bg" }));
   // Where a word scores 90 or more on both: ±1.3 semitones, ±3.3%.
-  svg.append(make("rect", { x: x(-1.3), y: y(3.3), width: x(1.3) - x(-1.3), height: y(-3.3) - y(3.3), rx: 6, class: "map-zone" }));
-  svg.append(make("line", { x1: W / 2, y1: 8, x2: W / 2, y2: H - 8, class: "map-axis" }));
-  svg.append(make("line", { x1: 8, y1: H / 2, x2: W - 8, y2: H / 2, class: "map-axis" }));
+  svg.append(
+    svgEl("rect", {
+      x: x(-1.3),
+      y: y(3.3),
+      width: x(1.3) - x(-1.3),
+      height: y(-3.3) - y(3.3),
+      rx: 6,
+      class: "map-zone",
+    }),
+  );
+  svg.append(svgEl("line", { x1: W / 2, y1: 8, x2: W / 2, y2: H - 8, class: "map-axis" }));
+  svg.append(svgEl("line", { x1: 8, y1: H / 2, x2: W - 8, y2: H / 2, class: "map-axis" }));
+  // Add a text label at (ax, ay).
   const label = (text, ax, ay, anchor) => {
-    const node = make("text", { x: ax, y: ay, "text-anchor": anchor, class: "map-label" });
+    const node = svgEl("text", { x: ax, y: ay, "text-anchor": anchor, class: "map-label" });
     node.textContent = text;
     svg.append(node);
   };
@@ -2665,30 +3494,41 @@ function renderDrillMap(part, tries) {
   label("higher ▶", W - 10, H / 2 - 6, "end");
   label("▲ brighter", W / 2 + 6, 18, "start");
   label("▼ darker", W / 2 + 6, H - 10, "start");
-  svg.append(make("circle", { cx: W / 2, cy: H / 2, r: 4, class: "map-target" }));
+  svg.append(svgEl("circle", { cx: W / 2, cy: H / 2, r: 4, class: "map-target" }));
+
+  // 2. The attempts, numbered, the latest larger; one missing a reading sits on an axis.
   tries.forEach((r, k) => {
     if (r.pitch == null && r.percent == null) return;
     const latest = k === tries.length - 1;
-    const dot = make("circle", {
+    const dot = svgEl("circle", {
       cx: x(r.pitch ?? 0),
       cy: y(r.percent ?? 0),
       r: latest ? 9 : 6,
-      class: `map-dot${latest ? " latest" : ""}${r.pitch == null || r.percent == null ? " partial" : ""}`,
+      class:
+        `map-dot${latest ? " latest" : ""}` +
+        `${r.pitch == null || r.percent == null ? " partial" : ""}`,
     });
     svg.append(dot);
-    const n = make("text", { x: x(r.pitch ?? 0), y: y(r.percent ?? 0) + 4, "text-anchor": "middle", class: `map-n${latest ? " latest" : ""}` });
+    const n = svgEl("text", {
+      x: x(r.pitch ?? 0),
+      y: y(r.percent ?? 0) + 4,
+      "text-anchor": "middle",
+      class: `map-n${latest ? " latest" : ""}`,
+    });
     n.textContent = String(k + 1);
     svg.append(n);
   });
-  // Where your voice is right now, while the microphone is open (renderDrillLive).
-  const trail = make("polyline", { points: "", class: "map-trail" });
-  const ring_ = make("circle", { cx: W / 2, cy: H / 2, r: 8, class: "map-live" });
+
+  // 3. Where your voice is right now, while the microphone is open (renderDrillLive).
+  const trail = svgEl("polyline", { points: "", class: "map-trail" });
+  const ring_ = svgEl("circle", { cx: W / 2, cy: H / 2, r: 8, class: "map-live" });
   ring_.style.display = "none";
   svg.append(trail, ring_);
   mapLive = { ring: ring_, trail, x, y };
   $("#train-map").replaceChildren(svg);
 }
 
+/** The meter for pitch or resonance alone: the target band, the last attempt and a live mark. */
 function renderDrillMeter(part, last) {
   const value = part === "resonance" ? last?.percent : part === "pitch" ? last?.pitch : null;
   const scaled = part === "resonance" || part === "pitch";
@@ -2716,18 +3556,36 @@ function renderDrillMeter(part, last) {
     el("span", { className: "end", textContent: `◀ ${low}` }),
     track,
     el("span", { className: "end", textContent: `${high} ▶` }),
-    el("span", { className: "scale-note", textContent: `target in the middle; ±${range}${unit} across` }),
+    el("span", {
+      className: "scale-note",
+      textContent: `target in the middle; ±${range}${unit} across`,
+    }),
   );
 }
 
+// What an attempt scored and what to do next, as the nodes of the result line.
+// Within 0.3 semitones counts as on pitch, within 1% as level resonance.
 function drillVerdict(part, r) {
+  // 1. Pitch and resonance together.
   if (part === "both") {
     const s = modeScore(r, part);
     if (r.pitch == null || r.percent == null) {
-      return [el("span", { textContent: r.voiced ? "This word is too short or unvoiced in the target to measure both." : "Not enough voice to measure: say it aloud, not whispered." })];
+      return [
+        el("span", {
+          textContent: r.voiced
+            ? "This word is too short or unvoiced in the target to measure both."
+            : "Not enough voice to measure: say it aloud, not whispered.",
+        }),
+      ];
     }
-    const pitch = Math.abs(r.pitch) < 0.3 ? "on pitch" : `${Math.abs(r.pitch).toFixed(1)} semitones ${r.pitch > 0 ? "high" : "low"}`;
-    const res = Math.abs(r.percent) < 1 ? "level resonance" : `${Math.abs(r.percent).toFixed(0)}% ${r.percent > 0 ? "brighter" : "darker"}`;
+    const pitch =
+      Math.abs(r.pitch) < 0.3
+        ? "on pitch"
+        : `${Math.abs(r.pitch).toFixed(1)} semitones ${r.pitch > 0 ? "high" : "low"}`;
+    const res =
+      Math.abs(r.percent) < 1
+        ? "level resonance"
+        : `${Math.abs(r.percent).toFixed(0)}% ${r.percent > 0 ? "brighter" : "darker"}`;
     const advice = bothTips(r.pitch, r.percent);
     const move = {
       "hold hold": "Both close: do it again the same way.",
@@ -2742,21 +3600,44 @@ function drillVerdict(part, r) {
     }[advice.key];
     return [el("b", { textContent: `${Math.round(s)}` }), ` · ${pitch}, ${res}. ${move}`];
   }
+
+  // 2. One part.
   const s = r.scores[part];
   if (s == null) {
-    const why = r.voiced ? "This word is too short or unvoiced in the target to measure that." : "Not enough voice to measure: say it aloud, not whispered.";
+    const why = r.voiced
+      ? "This word is too short or unvoiced in the target to measure that."
+      : "Not enough voice to measure: say it aloud, not whispered.";
     return [el("span", { textContent: why })];
   }
   let detail;
-  if (part === "resonance") detail = Math.abs(r.percent) < 1 ? "level with the target" : `${Math.abs(r.percent).toFixed(0)}% ${r.percent > 0 ? "brighter" : "darker"} than the target`;
-  else if (part === "pitch") detail = Math.abs(r.pitch) < 0.3 ? "on the target's pitch" : `${Math.abs(r.pitch).toFixed(1)} semitones ${r.pitch > 0 ? "higher" : "lower"} than the target`;
-  else detail = s >= PASS ? "shaped like the target's" : "shaped differently from the target's";
+  if (part === "resonance") {
+    detail =
+      Math.abs(r.percent) < 1
+        ? "level with the target"
+        : `${Math.abs(r.percent).toFixed(0)}% ` +
+          `${r.percent > 0 ? "brighter" : "darker"} than the target`;
+  } else if (part === "pitch") {
+    detail =
+      Math.abs(r.pitch) < 0.3
+        ? "on the target's pitch"
+        : `${Math.abs(r.pitch).toFixed(1)} semitones ` +
+          `${r.pitch > 0 ? "higher" : "lower"} than the target`;
+  } else {
+    detail = s >= PASS ? "shaped like the target's" : "shaped differently from the target's";
+  }
   const verdict = s >= PASS ? "Close. " : s >= 50 ? "Nearer. " : "";
   const next =
-    s >= PASS ? "Do it again the same way." : part === "resonance" ? `Go ${r.percent > 0 ? "darker" : "brighter"}.` : part === "pitch" ? `Go ${r.pitch > 0 ? "lower" : "higher"}.` : "Listen again and copy it closely.";
+    s >= PASS
+      ? "Do it again the same way."
+      : part === "resonance"
+        ? `Go ${r.percent > 0 ? "darker" : "brighter"}.`
+        : part === "pitch"
+          ? `Go ${r.pitch > 0 ? "lower" : "higher"}.`
+          : "Listen again and copy it closely.";
   return [el("b", { textContent: `${Math.round(s)}` }), ` · ${verdict}${detail}. ${next}`];
 }
 
+/** Play the trained word of the target, with 40 ms either side. */
 function playTrainWord() {
   const index = training.order[training.at];
   const word = profile.words[index];
@@ -2772,11 +3653,13 @@ function playTrainWord() {
 // the meter) shows where the last second or so of your voice sits against the
 // target's phrase: pitch in semitones, resonance in percent. Both are read in
 // the browser; the attempt that counts is still measured on the server.
-const LIVE_SECONDS = 1.2;
+const LIVE_SECONDS = 1.2; // the stretch of your voice the live readout reads, in seconds
 let drillLive = null; // { listener, points: [{t, f0, f}], started, unit, pitch, trail, ticks }
 let mapLive = null; // the map's ring and trail, and its scales
 let meterLive = null; // the meter's live mark
 
+// Your voice over the last LIVE_SECONDS: its median pitch in Hz (from at least
+// five readings), and how far that and your resonance are from the target's phrase.
 function drillNow() {
   const now = (performance.now() - drillLive.started) / 1000;
   const recent = drillLive.points.filter((p) => p.t > now - LIVE_SECONDS);
@@ -2789,13 +3672,30 @@ function drillNow() {
   };
 }
 
+/** The live readout in the trainer: in words, on the map and on the meter. */
 function renderDrillLive() {
+  // 1. In words: within 0.3 semitones is on pitch, within 2% is level.
   const { hz, pitch, percent } = drillNow();
   const said = [];
-  if (pitch != null) said.push(Math.abs(pitch) < 0.3 ? "on pitch" : `${Math.abs(pitch).toFixed(1)} semitones ${pitch > 0 ? "high" : "low"}`);
-  else if (hz) said.push(`${Math.round(hz)} Hz (${noteName(hz)})`);
-  if (percent != null) said.push(Math.abs(percent) < 2 ? "resonance about level" : `about ${Math.abs(percent).toFixed(0)}% ${percent > 0 ? "brighter" : "darker"}`);
+  if (pitch != null) {
+    said.push(
+      Math.abs(pitch) < 0.3
+        ? "on pitch"
+        : `${Math.abs(pitch).toFixed(1)} semitones ${pitch > 0 ? "high" : "low"}`,
+    );
+  } else if (hz) {
+    said.push(`${Math.round(hz)} Hz (${noteName(hz)})`);
+  }
+  if (percent != null) {
+    said.push(
+      Math.abs(percent) < 2
+        ? "resonance about level"
+        : `about ${Math.abs(percent).toFixed(0)}% ${percent > 0 ? "brighter" : "darker"}`,
+    );
+  }
   if (said.length) $("#train-live").textContent = `Now: ${said.join(", ")}`;
+
+  // 2. The ring on the map, with its tail.
   const seen = pitch != null || percent != null;
   if (mapLive) {
     mapLive.ring.style.display = seen ? "" : "none";
@@ -2807,22 +3707,31 @@ function renderDrillLive() {
       // A short tail, so the direction you're moving in shows. It starts over
       // whenever one of the two readings is missing: the ring then sits on an
       // axis, which isn't somewhere your voice has been.
+      // A point every third reading, the last 40 kept.
       if (pitch == null || percent == null) drillLive.trail.length = 0;
       else if (drillLive.ticks++ % 3 === 0) {
         drillLive.trail.push(point);
         if (drillLive.trail.length > 40) drillLive.trail.shift();
       }
-      mapLive.trail.setAttribute("points", drillLive.trail.map((p) => p.map((v) => v.toFixed(1)).join(",")).join(" "));
+      mapLive.trail.setAttribute(
+        "points",
+        drillLive.trail.map((p) => p.map((v) => v.toFixed(1)).join(",")).join(" "),
+      );
     }
   }
+
+  // 3. The mark on the meter (the meter's own scale: ±25% or ±6 semitones).
   if (meterLive) {
     const [value, range] = training.part === "resonance" ? [percent, 25] : [pitch, 6];
     meterLive.style.display = value == null ? "none" : "";
-    if (value != null) meterLive.style.left = `${50 + (Math.max(-range, Math.min(range, value)) / range) * 50}%`;
+    if (value != null) {
+      meterLive.style.left = `${50 + (Math.max(-range, Math.min(range, value)) / range) * 50}%`;
+    }
   }
 }
 
-// `free`: just look, for as long as 45 s; nothing is scored or kept.
+// Open the microphone in the trainer, for a scored attempt at the word or, with
+// `free`, just to look for as long as 45 s, scoring and keeping nothing.
 async function startDrill(free) {
   if (drillRec || session || opening || measuring || !training) return;
   const index = training.order[training.at];
@@ -2840,26 +3749,51 @@ async function startDrill(free) {
   }
 }
 
+// The rest of startDrill, once nothing else may start: open the microphone and
+// read the voice live. `at` is the page it started on.
 async function openDrill(free, index, word, at) {
+  // 1. The recorder, the live readings, and when the attempt ends by itself.
   stopPlayback();
   await stopMicTest();
   const recorder = new Recorder();
-  const mine = { listener: null, points: [], started: performance.now(), unit: null, pitch: wordPitch(index) ?? profile.median_f0 ?? null, trail: [], ticks: 0 };
-  // A scored attempt ends when the phrase has been said; looking live goes on until it is stopped.
-  const ending = !free && autoStop() ? new Ending({ wait: 0.7, enough: 0.5 * (word.end - word.start), patient: 2 }) : null;
+  const mine = {
+    listener: null,
+    points: [],
+    started: performance.now(),
+    unit: null,
+    pitch: wordPitch(index) ?? profile.median_f0 ?? null,
+    trail: [],
+    ticks: 0,
+  };
+  // A scored attempt ends when the phrase has been said; looking live goes on
+  // until it is stopped.
+  const ending =
+    !free && autoStop()
+      ? new Ending({ wait: 0.7, enough: 0.5 * (word.end - word.start), patient: 2 })
+      : null;
   $("#train-live").hidden = false;
-  $("#train-live").textContent = free ? "Say it, hold it, slide it: the ring follows your voice." : "Say it…";
+  $("#train-live").textContent = free
+    ? "Say it, hold it, slide it: the ring follows your voice."
+    : "Say it…";
+
+  // 2. Open the microphone.
   try {
     await recorder.start(
       (peak, rms) => {
-        if (ending?.hear(rms, (performance.now() - mine.started) / 1000) && drillRec?.recorder === recorder) stopDrill();
+        const seconds = (performance.now() - mine.started) / 1000;
+        if (ending?.hear(rms, seconds) && drillRec?.recorder === recorder) stopDrill();
       },
       (f0, frame, rate) => {
         if (drillLive !== mine) return;
         const f = mine.listener ? mine.listener.hear(frame, rate) : null;
-        // Pitch counts on the frames loud enough to count for resonance, as in the target's phrase.
-        mine.points.push({ t: (performance.now() - mine.started) / 1000, f0: mine.listener?.quiet ? null : f0, f });
-        if (mine.points.length > 900) mine.points.splice(0, 300);
+        // Pitch counts on the frames loud enough to count for resonance, as in
+        // the target's phrase.
+        mine.points.push({
+          t: (performance.now() - mine.started) / 1000,
+          f0: mine.listener?.quiet ? null : f0,
+          f,
+        });
+        if (mine.points.length > 900) mine.points.splice(0, 300); // keep it from growing
         renderDrillLive();
       },
       () => drillRec?.recorder === recorder && stopDrill(),
@@ -2873,24 +3807,31 @@ async function openDrill(free, index, word, at) {
     recorder.stop(); // the trainer was left while the microphone opened
     return;
   }
+
+  // 3. Under way: stops after 6 s (a word, not a line), or 45 s just looking.
   drillLive = mine;
-  drillRec = { recorder, free, index, timer: setTimeout(stopDrill, (free ? 45 : 6) * 1000) }; // a word, not a line
+  drillRec = { recorder, free, index, timer: setTimeout(stopDrill, (free ? 45 : 6) * 1000) };
   renderTrainer();
   renderMic();
   setTimeout(() => {
-    if (drillRec?.recorder === recorder && recorder.silent) $("#train-live").textContent = noSound();
+    if (drillRec?.recorder === recorder && recorder.silent) {
+      $("#train-live").textContent = noSound();
+    }
   }, 1500);
-  // The target's phrase, read the way the microphone is.
+
+  // 4. The target's phrase, read the way the microphone is.
   loadTargetTrack().then((frames) => {
     if (!frames || drillLive !== mine) return;
     const said = frames.filter((f) => f.t >= word.start - 0.02 && f.t < word.end + 0.02);
     mine.unit = typical(said.map((f) => f.f), 5);
     const f0s = said.map((f) => f.f0).filter(Boolean).sort((a, b) => a - b);
-    if (f0s.length >= 5) mine.pitch = f0s[f0s.length >> 1]; // the live tracker's own reading of the phrase
+    // The live tracker's own reading of the phrase.
+    if (f0s.length >= 5) mine.pitch = f0s[f0s.length >> 1];
     mine.listener = new Listener(profile.my_ceiling ?? profile.ceiling);
   });
 }
 
+/** Stop the trainer's microphone; a scored attempt is sent to be measured. */
 async function stopDrill() {
   if (!drillRec) return;
   const { recorder, timer, free, index } = drillRec;
@@ -2922,10 +3863,12 @@ async function stopDrill() {
   }
 }
 
+// "Say it": start a scored attempt, or stop the microphone.
 const toggleDrill = () => (drillRec ? stopDrill() : startDrill(false));
+// "Try it live": start looking, or stop the microphone.
 const toggleTryLive = () => (drillRec ? stopDrill() : startDrill(true));
 
-let minePlayer = null;
+let minePlayer = null; // the Audio playing your last attempt
 
 // Your last attempt at the word, to hear against the target's.
 function playMine() {
@@ -2936,18 +3879,21 @@ function playMine() {
   minePlayer.play().catch(() => {});
 }
 
+/** On to the next word in the trainer's order. */
 function nextTrainWord() {
   if (training.at + 1 < training.order.length) training.at += 1;
   training.picked = true;
   renderTrainer();
 }
 
+/** Back to the line page, with the coach on the part just trained. */
 function leaveTrainer() {
   if (drillRec) stopDrill();
   let part = training?.part;
   training = null;
   if (part === "both") {
     // The coach takes one part at a time: the weaker of the two on the last take.
+    // A part's score on the take on screen, 100 when it has none.
     const score = (k) => shown?.components.find((c) => c.key === k)?.score ?? 100;
     part = score("pitch") <= score("resonance") ? "pitch" : "resonance";
   }
@@ -2956,8 +3902,10 @@ function leaveTrainer() {
   setShown(shown);
 }
 
-// ---------- recording ----------
+// --- RECORDING TAKES ---
+// A take, a warm-up, or a clip to add as a line.
 
+/** Start recording a "take", a "warmup" or a "target" (a clip), if nothing else is starting. */
 async function startRecording(kind) {
   if (session || drillRec || opening || measuring) return;
   opening = kind;
@@ -2970,7 +3918,10 @@ async function startRecording(kind) {
   }
 }
 
+// The rest of startRecording: open the microphone, with the live guide for a
+// take or a warm-up. `at` is the page it started on.
 async function openRecording(kind, at) {
+  // 1. The recorder, the live guide, and when a take ends by itself.
   stopPlayback();
   await stopMicTest();
   const recorder = new Recorder();
@@ -2984,13 +3935,19 @@ async function openRecording(kind, at) {
   // A take ends when the line has been said: the quiet that ends it is a little
   // longer than the longest pause between the line's own words. Warming up and
   // recording a clip go on until they are stopped.
-  const ending = kind === "take" && autoStop() ? new Ending({ wait: waitFor(profile?.words), enough: 0.5 * spoken(profile?.words) }) : null;
+  const ending =
+    kind === "take" && autoStop()
+      ? new Ending({ wait: waitFor(profile?.words), enough: 0.5 * spoken(profile?.words) })
+      : null;
+
+  // 2. Open the microphone.
   const opened = performance.now();
   try {
     await recorder.start(
       (peak, rms) => {
-        $("#level").style.width = `${Math.min(100, peak * 140)}%`;
-        if (ending?.hear(rms, (performance.now() - opened) / 1000) && session?.recorder === recorder) stopRecording();
+        $("#level").style.width = `${Math.min(100, peak * 140)}%`; // full at a peak of about 0.7
+        const seconds = (performance.now() - opened) / 1000;
+        if (ending?.hear(rms, seconds) && session?.recorder === recorder) stopRecording();
       },
       withLive ? onLivePitch : null,
       () => {
@@ -3009,6 +3966,9 @@ async function openRecording(kind, at) {
     stopLive();
     return;
   }
+
+  // 3. Under way: the time in the status line four times a second, a warning
+  //    after 1.5 s of silence, and a stop at the limit.
   const started = performance.now();
   const limit = kind === "warmup" ? WARMUP_SECONDS : MAX_SECONDS;
   const label = kind === "warmup" ? "Warming up, not scored" : "Recording";
@@ -3016,7 +3976,12 @@ async function openRecording(kind, at) {
   const timer = setInterval(() => {
     const seconds = (performance.now() - started) / 1000;
     const dead = seconds > 1.5 && recorder.silent;
-    setStatus(dead ? `${label}… ${seconds.toFixed(0)} s. ${noSound()}` : `${label}… ${seconds.toFixed(0)} s${until}`, dead);
+    setStatus(
+      dead
+        ? `${label}… ${seconds.toFixed(0)} s. ${noSound()}`
+        : `${label}… ${seconds.toFixed(0)} s${until}`,
+      dead,
+    );
     if (seconds >= limit) stopRecording();
   }, 250);
   // What it is for, as it was when it started: the take is scored against this
@@ -3027,8 +3992,10 @@ async function openRecording(kind, at) {
   renderMic();
 }
 
-// `discard`: stop and keep nothing (the page it belonged to was left).
+// Stop recording: a take is scored, a clip opens to be trimmed, a warm-up just
+// ends. `discard`: stop and keep nothing (the page it belonged to was left).
 async function stopRecording({ discard = false } = {}) {
+  // 1. Stop the timer and the live guide.
   if (!session) return;
   const { kind, recorder, timer, target, owner } = session;
   session = null;
@@ -3041,13 +4008,16 @@ async function stopRecording({ discard = false } = {}) {
     if (kind !== "warmup") setStatus("");
     return;
   }
+
+  // 2. What was recorded, to where it goes.
   measuring = kind !== "warmup";
   renderControls();
   try {
     const blob = await recorder.stop();
     if (kind === "take") await submitTake(blob, target);
-    else if (kind === "target") await openTrim(blob, { name: "Recorded clip", back: "voice", extra: { voice: owner } });
-    else {
+    else if (kind === "target") {
+      await openTrim(blob, { name: "Recorded clip", back: "voice", extra: { voice: owner } });
+    } else {
       markStep("note");
       setStatus("Warm-up done. Your pitch stays on the guide until the next take.");
     }
@@ -3057,6 +4027,7 @@ async function stopRecording({ discard = false } = {}) {
   }
 }
 
+// Start recording this kind, or stop whatever is recording.
 const toggleRecording = (kind) => (session ? stopRecording() : startRecording(kind));
 
 // The target's F1-F3 through the line, read in the browser by the tracker the
@@ -3084,8 +4055,11 @@ function loadTargetTrack() {
   return targetTrack.frames;
 }
 
+// A resonance gap in percent, in words ("about level with" within 2%).
 const brightness = (percent) =>
-  Math.abs(percent) < 2 ? "about level with" : `about ${Math.abs(percent).toFixed(0)}% ${percent > 0 ? "brighter" : "darker"} than`;
+  Math.abs(percent) < 2
+    ? "about level with"
+    : `about ${Math.abs(percent).toFixed(0)}% ${percent > 0 ? "brighter" : "darker"} than`;
 
 // Your resonance so far against the target's, with your sounds lined up with
 // the target's first, as a take's Resonance is measured: each vowel is held
@@ -3109,12 +4083,21 @@ function renderLiveResonance() {
   }
   $("#live-res").hidden = percent == null;
   if (percent == null) return;
+  // ±25% across the meter.
   $("#live-res-mark").style.left = `${50 + (Math.max(-25, Math.min(25, percent)) / 25) * 50}%`;
   $("#live-res-text").textContent = `Resonance so far: ${brightness(percent)} the target`;
 }
 
+/** Start a live trace on the guide, and the resonance meter once the target's formants are read. */
 function startLive() {
-  const started = { points: [], started: performance.now(), onset: null, done: false, listener: null, target: null };
+  const started = {
+    points: [],
+    started: performance.now(),
+    onset: null,
+    done: false,
+    listener: null,
+    target: null,
+  };
   live = started;
   selectedWord = null;
   $("#live").hidden = false;
@@ -3128,24 +4111,37 @@ function startLive() {
   });
 }
 
+/** End the live trace; the guide keeps it until the next take is on screen. */
 function stopLive() {
   if (live) live.done = true;
   $("#live").hidden = true;
 }
 
+// Each reading while recording with the live guide: keep it, show your pitch
+// against the target's, and redraw.
 function onLivePitch(f0, frame, rate) {
   if (!live || live.done) return;
   const t = (performance.now() - live.started) / 1000;
   live.points.push({ t, f0, f: live.listener && frame ? live.listener.hear(frame, rate) : null });
   if (f0 && live.onset == null) live.onset = t;
-  const recent = live.points.filter((p) => p.f0 && p.t > t - 0.5).map((p) => p.f0).sort((a, b) => a - b);
+  // The median of the last half second, once there are five readings; within a
+  // semitone counts as on target.
+  const recent = live.points
+    .filter((p) => p.f0 && p.t > t - 0.5)
+    .map((p) => p.f0)
+    .sort((a, b) => a - b);
   const target = profile?.median_f0;
   if (recent.length >= 5) {
     const now = recent[Math.floor(recent.length / 2)];
     let text = `You: ${Math.round(now)} Hz (${noteName(now)})`;
     if (target) {
       const st = 12 * Math.log2(now / target);
-      const advice = Math.abs(st) < 1 ? "on target" : st > 0 ? `go lower (${st.toFixed(1)} st)` : `go higher (${(-st).toFixed(1)} st)`;
+      const advice =
+        Math.abs(st) < 1
+          ? "on target"
+          : st > 0
+            ? `go lower (${st.toFixed(1)} st)`
+            : `go higher (${(-st).toFixed(1)} st)`;
       text += ` · target about ${Math.round(target)} Hz (${noteName(target)}) — ${advice}`;
     }
     $("#live-text").textContent = text;
@@ -3154,15 +4150,21 @@ function onLivePitch(f0, frame, rate) {
   drawGuide();
 }
 
-// `line`: the line the take was recorded on.
+// Send a take to be scored and put it on screen. `line`: the line the take was
+// recorded on.
 async function submitTake(blob, line) {
   setStatus("Scoring…");
   try {
+    // 1. Score it, with the part picked by hand if there is one.
     const focus = chosenFocus();
     const path = `/api/targets/${line}/takes${focus ? `?focus=${focus}` : ""}`;
     const take = await postWav(path, await toWav(blob));
     if (current?.id !== line) return setStatus("The take was scored and kept with its line.");
-    if (profile && take.measures?.ceiling_used) profile.my_ceiling = take.measures.ceiling_used; // for the live meter
+
+    // 2. Add it to the line's takes, and the line's summary.
+    if (profile && take.measures?.ceiling_used) {
+      profile.my_ceiling = take.measures.ceiling_used; // for the live meter
+    }
     takes.push({
       id: take.id,
       created: take.created,
@@ -3172,9 +4174,20 @@ async function submitTake(blob, line) {
     });
     if (live?.done) live = null; // the take's own live trace, not a newer one
     const best = Math.max(...takes.map((t) => t.overall));
-    current = { ...current, takes: takes.length, best, last: take.created, last_score: take.overall, focus: take.coach?.focus ?? null };
+    current = {
+      ...current,
+      takes: takes.length,
+      best,
+      last: take.created,
+      last_score: take.overall,
+      focus: take.coach?.focus ?? null,
+    };
     targets = targets.map((t) => (t.id === current.id ? current : t));
-    if (inCheck()) check.results[check.index] = { target: current.id, take: take.id, overall: take.overall };
+
+    // 3. Count it in a voice check under way, and show it.
+    if (inCheck()) {
+      check.results[check.index] = { target: current.id, take: take.id, overall: take.overall };
+    }
     setStatus("");
     setShown(take);
   } catch (err) {
@@ -3182,6 +4195,7 @@ async function submitTake(blob, line) {
   }
 }
 
+/** The line page's record, warm-up and clip buttons, for what is recording. */
 function renderControls() {
   const kind = session?.kind;
   const checkDone = inCheck() && check.results[check.index];
@@ -3197,23 +4211,32 @@ function renderControls() {
   $("#new-record").textContent = kind === "target" ? "Stop" : "Record a clip";
 }
 
-// ---------- the result of a take ----------
+// --- TAKE RESULT ---
 
+/** The take on screen: its score, against the takes before it, and each part. */
 function renderResult() {
   $("#result").hidden = !shown || inCheck();
   if (!shown || inCheck()) return;
+
+  // 1. The score ring.
   const overall = Math.round(shown.overall);
   $("#overall").textContent = overall;
-  const circumference = 2 * Math.PI * 34;
-  $("#ring-fill").setAttribute("stroke-dasharray", `${(circumference * overall) / 100} ${circumference}`);
+  const circumference = 2 * Math.PI * 34; // the ring's radius
+  $("#ring-fill").setAttribute(
+    "stroke-dasharray",
+    `${(circumference * overall) / 100} ${circumference}`,
+  );
   $("#check").hidden = !shown.accepted;
 
+  // 2. On the ladder, and against the takes before it.
   const index = takes.findIndex((t) => t.id === shown.id);
   const earlier = takes.slice(0, Math.max(0, index));
   const previous = earlier.at(-1);
   $("#ladder-now").style.left = `${overall}%`;
   $("#ladder-now").title = `This take: ${overall}`;
-  const bestBefore = earlier.length ? Math.round(Math.max(...earlier.map((t) => t.overall))) : null;
+  const bestBefore = earlier.length
+    ? Math.round(Math.max(...earlier.map((t) => t.overall)))
+    : null;
   $("#ladder-best").hidden = bestBefore == null;
   if (bestBefore != null) {
     $("#ladder-best").style.left = `${bestBefore}%`;
@@ -3223,20 +4246,31 @@ function renderResult() {
   else {
     const best = Math.max(...earlier.map((t) => t.overall));
     const change = Math.round(shown.overall - previous.overall);
-    const said = change === 0 ? "Same as your last take" : `${change > 0 ? "Up" : "Down"} ${Math.abs(change)} from your last take`;
-    $("#score-note").textContent = shown.overall > best ? `${said}: a new best.` : `${said}. Best so far: ${Math.round(best)}.`;
+    const said =
+      change === 0
+        ? "Same as your last take"
+        : `${change > 0 ? "Up" : "Down"} ${Math.abs(change)} from your last take`;
+    $("#score-note").textContent =
+      shown.overall > best ? `${said}: a new best.` : `${said}. Best so far: ${Math.round(best)}.`;
   }
 
+  // 3. Each part, with its change since the last take.
   const focus = currentFocus();
   const rows = [...shown.components];
-  if (!rows.some((c) => c.key === "gender") && shown.gender?.take != null && shown.gender?.target != null) {
+  if (
+    !rows.some((c) => c.key === "gender") &&
+    shown.gender?.take != null &&
+    shown.gender?.target != null
+  ) {
     // A take from before gender read was a measurement: the same row, worked out here.
     const { take, target } = shown.gender;
     rows.push({
       key: "gender",
       label: "Gender read",
       score: Math.max(0, 100 - Math.abs(take - target)),
-      detail: `you read ${Math.round(take)} (${genderWord(take)}), the target ${Math.round(target)} (${genderWord(target)}); 0 is male, 100 female`,
+      detail:
+        `you read ${Math.round(take)} (${genderWord(take)}), ` +
+        `the target ${Math.round(target)} (${genderWord(target)}); 0 is male, 100 female`,
     });
   }
   $("#components").replaceChildren(
@@ -3248,26 +4282,33 @@ function renderResult() {
         { className: `${c.key === focus ? "focus" : ""}${READS.has(c.key) ? " extra" : ""}` },
         el("span", { className: "label", textContent: c.label }),
         bar(c.score),
-        el("span", { className: "num", textContent: c.score == null ? "–" : Math.round(c.score) }),
+        el("span", {
+          className: "num",
+          textContent: c.score == null ? "–" : Math.round(c.score),
+        }),
         el("span", {
           className: `delta ${change > 0 ? "up" : change < 0 ? "down" : ""}`,
           textContent: change == null ? "" : delta(c.score, before),
           title: change == null ? "" : "Change since your last take",
         }),
         trainButton(c.key),
-        el("span", { className: "detail", textContent: READS.has(c.key) ? `${c.detail}. Not counted in the score.` : c.detail }),
+        el("span", {
+          className: "detail",
+          textContent: READS.has(c.key) ? `${c.detail}. Not counted in the score.` : c.detail,
+        }),
       );
     }),
   );
 
-  // Advice on the parts is the coach's job; here only what's left: the words.
+  // 4. Advice on the parts is the coach's job; here only what's left: the words.
   const partHints = new Set(shown.components.map((c) => c.hint));
   const extra = shown.coach ? shown.hints.filter((h) => !partHints.has(h)) : shown.hints;
   $("#hints-wrap").hidden = !extra.length;
   $("#hints").replaceChildren(...extra.map((hint) => el("li", { textContent: hint })));
 }
 
-// "Train ›" on each part a person can work on directly (not Voice: it follows from the rest).
+// "Train ›" on each part a person can work on directly (not Voice: it follows
+// from the rest; not fry, which is only read). An empty span otherwise.
 function trainButton(key) {
   if (key === "identity" || key === "fry") return el("span");
   const button = el("button", { type: "button", className: "train-btn", textContent: "Train ›" });
@@ -3277,7 +4318,9 @@ function trainButton(key) {
     button.onclick = () => openTrainer("both");
     return button;
   }
-  button.title = TRAIN[key] ? `Work on ${partLabel(key).toLowerCase()} word by word` : `Work on ${partLabel(key).toLowerCase()} across the line`;
+  button.title = TRAIN[key]
+    ? `Work on ${partLabel(key).toLowerCase()} word by word`
+    : `Work on ${partLabel(key).toLowerCase()} across the line`;
   button.onclick = () => openTrainer(key);
   return button;
 }
@@ -3285,8 +4328,19 @@ function trainButton(key) {
 // Shown beside the parts and not counted in the score.
 const READS = new Set(["gender", "fry"]);
 
-const genderWord = (v) => (v >= 80 ? "female" : v >= 60 ? "leans female" : v > 40 ? "in between" : v > 20 ? "leans male" : "male");
+// A gender read, 0 (male) to 100 (female), in words.
+const genderWord = (v) =>
+  v >= 80
+    ? "female"
+    : v >= 60
+      ? "leans female"
+      : v > 40
+        ? "in between"
+        : v > 20
+          ? "leans male"
+          : "male";
 
+/** A bar for each take on the line, to put an earlier one on screen. */
 function renderHistory() {
   $("#history").hidden = takes.length < 2 || inCheck();
   if (takes.length < 2 || inCheck()) return;
@@ -3294,8 +4348,11 @@ function renderHistory() {
   $("#history-note").textContent = `${takes.length} so far, best ${Math.round(best)}`;
   $("#takes").replaceChildren(
     ...takes.map((take) => {
-      const button = el("button", { type: "button", title: `${Math.round(take.overall)} — ${new Date(take.created).toLocaleString()}` });
-      button.style.height = `${Math.max(4, take.overall)}%`;
+      const button = el("button", {
+        type: "button",
+        title: `${Math.round(take.overall)} — ${new Date(take.created).toLocaleString()}`,
+      });
+      button.style.height = `${Math.max(4, take.overall)}%`; // at least 4%, to be seen
       button.setAttribute("aria-current", String(take.id === shown?.id));
       button.onclick = async () => {
         stopPlayback();
@@ -3306,16 +4363,18 @@ function renderHistory() {
   );
 }
 
-// ---------- the voice check: several lines, one take each ----------
+// --- VOICE CHECK ---
+// Several lines, one take each.
 
+/** Start a voice check on the open voice's ticked lines, at the first. */
 async function startCheck() {
   const lines = checkLines();
   if (lines.length < voice.min_check_lines) return;
-  const owner = voice;
-  check = { voiceId: owner.id, voiceName: owner.name, lines, index: 0, results: [] };
+  check = { voiceId: voice.id, lines, index: 0, results: [] };
   await openLine(lines[0], { keepCheck: true });
 }
 
+/** The voice check's banner on the line page: which line, and the score of each so far. */
 function renderCheckBanner() {
   const on = inCheck();
   $("#check-banner").hidden = !on;
@@ -3326,8 +4385,10 @@ function renderCheckBanner() {
   const n = check.lines.length;
   const done = check.results[i];
   $("#check-step").textContent = done
-    ? `Line ${i + 1} of ${n}: ${Math.round(done.overall)}. ${i + 1 < n ? "On to the next one." : "That's every line."}`
-    : `Line ${i + 1} of ${n}. Listen as often as you like, then one take: no retries, like performing it.`;
+    ? `Line ${i + 1} of ${n}: ${Math.round(done.overall)}. ` +
+      `${i + 1 < n ? "On to the next one." : "That's every line."}`
+    : `Line ${i + 1} of ${n}. ` +
+      "Listen as often as you like, then one take: no retries, like performing it.";
   $("#check-dots").replaceChildren(
     ...check.lines.map((line, k) => {
       const result = check.results[k];
@@ -3342,6 +4403,7 @@ function renderCheckBanner() {
   $("#check-next").textContent = i + 1 < n ? "Next line ›" : "See your voice score";
 }
 
+/** On to the check's next line, or, after the last, the voice score. */
 async function checkNext() {
   if (!check) return;
   if (check.index + 1 < check.lines.length) {
@@ -3352,7 +4414,9 @@ async function checkNext() {
   const { voiceId, results } = check;
   setStatus("Working out your voice score…");
   try {
-    const result = await send(`/api/voices/${voiceId}/checks`, "POST", { takes: results.map(({ target, take }) => ({ target, take })) });
+    const result = await send(`/api/voices/${voiceId}/checks`, "POST", {
+      takes: results.map(({ target, take }) => ({ target, take })),
+    });
     check = null;
     await refreshLists();
     setStatus("");
@@ -3362,18 +4426,27 @@ async function checkNext() {
   }
 }
 
+/** Stop the voice check, once confirmed, and go back to the voice. */
 async function stopCheck() {
-  if (!confirm("Stop the voice check? The takes you've made stay on their lines, but no voice score is saved.")) return;
+  const sure = confirm(
+    "Stop the voice check? " +
+      "The takes you've made stay on their lines, but no voice score is saved.",
+  );
+  if (!sure) return;
   const voiceId = check?.voiceId;
   check = null;
   if (voiceId) await openVoice(voiceId);
 }
 
+/** Open a voice check's result. */
 async function openCheck(voiceId, checkId) {
   leave();
   let result;
   try {
-    [voice, result] = await Promise.all([api(`/api/voices/${voiceId}`), api(`/api/voices/${voiceId}/checks/${checkId}`)]);
+    [voice, result] = await Promise.all([
+      api(`/api/voices/${voiceId}`),
+      api(`/api/voices/${voiceId}/checks/${checkId}`),
+    ]);
   } catch (err) {
     setStatus(err.message, true);
     return;
@@ -3383,20 +4456,30 @@ async function openCheck(voiceId, checkId) {
   show("check-result");
 }
 
+/** A voice check's result: the score, each line, each part, and what to work on. */
 function renderCheckResult(result) {
+  // 1. Against the check before, and how even the lines were (within 10 points is steady).
   const index = voice.checks.findIndex((c) => c.id === result.id);
   const before = index > 0 ? voice.checks[index - 1] : null;
-  const back = el("button", { type: "button", className: "crumb", textContent: `‹ ${voice.name}` });
+  const back = el("button", {
+    type: "button",
+    className: "crumb",
+    textContent: `‹ ${voice.name}`,
+  });
   back.onclick = () => openVoice(voice.id);
   const spread = result.high - result.low;
   const steady =
     spread <= 10
-      ? `Steady: your lines ranged ${Math.round(result.low)}–${Math.round(result.high)}, so this is how the voice comes across, not one lucky or unlucky line.`
-      : `Uneven: your lines ranged ${Math.round(result.low)}–${Math.round(result.high)}. The voice holds on some lines and slips on others.`;
+      ? `Steady: your lines ranged ${Math.round(result.low)}–${Math.round(result.high)}, ` +
+        "so this is how the voice comes across, not one lucky or unlucky line."
+      : `Uneven: your lines ranged ${Math.round(result.low)}–${Math.round(result.high)}. ` +
+        "The voice holds on some lines and slips on others.";
   const change = before
-    ? `${delta(result.average, before.average)} since the check before (${Math.round(before.average)}).`
+    ? `${delta(result.average, before.average)} since the check before ` +
+      `(${Math.round(before.average)}).`
     : "Your first voice check: this is your baseline.";
 
+  // 2. Each line, then each part.
   const lines = el(
     "ol",
     { className: "check-lines" },
@@ -3425,26 +4508,54 @@ function renderCheckResult(result) {
         { className: key === result.focus ? "focus" : "" },
         el("span", { className: "label", textContent: label }),
         bar(result.parts[key]),
-        el("span", { className: "num", textContent: result.parts[key] == null ? "–" : Math.round(result.parts[key]) }),
+        el("span", {
+          className: "num",
+          textContent: result.parts[key] == null ? "–" : Math.round(result.parts[key]),
+        }),
       ),
     ),
   );
+
+  // 3. What to work on: habits in every line, the part to lift, the weakest line.
   const habits = habitList(result.habits ?? {});
   const weakest = result.lines.find((r) => r.target === result.weakest);
   const next = [];
-  if (result.focus) next.push(`Work on ${partLabel(result.focus).toLowerCase()} across your lines: it would lift the voice score most.`);
+  if (result.focus) {
+    next.push(
+      `Work on ${partLabel(result.focus).toLowerCase()} across your lines: ` +
+        "it would lift the voice score most.",
+    );
+  }
   if (weakest && spread > 10) next.push(`Start with your weakest line, “${weakest.line}”.`);
-  const practiseWeakest = el("button", { type: "button", className: "record", textContent: "Practise the weakest line" });
+  const practiseWeakest = el("button", {
+    type: "button",
+    className: "record",
+    textContent: "Practise the weakest line",
+  });
   practiseWeakest.onclick = async () => {
     const line = targets.find((t) => t.id === result.weakest);
     if (line) await openLine(line);
   };
-  const toVoice = el("button", { type: "button", className: "btn", textContent: `Back to ${voice.name}` });
+  const toVoice = el("button", {
+    type: "button",
+    className: "btn",
+    textContent: `Back to ${voice.name}`,
+  });
   toVoice.onclick = () => openVoice(voice.id);
 
+  // 4. The page.
   $("#check-result").replaceChildren(
     back,
-    el("header", { className: "page-head" }, el("div", {}, el("p", { className: "eyebrow", textContent: `Voice check · ${when(result.created)}` }), el("h2", { textContent: "Your voice score" }))),
+    el(
+      "header",
+      { className: "page-head" },
+      el(
+        "div",
+        {},
+        el("p", { className: "eyebrow", textContent: `Voice check · ${when(result.created)}` }),
+        el("h2", { textContent: "Your voice score" }),
+      ),
+    ),
     el(
       "section",
       { className: "card score-card" },
@@ -3455,7 +4566,14 @@ function renderCheckResult(result) {
         el(
           "div",
           { className: "score-text" },
-          el("div", { className: "score" }, el("span", { textContent: Math.round(result.average) }), el("small", { textContent: `/ 100, the average of ${plural(result.lines.length, "line")}` })),
+          el(
+            "div",
+            { className: "score" },
+            el("span", { textContent: Math.round(result.average) }),
+            el("small", {
+              textContent: `/ 100, the average of ${plural(result.lines.length, "line")}`,
+            }),
+          ),
           el("p", { className: "score-note", textContent: change }),
           el("p", { className: "fine", textContent: steady }),
         ),
@@ -3463,20 +4581,35 @@ function renderCheckResult(result) {
       ladder(result.average, before?.average ?? null),
     ),
     el("section", { className: "card" }, el("h3", { textContent: "Each line" }), lines),
-    el("section", { className: "card" }, el("h3", { textContent: "Each part, averaged over the lines" }), parts),
+    el(
+      "section",
+      { className: "card" },
+      el("h3", { textContent: "Each part, averaged over the lines" }),
+      parts,
+    ),
     el(
       "section",
       { className: "card coach" },
       el("h3", { textContent: "What to work on" }),
-      habits.length ? el("p", { textContent: `In every line you were ${habits.join(" and ")}. Fix that once and every line improves.` }) : null,
+      habits.length
+        ? el("p", {
+            textContent:
+              `In every line you were ${habits.join(" and ")}. ` +
+              "Fix that once and every line improves.",
+          })
+        : null,
       ...next.map((text) => el("p", { textContent: text })),
       el("div", { className: "score-card-buttons" }, practiseWeakest, toVoice),
     ),
   );
 }
 
-// ---------- polling: recordings being processed ----------
+// --- POLLING ---
+// Recordings being processed.
 
+// Every 1.5 s, while any recording is being processed: follow it, and refresh
+// the page showing it; once one finishes, reload the lists, as its job may have
+// added lines.
 async function poll() {
   if (sources.some(unfinished)) {
     try {
@@ -3488,7 +4621,11 @@ async function poll() {
         await refreshLists(); // its job may have added lines
         if (voice && !$("#voice").hidden) {
           await refreshVoice();
-          setStatus(voice.lines.length ? "Done: the best lines are under “Your lines”, ready to practise." : "");
+          setStatus(
+            voice.lines.length
+              ? "Done: the best lines are under “Your lines”, ready to practise."
+              : "",
+          );
         }
       }
     } catch {}
@@ -3496,13 +4633,20 @@ async function poll() {
   setTimeout(poll, 1500);
 }
 
-// ---------- wiring ----------
+// --- WIRING ---
+// Everything here runs before the first await below, so no handler can fire
+// before all of them are set.
 
+// The sidebar and home.
 $("#home-link").onclick = goHome;
 $("#new-voice").onclick = () => toggleNewVoice(true);
 $("#new-voice-cancel").onclick = () => toggleNewVoice(false);
 // One box for a name or a link: in the sidebar, on the first screen, on home.
-for (const [form, input] of [["#new-voice-form", "#new-voice-name"], ["#first-voice-form", "#first-voice-name"], ["#home-new-form", "#home-new-input"]]) {
+for (const [form, input] of [
+  ["#new-voice-form", "#new-voice-name"],
+  ["#first-voice-form", "#first-voice-name"],
+  ["#home-new-form", "#home-new-input"],
+]) {
   $(form).onsubmit = async (e) => {
     e.preventDefault();
     const text = $(input).value.trim();
@@ -3512,12 +4656,14 @@ for (const [form, input] of [["#new-voice-form", "#new-voice-name"], ["#first-vo
     await startVoice(text);
   };
 }
+
+// A voice's page, and adding lines to it.
 $("#rename-voice").onclick = renameVoice;
-for (const b of document.querySelectorAll("#voice-tabs button")) b.onclick = () => setVoiceTab(b.dataset.tab);
+for (const b of document.querySelectorAll("#voice-tabs button")) {
+  b.onclick = () => setVoiceTab(b.dataset.tab);
+}
 $("#autopick").onclick = autoPick;
 $("#delete-voice").onclick = deleteVoice;
-$("#record").onclick = () => toggleRecording("take");
-$("#warmup").onclick = () => toggleRecording("warmup");
 $("#new-record").onclick = () => toggleRecording("target");
 $("#new-file").onchange = async (e) => {
   const [file] = e.target.files;
@@ -3525,6 +4671,8 @@ $("#new-file").onchange = async (e) => {
   if (file) await addFile(file);
 };
 $("#link-form").onsubmit = addLink;
+
+// A recording's page, and trimming a clip.
 $("#line-search").oninput = renderLines;
 $("#only-good").onchange = renderLines;
 $("#delete-source").onclick = deleteSource;
@@ -3533,6 +4681,10 @@ $("#trim-end").oninput = renderTrim;
 $("#trim-play").onclick = playTrim;
 $("#trim-use").onclick = useTrim;
 $("#trim-cancel").onclick = closeTrim;
+
+// A line's page, and the voice check on it.
+$("#record").onclick = () => toggleRecording("take");
+$("#warmup").onclick = () => toggleRecording("warmup");
 $("#edit-line").onclick = editLine;
 $("#cancel-line").onclick = renderLine;
 $("#line-form").onsubmit = saveLine;
@@ -3541,12 +4693,25 @@ $("#play-target").onclick = () => play("target");
 $("#play-take").onclick = () => play("take");
 $("#play-both").onclick = () => play("both");
 $("#play-note").onclick = playNote;
+for (const b of document.querySelectorAll(".speed button")) {
+  b.onclick = () => setSpeed(Number(b.dataset.rate));
+}
 $("#check-next").onclick = checkNext;
+$("#check-stop").onclick = stopCheck;
+
+// The trainer.
 $("#train-listen").onclick = playTrainWord;
 $("#train-note").onclick = playWordNote;
 $("#train-mine").onclick = playMine;
-for (const b of document.querySelectorAll("#train-modes button")) b.onclick = () => switchTrainMode(b.dataset.part);
+for (const b of document.querySelectorAll("#train-modes button")) {
+  b.onclick = () => switchTrainMode(b.dataset.part);
+}
 $("#train-say").onclick = toggleDrill;
+$("#train-try").onclick = toggleTryLive;
+$("#train-next").onclick = nextTrainWord;
+$("#train-back").onclick = leaveTrainer;
+
+// The microphone box and the auto-stop setting.
 $("#mic-select").onchange = (e) => chooseMic(e.target.value);
 $("#mic-test").onclick = testMic;
 $("#mic-off").onclick = closeMic;
@@ -3561,17 +4726,18 @@ api("/api/config")
   .catch(() => {});
 window.addEventListener("pagehide", () => mic.stream?.getTracks().forEach((t) => t.stop()));
 listMics();
-$("#train-try").onclick = toggleTryLive;
-$("#train-next").onclick = nextTrainWord;
-$("#train-back").onclick = leaveTrainer;
-$("#check-stop").onclick = stopCheck;
-for (const b of document.querySelectorAll(".speed button")) b.onclick = () => setSpeed(Number(b.dataset.rate));
 
 // Space records a take, unless the keyboard is busy with a field or button.
 document.addEventListener("keydown", (e) => {
   if (e.code !== "Space" || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
   const active = document.activeElement;
-  if (active && active !== document.body && active.closest("button, input, textarea, select, a, label, [contenteditable]")) return;
+  if (
+    active &&
+    active !== document.body &&
+    active.closest("button, input, textarea, select, a, label, [contenteditable]")
+  ) {
+    return;
+  }
   if (opening || measuring) {
     e.preventDefault(); // starting, or scoring: a second press would start another
     return;
@@ -3581,7 +4747,13 @@ document.addEventListener("keydown", (e) => {
     toggleDrill();
     return;
   }
-  if ($("#practice").hidden || (session && session.kind !== "take") || $("#record").disabled) return;
+  if (
+    $("#practice").hidden ||
+    (session && session.kind !== "take") ||
+    $("#record").disabled
+  ) {
+    return;
+  }
   e.preventDefault();
   toggleRecording("take");
 });
@@ -3592,6 +4764,8 @@ window.addEventListener("resize", () => {
 });
 // Colours come from CSS, so redraw when the theme flips.
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => drawGuide());
+
+// --- STARTUP ---
 
 try {
   await refreshLists();

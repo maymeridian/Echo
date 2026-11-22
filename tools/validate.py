@@ -1,4 +1,1628 @@
-"""Check the measurements against data with known answers.
+'''
+tools/validate.py
+Author: maymeridian
+Description: Checks each measurement against data with known answers, one command per check.
+             - Each prints the current method next to the alternatives that were considered.
+               Every command takes --workers (default 8).
+             - python tools/validate.py pitch --ptdb cache/ptdb
+               Pitch tracking against PTDB-TUG (Pirker et al., Interspeech 2011):
+               laryngograph-derived reference pitch for 10 women and 10 men.
+               Download: http://www2.spsc.tugraz.at/databases/PTDB-TUG/ (ODbL).
+             - python tools/validate.py formants --h95 cache/hillenbrand
+               Formant tracking against Hillenbrand et al. (1995, JASA 97:3099): hand-checked
+               F1-F3 for 1,668 /hVd/ words by men, women and children.
+               Download: https://github.com/santiagobarreda/hillenbrand_et_al_1995
+             - python tools/validate.py formant-lines --h95 cache/hillenbrand
+               The same words, each speaker's 12 joined into one recording, with one formant
+               ceiling chosen per recording from its voiced frames, without vowel labels.
+             - python tools/validate.py vcc2018 --vcc cache/vcc2018 --out cache/vcc2018/scored.jsonl
+               The whole scorer against human judgments: the Voice Conversion Challenge 2018
+               similarity test (Lorenzo-Trueba et al., Odyssey 2018), where listeners rated
+               converted speech against the natural target or source speaker saying the same
+               sentence, 1 (different, sure) to 4 (same, sure). Download:
+               https://doi.org/10.7488/ds/2337 and https://doi.org/10.7488/ds/2496 (CC BY 4.0).
+               --report-only reports on an earlier --out again; --models compares speaker
+               models and projections.
+             - python tools/validate.py voxsim-fetch --voxsim cache/voxsim --out cache/voxceleb1
+               python tools/validate.py voxsim --voxsim cache/voxsim --audio cache/voxceleb1
+               The speaker-identity measures against VoxSim (Ahn et al., Interspeech 2024,
+               arXiv:2407.18505): human 1-6 similarity ratings of VoxCeleb1 clip pairs,
+               different sentences, recorded in the wild. Ratings from
+               https://mm.kaist.ac.kr/projects/voxsim/ (CC BY 4.0). voxsim-fetch pulls only the
+               needed clips out of the VoxCeleb1 zips on the Hugging Face mirror
+               (ProgramComputer/voxceleb; accept its terms and log in first).
+             - python tools/validate.py line --ravdess cache/ravdess
+               The word check (line.py) on RAVDESS, where every actor says the same two
+               sentences: how often it flags a take that did say the line (false alarms), and
+               how often it catches the other sentence or a take cut short.
+             - python tools/validate.py cleaning --music cache/music
+               Clip cleaning: clean sentences (CMU ARCTIC, RAVDESS, VCC2018 targets) mixed with
+               music (six public-domain/CC0 recordings from Wikimedia Commons, plus a synthetic
+               drum-and-bass loop) at 0, 5 and 10 dB, then scored raw, after vocal separation,
+               and after two speech denoisers, against the clean original.
+             - python tools/validate.py other-voice --vcc cache/vcc2018
+               The "other voice" tag on lines split from a long recording (sources.py): for
+               each VCC2018 speaker, 30 of their sentences mixed with 8 by three others, all
+               from the same studio, run through the job; three rounds of fresh random picks.
+             - python tools/validate.py speakers --vcc cache/vcc2018
+               Finding the speakers in a recording (sources.find_speakers): mixes of 1 to 4
+               VCC2018 speakers, how often the count is right and how many lines go to the
+               right speaker, at several thresholds. With --voxceleb cache/voxceleb1, the same
+               test on VoxCeleb1 interviews too.
+'''
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import numpy as np
+import parselmouth
+
+from echo_voice.analysis import SR, load
+
+# --- SHARED HELPERS ---
+
+
+def _low_priority():
+    """Pool initializer: run workers below normal priority on Windows (0x4000 is
+    BELOW_NORMAL_PRIORITY_CLASS), so a long check leaves the machine usable."""
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
+
+
+# --- PITCH ---
+
+
+def _track(snd: parselmouth.Sound, floor: float, ceiling: float, method: str) -> parselmouth.Pitch:
+    """Praat's pitch track at 10 ms steps between `floor` and `ceiling` Hz, by autocorrelation
+    ("ac") or cross-correlation (anything else)."""
+    if method == "ac":
+        return snd.to_pitch_ac(time_step=0.01, pitch_floor=floor, pitch_ceiling=ceiling)
+    return snd.to_pitch_cc(time_step=0.01, pitch_floor=floor, pitch_ceiling=ceiling)
+
+
+def _on_grid(pitch: parselmouth.Pitch, times: np.ndarray) -> np.ndarray:
+    """A pitch track read at `times` from its nearest frames: Hz, 0 where unvoiced or outside
+    the track."""
+    f0 = pitch.selected_array["frequency"]
+    xs = pitch.xs()
+    out = np.zeros(len(times))
+    idx = np.round((times - xs[0]) / pitch.get_time_step()).astype(int)
+    ok = (idx >= 0) & (idx < len(xs))
+    out[ok] = f0[idx[ok]]
+    return out
+
+
+PITCH_METHODS = {
+    # name: (algorithm, how the range is chosen)
+    "ac 60-600 (current)": ("ac", "fixed"),
+    "cc 60-600": ("cc", "fixed"),
+    "ac two-pass, q35*0.72 .. q65*1.9 (De Looze & Hirst 2008)": ("ac", "dlh"),
+    "ac two-pass, q25*0.75 .. q75*1.5 (Hirst 2011)": ("ac", "hirst"),
+    "cc two-pass, q25*0.75 .. q75*1.5 (Hirst 2011)": ("cc", "hirst"),
+}
+
+
+def pitch_tracks(y: np.ndarray, times: np.ndarray) -> dict[str, np.ndarray]:
+    """Each of PITCH_METHODS' pitch on the grid `times`. The two-pass methods track once at
+    60-700 Hz and, with at least 20 voiced frames, again within a range set by the quantiles
+    of that first pass (the floor no lower than 40 Hz); otherwise they keep 60-600 Hz."""
+    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
+    out = {}
+    for name, (method, rng) in PITCH_METHODS.items():
+        floor, ceiling = 60.0, 600.0
+        if rng != "fixed":
+            first = _on_grid(_track(snd, 60.0, 700.0, method), times)
+            v = first[first > 0]
+            if v.size >= 20:
+                if rng == "dlh":
+                    floor, ceiling = np.quantile(v, 0.35) * 0.72, np.quantile(v, 0.65) * 1.9
+                else:
+                    floor, ceiling = np.quantile(v, 0.25) * 0.75, np.quantile(v, 0.75) * 1.5
+                floor = max(40.0, floor)
+        out[name] = _on_grid(_track(snd, floor, ceiling, method), times)
+    return out
+
+
+def _pitch_job(path: Path):
+    """One PTDB-TUG recording: its stem, the reference pitch, and every method's pitch on a
+    10 ms grid."""
+    ref = np.loadtxt(path.parent / f"ref_{path.stem[4:]}.f0")[:, 0]
+    y = load(path)
+    times = np.arange(int(len(y) / SR * 100)) / 100.0
+    return path.stem, ref, pitch_tracks(y, times)
+
+
+def validate_pitch(root: Path, workers: int) -> None:
+    """Every method against PTDB-TUG's reference pitch, by sex: gross errors, voicing errors,
+    fine error in cents, and octave errors."""
+    # 1. Every recording, every method.
+    files = sorted(root.glob("mic_*.wav"))
+    with ProcessPoolExecutor(workers) as pool:
+        results = list(pool.map(_pitch_job, files))
+
+    # 2. The reference's first frame sits half a 32 ms window in; find the lag (in 10 ms
+    # frames, up to 40 ms either way) that lines the current tracker up best and use it for all.
+    def gpe_at(lag):
+        """The current tracker's mean gross error rate with the reference shifted `lag` frames."""
+        errs = []
+        for _, ref, tracks in results:
+            est = tracks["ac 60-600 (current)"]
+            r = ref[max(0, -lag) :][: len(est)]
+            e = est[max(0, lag) :][: len(r)]
+            r = r[: len(e)]
+            both = (r > 0) & (e > 0)
+            errs.append(np.mean(np.abs(e[both] / r[both] - 1) > 0.2))
+        return float(np.mean(errs))
+
+    lag = min(range(-4, 5), key=gpe_at)
+    print(f"{len(results)} utterances, reference lag {lag * 10:+d} ms\n")
+
+    # 3. The tallies, per method and group. More than 20% off is a gross error; under 0.6 or
+    # over 1.6 times the reference, an octave error down or up.
+    rows = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for stem, ref, tracks in results:
+        sex = "female" if stem.split("_")[1].startswith("F") else "male"
+        for name, est in tracks.items():
+            r = ref[max(0, -lag) :]
+            e = est[max(0, lag) :]
+            n = min(len(r), len(e))
+            r, e = r[:n], e[:n]
+            rv, ev = r > 0, e > 0
+            both = rv & ev
+            ratio = e[both] / r[both]
+            gross = np.abs(ratio - 1) > 0.2
+            for group in (sex, "all"):
+                d = rows[name][group]
+                d["frames"].append(n)
+                d["gross"].append(gross.sum())
+                d["both"].append(both.sum())
+                d["vde"].append(np.sum(rv != ev))
+                d["cents"].extend(np.abs(1200 * np.log2(ratio[~gross])))
+                d["octave_down"].append(np.sum(ratio < 0.6))
+                d["octave_up"].append(np.sum(ratio > 1.6))
+
+    # 4. The table.
+    print(
+        f"{'method':58s} {'group':7s} {'GPE':>6s} {'VDE':>6s} {'fine err':>9s} {'oct down/up':>12s}"
+    )
+    for name, groups in rows.items():
+        for group in ("female", "male", "all"):
+            d = groups[group]
+            gpe = sum(d["gross"]) / sum(d["both"])
+            vde = sum(d["vde"]) / sum(d["frames"])
+            fine = np.median(d["cents"])
+            od = sum(d["octave_down"]) / sum(d["both"])
+            ou = sum(d["octave_up"]) / sum(d["both"])
+            print(f"{name:58s} {group:7s} {gpe:6.2%} {vde:6.2%} {fine:6.1f} c  {od:5.2%}/{ou:5.2%}")
+        print()
+    print("GPE: share of frames voiced in both with more than 20% error. VDE: share of")
+    print("frames whose voiced/unvoiced decision differs. Fine error: median cents on the rest.")
+
+
+# --- FORMANTS ---
+
+FIXED_CEILINGS = (5000, 5500)  # Hz: the usual fixed ceilings, for men and for women
+CANDIDATES = np.arange(4500, 7501, 250)  # Hz: the ceilings tried per recording
+
+
+def _formant_values(y: np.ndarray, ceiling: float, times: list[float]) -> np.ndarray:
+    """F1-F3 (one row each) at `times`, tracked by Praat's Burg method at 5 ms steps, five
+    formants up to `ceiling` Hz."""
+    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
+    formant = snd.to_formant_burg(
+        time_step=0.005,
+        max_number_of_formants=5,
+        maximum_formant=ceiling,
+    )
+    return np.array([[formant.get_value_at_time(k, t) for t in times] for k in (1, 2, 3)])
+
+
+def roughness(tracks: np.ndarray) -> float:
+    """How far F1-F3 stray from a smooth (cubic) path, in semitones. Used to
+    pick a ceiling per recording, after FastTrack (Barreda 2021): the wrong
+    ceiling makes tracks jump between resonances."""
+    total = 0.0
+    x = np.linspace(-1, 1, tracks.shape[1])
+    for f in tracks:
+        if not np.all(np.isfinite(f)):
+            return np.inf
+        st = 12 * np.log2(f)
+        fit = np.polyval(np.polyfit(x, st, 3), x)
+        total += float(np.mean(np.abs(st - fit)))
+    return total
+
+
+def _formant_job(item):
+    """One Hillenbrand vowel: F1-F3 at 20%, 50% and 80% of it by each method, and the ceiling
+    the smoothest-track method chose."""
+    name, start, end, path = item
+    y = load(path)
+    probe = list(start + (end - start) * np.array([0.2, 0.5, 0.8]))
+    dense = list(np.linspace(start, end, 21)[2:-2])  # inner 80% of the vowel
+    out = {f"fixed {c}": _formant_values(y, c, probe) for c in FIXED_CEILINGS}
+    # By the first letter of the name: men, women, boys, girls.
+    group_ceiling = {"m": 5000, "w": 5500, "b": 6000, "g": 6000}[name[0]]
+    out["by voice type (oracle)"] = _formant_values(y, group_ceiling, probe)
+    scores = [(roughness(_formant_values(y, c, dense)), c) for c in CANDIDATES]
+    best = min(scores)[1]
+    out["smoothest ceiling per recording"] = _formant_values(y, best, probe)
+    return name, out, best
+
+
+def _h95_truth(root: Path):
+    """Hillenbrand's hand-checked formants and vowel times: {word: F1-F3 (rows) at 20%, 50%
+    and 80% of the vowel (columns)} and {word: (vowel start, vowel end) in seconds}."""
+    truth = {}
+    for line in (root / "vowdata.dat").read_text("latin-1").splitlines():
+        parts = line.split()
+        if len(parts) == 16 and parts[0][:1] in "mwbg" and parts[0][1:3].isdigit():
+            v = [float(x) for x in parts[1:]]
+            truth[parts[0]] = np.array(
+                [[v[6], v[9], v[12]], [v[7], v[10], v[13]], [v[8], v[11], v[14]]]
+            )
+    times = {}
+    for line in (root / "timedata.dat").read_text("latin-1").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] in truth:
+            times[parts[0]] = (float(parts[1]) / 1000, float(parts[2]) / 1000)
+    return truth, times
+
+
+def validate_formants(root: Path, workers: int) -> None:
+    """Every ceiling method against Hillenbrand's formants, by voice type: median error and
+    the share more than 15% off, per formant, and the ceilings the smoothest method chose."""
+    # 1. Every vowel with its audio, every method.
+    truth, times = _h95_truth(root)
+    items = [
+        (n, *times[n], root / "audio" / f"{n}.wav")
+        for n in sorted(truth)
+        if n in times and (root / "audio" / f"{n}.wav").exists()
+    ]
+    with ProcessPoolExecutor(workers) as pool:
+        results = list(pool.map(_formant_job, items, chunksize=8))
+
+    # 2. The relative errors, where the reference has a value.
+    group_name = {"m": "men", "w": "women", "b": "children", "g": "children"}
+    err = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    chosen = defaultdict(list)
+    for name, out, best in results:
+        chosen[group_name[name[0]]].append(best)
+        ref = truth[name]
+        for method, est in out.items():
+            for k in range(3):
+                ok = (ref[k] > 0) & np.isfinite(est[k])
+                rel = np.abs(est[k][ok] / ref[k][ok] - 1)
+                for g in (group_name[name[0]], "all"):
+                    err[method][g][k].extend(rel)
+                missing = np.sum((ref[k] > 0) & ~np.isfinite(est[k]))
+                for g in (group_name[name[0]], "all"):
+                    err[method][g][f"missing{k}"].append(missing)
+
+    # 3. The table.
+    print(
+        f"{len(results)} vowels. Median |error| and share off by more than 15% (gross), "
+        "per formant.\n"
+    )
+    print(
+        f"{'method':34s} {'group':9s}"
+        + "".join(f"{'F' + str(k + 1) + ' med/gross':>17s}" for k in range(3))
+    )
+    for method, groups in err.items():
+        for g in ("men", "women", "children", "all"):
+            cells = []
+            for k in range(3):
+                a = np.array(groups[g][k])
+                cells.append(f"{np.median(a):6.1%} / {np.mean(a > 0.15):5.1%}")
+            print(f"{method:34s} {g:9s}" + "".join(f"{c:>17s}" for c in cells))
+        print()
+    for g, c in chosen.items():
+        print(
+            f"smoothest ceiling chosen for {g:9s}: median {np.median(c):.0f} Hz, "
+            f"IQR {np.percentile(c, 25):.0f}-{np.percentile(c, 75):.0f}"
+        )
+
+
+# --- FORMANTS ON WHOLE LINES ---
+# One ceiling per recording, chosen without vowel labels.
+
+LINE_CEILINGS = np.arange(4500, 7001, 250)  # Hz: the ceilings tried per joined recording
+
+
+def _runs(voiced: np.ndarray) -> list[np.ndarray]:
+    """Index arrays of consecutive voiced frames, 5 frames or longer."""
+    idx = np.flatnonzero(voiced)
+    if idx.size == 0:
+        return []
+    return [r for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1) if r.size >= 5]
+
+
+def _line_tracks(snd: parselmouth.Sound, times: np.ndarray, ceiling: float) -> np.ndarray:
+    """F1-F3 (one row each) at `times`, tracked at 10 ms steps, five formants up to `ceiling`."""
+    formant = snd.to_formant_burg(time_step=0.01, max_number_of_formants=5, maximum_formant=ceiling)
+    return np.array([[formant.get_value_at_time(k, float(t)) for t in times] for k in (1, 2, 3)])
+
+
+def _rough_jumps(st: np.ndarray, runs) -> float:
+    """The mean frame-to-frame jump of the tracks (semitones) within the voiced runs."""
+    d = [np.abs(np.diff(st[:, r], axis=1)) for r in runs]
+    return float(np.nanmean(np.concatenate(d, axis=1))) if d else np.inf
+
+
+def _rough_median(st: np.ndarray, runs) -> float:
+    """The mean distance of the tracks (semitones) from their 5-frame running median, within
+    the voiced runs."""
+    from scipy.ndimage import median_filter
+
+    res = []
+    for r in runs:
+        seg = st[:, r]
+        res.append(np.abs(seg - median_filter(seg, size=(1, 5), mode="nearest")))
+    return float(np.nanmean(np.concatenate(res, axis=1))) if res else np.inf
+
+
+def _rough_chunks(st: np.ndarray, runs) -> float:
+    """The mean distance of the tracks (semitones) from a quadratic fitted to each stretch of
+    about 100 ms of the voiced runs; stretches under 5 frames are skipped."""
+    res = []
+    for r in runs:
+        for chunk in np.array_split(r, max(1, len(r) // 10)):
+            if len(chunk) < 5:
+                continue
+            x = np.linspace(-1, 1, len(chunk))
+            seg = st[:, chunk]
+            if not np.all(np.isfinite(seg)):
+                res.append(np.full(3, 3.0))  # an undefined formant mid-vowel counts as a bad fit
+                continue
+            fit = np.array([np.polyval(np.polyfit(x, f, 2), x) for f in seg])
+            res.append(np.abs(seg - fit).mean(axis=1))
+    return float(np.mean(res)) if res else np.inf
+
+
+# How rough a ceiling's tracks are, three ways: each picks the ceiling with the least.
+CRITERIA = {
+    "frame-to-frame jumps": _rough_jumps,
+    "distance from running median": _rough_median,
+    "quadratic fit per 100 ms": _rough_chunks,
+}
+
+
+def _line_job(item):
+    """One Hillenbrand speaker's words joined into one recording: the ceiling each method
+    chooses for it, and F1-F3 at 20%, 50% and 80% of every vowel at that ceiling."""
+    # 1. The words joined with 0.15 s of silence between them, scaled to a 0.9 peak; where
+    # each vowel's probes fall in the joined recording.
+    speaker, parts = item
+    gap = np.zeros(int(0.15 * SR), dtype=np.float32)
+    pieces, probes, offset = [], [], 0.0
+    for name, start, end, path in parts:
+        y = load(path)
+        pieces += [y, gap]
+        probes.append((name, offset + start + (end - start) * np.array([0.2, 0.5, 0.8])))
+        offset += (len(y) + len(gap)) / SR
+    y = np.concatenate(pieces)
+    y = 0.9 * y / np.max(np.abs(y))
+    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
+
+    # 2. The voiced runs, and the tracks at every ceiling in semitones.
+    times = np.arange(int(len(y) / SR * 100)) / 100.0
+    pitch = _on_grid(_track(snd, 60.0, 600.0, "ac"), times)
+    runs = _runs(pitch > 0)
+    st = {c: 12 * np.log2(_line_tracks(snd, times, c)) for c in LINE_CEILINGS}
+
+    # 3. The ceiling by each criterion, and the app's own choice.
+    chosen = {"fixed 5500 (current)": 5500.0}
+    for label, fn in CRITERIA.items():
+        chosen[label] = float(min(LINE_CEILINGS, key=lambda c: fn(st[c], runs)))
+    from echo_voice.analysis import formant_tracks
+
+    f0 = np.where(pitch > 0, pitch, np.nan)
+    chosen["echo_voice.analysis (production)"] = formant_tracks(snd, times, f0)[1]
+
+    # 4. F1-F3 at the probes, at each chosen ceiling.
+    out = {}
+    for label, ceiling in chosen.items():
+        formant = snd.to_formant_burg(
+            time_step=0.005,
+            max_number_of_formants=5,
+            maximum_formant=ceiling,
+        )
+        out[label] = {
+            name: np.array(
+                [[formant.get_value_at_time(k, float(t)) for t in ts] for k in (1, 2, 3)]
+            )
+            for name, ts in probes
+        }
+    return speaker, out, chosen
+
+
+def validate_formant_lines(root: Path, workers: int) -> None:
+    """Every way of choosing one ceiling per recording against Hillenbrand's formants, by
+    voice type: median error and the share more than 15% off, and the median ceiling chosen."""
+    # 1. Each speaker's words, joined and measured.
+    truth, times = _h95_truth(root)
+    by_speaker = defaultdict(list)
+    for n in sorted(truth):
+        path = root / "audio" / f"{n}.wav"
+        if n in times and path.exists():
+            by_speaker[n[:3]].append((n, *times[n], path))
+    with ProcessPoolExecutor(workers) as pool:
+        results = list(pool.map(_line_job, by_speaker.items()))
+
+    # 2. The relative errors, and the ceilings chosen.
+    group_name = {"m": "men", "w": "women", "b": "children", "g": "children"}
+    err = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    picks = defaultdict(lambda: defaultdict(list))
+    for speaker, out, chosen in results:
+        g = group_name[speaker[0]]
+        for label, c in chosen.items():
+            picks[label][g].append(c)
+        for label, est in out.items():
+            for name, values in est.items():
+                ref = truth[name]
+                for k in range(3):
+                    ok = ref[k] > 0
+                    rel = np.abs(values[k][ok] / ref[k][ok] - 1)
+                    rel[~np.isfinite(rel)] = 1.0  # no value where the vowel has one: count as gross
+                    for gg in (g, "all"):
+                        err[label][gg][k].extend(rel)
+
+    # 3. The table.
+    print(f"{len(results)} speakers, each speaker's 12 words joined into one recording;")
+    print("one ceiling chosen per recording from its voiced frames, no vowel labels.\n")
+    print(
+        f"{'method':32s} {'group':9s}"
+        + "".join(f"{'F' + str(k + 1) + ' med/gross':>17s}" for k in range(3))
+        + "   ceiling chosen (median)"
+    )
+    for label, groups in err.items():
+        for g in ("men", "women", "children", "all"):
+            cells = []
+            for k in range(3):
+                a = np.array(groups[g][k])
+                cells.append(f"{np.median(a):6.1%} / {np.mean(a > 0.15):5.1%}")
+            if g == "all":
+                pick = np.median([p for group in picks[label].values() for p in group])
+            else:
+                pick = np.median(picks[label][g])
+            print(f"{label:32s} {g:9s}" + "".join(f"{c:>17s}" for c in cells) + f"   {pick:.0f} Hz")
+        print()
+
+
+# --- HUMAN SIMILARITY JUDGMENTS (VCC2018) ---
+
+
+def _vcc_path(root: Path, name: str) -> Path:
+    """Where a rated VCC2018 file is: system S00 is the natural source speaker, T00 the natural
+    target speaker, and any other system's file is its converted speech."""
+    system, target, source, sentence, _ = name[:-4].split("_")
+    if system == "S00":
+        return root / "vcc2018_evaluation" / source / f"{sentence}.wav"
+    if system == "T00":
+        return root / "vcc2018_reference" / target / f"{sentence}.wav"
+    return root / "converted" / name
+
+
+def vcc_pairs(root: Path) -> list[dict]:
+    """Unique rated pairs with the mean listener score. The natural recording is
+    the target; the other side is the take."""
+    import csv
+
+    ratings = defaultdict(list)
+    path = root / "vcc2018_listening_test_scores" / "vcc2018_evaluation_sim_simple.txt"
+    with open(path, encoding="utf-8") as f:
+        for a, b, _, score in list(csv.reader(f))[1:]:
+            if b.split("_")[0] in ("S00", "T00") and a.split("_")[0] not in ("S00", "T00"):
+                a, b = b, a  # natural first
+            ratings[(a, b)].append(int(score))
+    pairs = []
+    for (a, b), scores in ratings.items():
+        pa, pb = _vcc_path(root, a), _vcc_path(root, b)
+        if pa == pb or not pa.exists() or not pb.exists():
+            continue
+        system = b.split("_")[0]
+        kind = {"S00": "natural", "T00": "natural"}.get(system, "converted")
+        against = "source" if a.startswith("S00") else "target"
+        pairs.append(
+            {
+                "target": str(pa),
+                "take": str(pb),
+                "rating": float(np.mean(scores)),
+                "n": len(scores),
+                "system": system,
+                "kind": kind,
+                "against": against,
+                "task": b[:-4].split("_")[-1],
+            }
+        )
+    return pairs
+
+
+def _vcc_job(group):
+    """Every take rated against one natural recording, scored by the app: the pairs that could
+    be analysed, with the overall, identity and component scores added."""
+    from echo_voice.analysis import AnalysisError, analyze
+    from echo_voice.scoring import compare
+
+    target_path, pairs = group
+    try:
+        target = analyze(load(target_path))
+    except AnalysisError:
+        return []
+    rows = []
+    for p in pairs:
+        try:
+            r = compare(target, analyze(load(p["take"])))
+        except AnalysisError:
+            continue
+        p = dict(p, overall=r["overall"], identity=r["identity"])
+        p.update({f"score_{c['key']}": c["score"] for c in r["components"]})
+        rows.append(p)
+    return rows
+
+
+def score_vcc(root: Path, out: Path, workers: int) -> None:
+    """Score every rated pair, write one JSON line per pair to `out`, and report on them."""
+    import json
+
+    groups = defaultdict(list)
+    for p in vcc_pairs(root):
+        groups[p["target"]].append(p)
+    print(
+        f"scoring {sum(len(g) for g in groups.values())} pairs "
+        f"against {len(groups)} natural recordings...",
+        file=sys.stderr,
+    )
+    done = 0
+    with ProcessPoolExecutor(workers) as pool, open(out, "w", encoding="utf-8") as f:
+        for rows in pool.map(_vcc_job, groups.items()):
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+            done += 1
+            if done % 50 == 0:
+                print(f"  {done}/{len(groups)}", file=sys.stderr)
+    report_vcc(out)
+
+
+def report_vcc(path: Path, extra: dict[str, dict] | None = None) -> None:
+    """Correlations with listeners, per pair and per system. `extra` maps a
+    label to {(target, take): value} for alternative measures."""
+    import json
+
+    from scipy.stats import pearsonr, spearmanr
+
+    rows = [json.loads(line) for line in Path(path).read_text("utf-8").splitlines()]
+    measures = ["overall", "identity"] + sorted(k for k in rows[0] if k.startswith("score_"))
+    values = {m: [r[m] for r in rows] for m in measures}
+    for label, table in (extra or {}).items():
+        measures.append(label)
+        values[label] = [table.get((r["target"], r["take"])) for r in rows]
+
+    def corr(idx, m):
+        """Spearman and Pearson between measure `m` and the ratings over the rows `idx`; NaN
+        with fewer than 5 values."""
+        x = np.array([values[m][i] for i in idx], dtype=float)
+        y = np.array([rows[i]["rating"] for i in idx])
+        ok = np.isfinite(x)
+        if ok.sum() < 5:
+            return float("nan"), float("nan")
+        return spearmanr(x[ok], y[ok])[0], pearsonr(x[ok], y[ok])[0]
+
+    def system_corr(idx, m):
+        """Spearman and Pearson between measure `m` and the ratings over groups of the rows
+        `idx` (system, compared-with, task), each group's ratings weighted by how many there
+        were; and the number of groups."""
+        groups = defaultdict(list)
+        for i in idx:
+            r = rows[i]
+            groups[(r["system"], r["against"], r["task"])].append(i)
+        xs, ys = [], []
+        for g in groups.values():
+            x = np.array([values[m][i] for i in g], dtype=float)
+            if np.isfinite(x).sum() == 0:
+                continue
+            w = np.array([rows[i]["n"] for i in g], dtype=float)
+            xs.append(np.nanmean(x))
+            ys.append(np.average([rows[i]["rating"] for i in g], weights=w))
+        return spearmanr(xs, ys)[0], pearsonr(xs, ys)[0], len(xs)
+
+    conv = [i for i, r in enumerate(rows) if r["kind"] == "converted"]
+    conv_t = [i for i in conv if rows[i]["against"] == "target"]
+    print(f"{len(rows)} pairs ({len(conv)} converted, {len(rows) - len(conv)} natural).")
+    print(
+        "Spearman / Pearson with the mean listener rating "
+        "(1 = different, sure ... 4 = same, sure).\n"
+    )
+    head = (
+        f"{'measure':26s}{'all pairs':>15s}{'converted':>15s}"
+        f"{'conv vs target':>16s}{'per system':>16s}"
+    )
+    print(head)
+    for m in measures:
+        cells = [corr(range(len(rows)), m), corr(conv, m), corr(conv_t, m)]
+        sr, pr, _ = system_corr(conv, m)
+        print(
+            f"{m:26s}" + "".join(f"{a:7.3f}/{b:6.3f} " for a, b in cells) + f"  {sr:6.3f}/{pr:6.3f}"
+        )
+    print(
+        f"\nper system: {system_corr(conv, 'overall')[2]} groups (system x compared-with x task), "
+        "means weighted by number of ratings"
+    )
+
+
+# --- OTHER SPEAKER MODELS, AND LOW-DIMENSIONAL PROJECTIONS ---
+
+# The speaker models compared: name -> (ONNX file in the model cache, whose front end it needs).
+SPEAKER_MODELS = {
+    "resnet34-LM (current)": ("wespeaker_en_voxceleb_resnet34_LM.onnx", "wespeaker"),
+    "resnet293-LM": ("wespeaker_en_voxceleb_resnet293_LM.onnx", "wespeaker"),
+    "wespeaker CAM++-LM": ("wespeaker_en_voxceleb_CAM++_LM.onnx", "wespeaker"),
+    "3d-speaker ERes2Net": ("3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx", "3dspeaker"),
+    "3d-speaker CAM++": ("3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx", "3dspeaker"),
+}
+_sessions: dict = {}  # each model's ONNX session, loaded once per process
+
+
+def embed_with(model: str, y: np.ndarray) -> np.ndarray:
+    """Embedding with each framework's own front end: WeSpeaker uses int16-scale
+    samples and a Hamming window, 3D-Speaker [-1, 1] samples and Kaldi's default
+    window; both subtract the utterance mean from 80-bin filterbanks."""
+    import kaldi_native_fbank as knf
+    import onnxruntime
+
+    from echo_voice.models import cache_dir
+
+    filename, framework = SPEAKER_MODELS[model]
+    if model not in _sessions:
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = 1
+        _sessions[model] = onnxruntime.InferenceSession(
+            str(cache_dir() / "models" / filename),
+            opts,
+            providers=["CPUExecutionProvider"],
+        )
+    sess = _sessions[model]
+    o = knf.FbankOptions()
+    o.frame_opts.samp_freq = SR
+    o.frame_opts.dither = 0.0
+    o.mel_opts.num_bins = 80
+    if framework == "wespeaker":
+        o.frame_opts.window_type = "hamming"
+    samples = y.astype(np.float64) * 32768 + np.random.default_rng(0).standard_normal(len(y))
+    if framework == "3dspeaker":
+        samples /= 32768
+    fb = knf.OnlineFbank(o)
+    fb.accept_waveform(SR, samples.astype(np.float32).tolist())
+    fb.input_finished()
+    feats = np.array([fb.get_frame(i) for i in range(fb.num_frames_ready)], dtype=np.float32)
+    feats -= feats.mean(axis=0)
+    e = sess.run(None, {sess.get_inputs()[0].name: feats[None]})[0][0].astype(np.float64)
+    return e / np.linalg.norm(e)
+
+
+def _embed_job(path: str):
+    """One file's embedding by every model: (path, {model: embedding}), or (path, None) if it
+    can't be prepared."""
+    from echo_voice.analysis import AnalysisError, _prepare
+
+    try:
+        y = _prepare(load(path))
+    except AnalysisError:
+        return path, None
+    return path, {m: embed_with(m, y).astype(np.float32) for m in SPEAKER_MODELS}
+
+
+def _embed_files(paths: list[str], cache: Path, workers: int) -> dict[str, dict[str, np.ndarray]]:
+    """Every file's embeddings by every model, from `cache` where it has them; the cache is
+    saved back every 2000 files embedded."""
+    import pickle
+
+    done = pickle.loads(cache.read_bytes()) if cache.exists() else {}
+    todo = [p for p in paths if p not in done]
+    if todo:
+        print(f"embedding {len(todo)} files with {len(SPEAKER_MODELS)} models...", file=sys.stderr)
+        with ProcessPoolExecutor(workers) as pool:
+            for i, (path, e) in enumerate(pool.map(_embed_job, todo, chunksize=16), 1):
+                done[path] = e
+                if i % 2000 == 0:
+                    print(f"  {i}/{len(todo)}", file=sys.stderr)
+                    cache.write_bytes(pickle.dumps(done))
+        cache.write_bytes(pickle.dumps(done))
+    return done
+
+
+def vcc_models(root: Path, scored: Path, workers: int) -> None:
+    """The VCC2018 report again, with each speaker model's cosine added: as it is, with the
+    cohort's mean taken out, and on the cohort's top 3, 10 and 30 principal components."""
+    import json
+
+    # 1. Every file's embeddings, and the cohort's.
+    rows = [json.loads(line) for line in Path(scored).read_text("utf-8").splitlines()]
+    files = sorted({r["target"] for r in rows} | {r["take"] for r in rows})
+    from calibrate import cohort_files
+
+    emb = _embed_files(files, root / "embeddings.pkl", workers)
+    cohort = cohort_files(Path(__file__).parents[1] / "cache")
+    cohort_paths = sorted({f for fs in cohort.values() for f in fs})
+    cemb = _embed_files(cohort_paths, root / "cohort_embeddings.pkl", workers)
+
+    # 2. Each model's cosine, three ways.
+    extra = {}
+    for model in SPEAKER_MODELS:
+
+        def cos(a, b, f=lambda v: v, model=model):
+            """The cosine between two files' embeddings by `model`, each passed through `f`
+            first; None if either has none."""
+            ea, eb = emb.get(a), emb.get(b)
+            if ea is None or eb is None:
+                return None
+            x, y = f(ea[model]), f(eb[model])
+            return float(x @ y / np.linalg.norm(x) / np.linalg.norm(y))
+
+        extra[f"cos {model}"] = {
+            (r["target"], r["take"]): cos(r["target"], r["take"]) for r in rows
+        }
+        # Each cohort speaker's mean embedding, their mean, and their principal components.
+        cents = np.array(
+            [
+                np.mean([cemb[f][model] for f in fs if cemb.get(f) is not None], axis=0)
+                for fs in cohort.values()
+            ]
+        )
+        mu = cents.mean(axis=0)
+        _, _, vt = np.linalg.svd(cents - mu, full_matrices=False)
+        extra[f"  mean-subtracted {model}"] = {
+            (r["target"], r["take"]): cos(r["target"], r["take"], lambda v, mu=mu: v - mu)
+            for r in rows
+        }
+        for k in (3, 10, 30):
+
+            def project(v, b=vt[:k], mu=mu):
+                """An embedding less the cohort mean, on the cohort's top k principal components."""
+                return b @ (v - mu)
+
+            extra[f"  top-{k} PCs {model}"] = {
+                (r["target"], r["take"]): cos(r["target"], r["take"], project) for r in rows
+            }
+    print(f"cohort: {len(cohort)} speakers\n")
+    report_vcc(scored, extra)
+
+
+# --- VOXSIM (HUMAN RATINGS OF IN-THE-WILD PAIRS) ---
+
+# The VoxCeleb1 zips on the Hugging Face mirror, by split.
+VOX_ZIPS = {
+    "dev": "datasets/ProgramComputer/voxceleb/vox1/vox1_dev_wav.zip",
+    "test": "datasets/ProgramComputer/voxceleb/vox1/vox1_test_wav.zip",
+}
+
+
+def voxsim_pairs(root: Path, split: str) -> list[dict]:
+    """VoxSim's rated pairs, from its test list or (any other `split`) its averaged training
+    list: the two clips, whether they are one speaker, and the 1-6 rating."""
+    import csv
+
+    name = "voxsim_test_list.txt" if split == "test" else "voxsim_train_list_average.txt"
+    with open(root / name, encoding="utf-8") as f:
+        return [
+            {"a": r[0], "b": r[1], "same": r[2] == "1", "rating": float(r[4])}
+            for r in csv.reader(f)
+        ]
+
+
+def _member_from(buf: bytes, base: int, info) -> bytes | None:
+    """One zip member out of a downloaded byte range starting at `base`,
+    checked against its CRC; None if it doesn't check out."""
+    import struct
+    import zlib
+
+    at = info.header_offset - base
+    if buf[at : at + 4] != b"PK\x03\x04":
+        return None
+    name_len, extra_len = struct.unpack("<HH", buf[at + 26 : at + 30])
+    start = at + 30 + name_len + extra_len
+    data = buf[start : start + info.compress_size]
+    if len(data) != info.compress_size:
+        return None
+    if info.compress_type == 8:  # deflate, stored raw (no zlib header)
+        data = zlib.decompress(data, -15)
+    elif info.compress_type != 0:  # anything but stored
+        return None
+    return data if zlib.crc32(data) & 0xFFFFFFFF == info.CRC else None
+
+
+def _member_end(info) -> int:
+    """How far into the zip a member can reach: its 30-byte local header and name, up to 1024
+    bytes of "extra" field, and its data. Local headers can carry more "extra" bytes than the
+    central directory says."""
+    return info.header_offset + 30 + len(info.filename.encode()) + 1024 + info.compress_size
+
+
+def _fetch_run(fs, zpath: str, run, out: Path) -> int:
+    """Download a run of neighbouring members in one ranged request. Each file
+    is written to a temporary name and renamed, so an interrupted fetch never
+    leaves a partial file behind. Returns how many failed."""
+    first, last = run[0][1], run[-1][1]
+    end = _member_end(last)
+    buf = fs.cat_file(zpath, start=first.header_offset, end=end)
+    failed = 0
+    for clip, info in run:
+        data = _member_from(buf, first.header_offset, info)
+        if data is None:
+            failed += 1
+            continue
+        path = out / clip
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    return failed
+
+
+def voxsim_fetch(root: Path, out: Path, train_pairs: int, workers: int) -> None:
+    """Download the VoxCeleb1 clips the VoxSim test pairs (and `train_pairs` random training
+    pairs) need into `out`, fetching neighbouring zip members together."""
+    import random
+    import zipfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    from huggingface_hub import HfFileSystem
+
+    # 1. The clips needed.
+    pairs = voxsim_pairs(root, "test")
+    if train_pairs:
+        pairs += random.Random(0).sample(voxsim_pairs(root, "train"), train_pairs)
+    need = {c for p in pairs for c in (p["a"], p["b"])}
+    fs = HfFileSystem()
+    bad_sizes = []
+    for split, zpath in VOX_ZIPS.items():
+        # 2. The zip's index (read in 16 MiB blocks), and what is still to fetch.
+        with fs.open(zpath, "rb", block_size=16 * 2**20) as f:
+            index = {i.filename.split("wav/", 1)[-1]: i for i in zipfile.ZipFile(f).infolist()}
+        todo = []
+        for c in sorted(need):
+            info = index.get(c)
+            if info is None:
+                continue
+            path = out / c
+            if path.exists() and path.stat().st_size != info.file_size:
+                bad_sizes.append(c)  # left over from an interrupted run
+                path.unlink()
+            if not path.exists():
+                todo.append((c, info))
+        todo.sort(key=lambda t: t[1].header_offset)
+
+        # 3. Members that sit next to each other in the zip come down together: a run takes
+        # the next member while it starts within 2 MiB of the last one and no later than that
+        # one can end, and the run holds less than 16 MiB of data so far.
+        runs, size = [], 0
+        for c, info in todo:
+            last = runs[-1][-1][1] if runs else None
+            gap_free = (
+                last is not None
+                and info.header_offset - last.header_offset < 2 * 2**20
+                and info.header_offset <= _member_end(last)
+            )
+            if gap_free and size < 16 * 2**20:
+                runs[-1].append((c, info))
+                size += info.compress_size
+            else:
+                runs.append([(c, info)])
+                size = info.compress_size
+        print(f"{split}: {len(todo)} clips to fetch in {len(runs)} requests", file=sys.stderr)
+
+        # 4. The runs, `workers` at a time.
+        failed = 0
+        with ThreadPoolExecutor(workers) as pool:
+            results = pool.map(lambda r, zpath=zpath: _fetch_run(fs, zpath, r, out), runs)
+            for i, n in enumerate(results, 1):
+                failed += n
+                if i % 1000 == 0:
+                    print(f"  {i}/{len(runs)}", file=sys.stderr)
+        print(
+            f"{split}: {len(todo) - failed} written, {failed} failed their check",
+            file=sys.stderr,
+        )
+    if bad_sizes:
+        (out / "refetched.txt").write_text("\n".join(bad_sizes), "utf-8")
+        print(
+            f"{len(bad_sizes)} partial files from an earlier run were fetched again "
+            "(listed in refetched.txt)",
+            file=sys.stderr,
+        )
+    missing = [c for c in need if not (out / c).exists()]
+    print(f"done; {len(missing)} clips still missing", file=sys.stderr)
+
+
+def _voxsim_features(path: str):
+    """Word-independent features of one clip: speaker embeddings, median pitch
+    and median formants (as the app measures them)."""
+    from echo_voice import identity
+    from echo_voice.analysis import MAX_SECONDS, AnalysisError, _prepare, analyze
+
+    y = load(path)[: int((MAX_SECONDS - 1) * SR)]
+    try:
+        v = analyze(y)
+    except AnalysisError:
+        return path, None
+    yp = _prepare(y)
+    if v.voiced.sum() >= 20:
+        formants = np.nanmedian(v.formants[:, v.voiced], axis=1)
+    else:
+        formants = np.full(3, np.nan)
+    return path, {
+        "emb": v.embedding,
+        "raw": identity.raw_embed(yp),
+        "cam": embed_with("wespeaker CAM++-LM", yp),
+        "eres": embed_with("3d-speaker ERes2Net", yp),
+        "f0": v.median_f0,
+        "formants": formants,
+    }
+
+
+def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
+    """Every measure against VoxSim's ratings, on the test split and a sample of 3000 training
+    pairs: Pearson and Spearman over all pairs, different speakers and same speaker."""
+    import pickle
+    import random
+
+    from scipy.stats import pearsonr, spearmanr
+
+    from echo_voice.scoring import CALIBRATION, curve
+
+    # 1. The pairs, and every clip's features (cached in features.pkl, saved back every 2000).
+    sets = {
+        "VoxSim test": voxsim_pairs(root, "test"),
+        "VoxSim train sample": random.Random(0).sample(voxsim_pairs(root, "train"), 3000),
+    }
+    clips = sorted(
+        {c for ps in sets.values() for p in ps for c in (p["a"], p["b"]) if (audio / c).exists()}
+    )
+    cache = audio / "features.pkl"
+    feats = pickle.loads(cache.read_bytes()) if cache.exists() else {}
+    todo = [str(audio / c) for c in clips if str(audio / c) not in feats]
+    if todo:
+        print(f"analysing {len(todo)} clips...", file=sys.stderr)
+        with ProcessPoolExecutor(workers) as pool:
+            for i, (path, f) in enumerate(pool.map(_voxsim_features, todo, chunksize=8), 1):
+                feats[path] = f
+                if i % 2000 == 0:
+                    print(f"  {i}/{len(todo)}", file=sys.stderr)
+                    cache.write_bytes(pickle.dumps(feats))
+        cache.write_bytes(pickle.dumps(feats))
+
+    # 2. The measures of one pair.
+    def cosine(a, b):
+        """The cosine between two vectors."""
+        return float(a @ b / np.linalg.norm(a) / np.linalg.norm(b))
+
+    curves = CALIBRATION["curves"]
+    w = CALIBRATION["weights"]
+
+    from types import SimpleNamespace
+
+    from echo_voice import similarity
+
+    def measures(fa, fb):
+        """Every measure of how alike two clips' features are, higher meaning more alike."""
+
+        def ns(f):
+            """A clip's features in the shape similarity.features takes."""
+            return SimpleNamespace(
+                embedding=f["emb"],
+                median_f0=f["f0"],
+                median_formants=f["formants"],
+            )
+
+        listener = similarity.predict(similarity.features(ns(fa), ns(fb)))
+        embedding = cosine(fa["emb"], fb["emb"])
+        average = (embedding + cosine(fa["cam"], fb["cam"]) + cosine(fa["eres"], fb["eres"])) / 3
+        out = {
+            "Voice: listener model (current)": listener,
+            "  embedding similarity alone": embedding,
+            "  ...without mean subtraction": cosine(fa["raw"], fb["raw"]),
+            "  ...average of 3 models": average,
+        }
+        pitch = None
+        if fa["f0"] and fb["f0"]:
+            pitch = abs(12 * np.log2(fa["f0"] / fb["f0"]))
+            out["Pitch (median, semitones apart)"] = -pitch
+        res = None
+        if np.all(np.isfinite(fa["formants"])) and np.all(np.isfinite(fb["formants"])):
+            res = float(np.mean(np.abs(12 * np.log2(fa["formants"] / fb["formants"]))))
+            out["Resonance (median formants apart)"] = -res
+        parts = {"identity": curve(6 - listener, **curves["identity"])}
+        if pitch is not None:
+            parts["pitch"] = curve(pitch, **curves["pitch"])
+        if res is not None:
+            parts["resonance"] = curve(res, **curves["resonance"])
+        total = sum(w[k] * v for k, v in parts.items())
+        out["Voice + Pitch + Resonance (app weights)"] = total / sum(w[k] for k in parts)
+        return out
+
+    # 3. The table for each set of pairs.
+    for label, pairs in sets.items():
+        rows = []
+        for p in pairs:
+            fa, fb = feats.get(str(audio / p["a"])), feats.get(str(audio / p["b"]))
+            if fa and fb:
+                rows.append((p, measures(fa, fb)))
+        print(
+            f"\n{label}: {len(rows)} pairs ({sum(p['same'] for p, _ in rows)} same speaker), "
+            "human ratings 1-6. Pearson / Spearman."
+        )
+        print(f"{'measure':42s}{'all pairs':>17s}{'different speakers':>20s}{'same speaker':>17s}")
+        names = list(dict.fromkeys(k for _, m in rows for k in m))
+        for name in names:
+            cells = []
+            for sel in (lambda p: True, lambda p: not p["same"], lambda p: p["same"]):
+                xs = [(m[name], p["rating"]) for p, m in rows if sel(p) and name in m]
+                x, y = np.array(xs).T
+                cells.append(f"{pearsonr(x, y)[0]:6.3f} / {spearmanr(x, y)[0]:6.3f}")
+            print(f"{name:42s}" + "".join(f"{c:>18s}" for c in cells))
+
+
+# --- THE WORD CHECK (LINE.PY) ---
+
+
+def _transcribe_job(item):
+    """A RAVDESS file's words as the recogniser hears them: clean, through a simulated
+    microphone, and for a file chosen to be cut, the first and the last 60% of the microphone
+    version. (path, {version: words}), or (path, None) if it can't be analysed."""
+    import zlib
+
+    from calibrate import channel
+
+    from echo_voice.analysis import AnalysisError, _prepare
+    from echo_voice.line import transcribe
+
+    path, cut = item
+    y = load(path)
+    out = {}
+    try:
+        out["clean"] = transcribe(_prepare(y))
+        mic = channel(y, zlib.crc32(Path(path).stem.encode()))
+        out["mic"] = transcribe(_prepare(mic))
+        if cut:
+            prepared = _prepare(mic)
+            out["first60"] = transcribe(prepared[: int(len(prepared) * 0.6)])
+            out["last60"] = transcribe(prepared[int(len(prepared) * 0.4) :])
+    except AnalysisError:
+        return path, None
+    return path, out
+
+
+def validate_line(ravdess: Path, workers: int) -> None:
+    """The word check on RAVDESS: how well the recogniser hears the sentences, and how often
+    the check flags the same sentence, the other sentence, and takes cut to 60%."""
+    import json
+    import random
+
+    from echo_voice.line import compare_words
+
+    # 1. Every file's words, cached in ravdess_transcripts.json (saved back every 200 files);
+    # 300 files are also heard cut short.
+    files = sorted(str(f) for f in ravdess.glob("Actor_*/03-01-*.wav"))
+    rng = random.Random(0)
+    cut = set(rng.sample(files, 300))
+    cache = ravdess.parent / "ravdess_transcripts.json"
+    words = json.loads(cache.read_text("utf-8")) if cache.exists() else {}
+    todo = [(f, f in cut) for f in files if f not in words]
+    if todo:
+        print(f"transcribing {len(todo)} files...", file=sys.stderr)
+        with ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
+            for i, (path, out) in enumerate(pool.map(_transcribe_job, todo, chunksize=8), 1):
+                words[path] = out
+                if i % 200 == 0:
+                    cache.write_text(json.dumps(words), "utf-8")
+                    print(f"  {i}/{len(todo)}", file=sys.stderr)
+        cache.write_text(json.dumps(words), "utf-8")
+
+    # 2. How well the recogniser hears the sentences at all. RAVDESS's two statements:
+    truth = {"01": "kids are talking by the door", "02": "dogs are sitting by the door"}
+    meta = {f: Path(f).stem.split("-") for f in files if words.get(f)}
+    for kind in ("clean", "mic"):
+        rates = [compare_words(truth[meta[f][4]].split(), words[f][kind]).match_rate for f in meta]
+        print(
+            f"recognised words, {kind:5s}: {np.mean(rates):.1%} of the sentence on average, "
+            f"{np.mean(np.array(rates) == 1):.1%} of files word-perfect"
+        )
+
+    # 3. 3000 random pairs each of the same sentence and the other one, and the cut takes.
+    by_statement = defaultdict(list)
+    for f, m in meta.items():
+        by_statement[m[4]].append(f)
+    same, other = [], []
+    for _ in range(3000):
+        st = rng.choice(["01", "02"])
+        a, b = rng.sample(by_statement[st], 2)
+        same.append(compare_words(words[a]["clean"], words[b]["mic"]))
+        c = rng.choice(by_statement["02" if st == "01" else "01"])
+        other.append(compare_words(words[a]["clean"], words[c]["mic"]))
+    first = [compare_words(words[f]["clean"], words[f]["first60"]) for f in cut if words.get(f)]
+    last = [compare_words(words[f]["clean"], words[f]["last60"]) for f in cut if words.get(f)]
+
+    def flagged(checks):
+        """The share of word checks that flag the take."""
+        return np.mean([c.flagged for c in checks])
+
+    # 4. The report.
+    print(
+        "\nTarget clean, take through the simulated mic; target words come from the recogniser too."
+    )
+    print(
+        f"same sentence, other actor/emotion: flagged {flagged(same):.1%} (false alarms); "
+        f"median match {np.median([c.match_rate for c in same]):.2f}"
+    )
+    print(
+        f"the other sentence:                 flagged {flagged(other):.1%}; "
+        f"median match {np.median([c.match_rate for c in other]):.2f}"
+    )
+    print(f"take cut to its first 60%:          flagged {flagged(first):.1%}")
+    print(f"take cut to its last 60%:           flagged {flagged(last):.1%}")
+    fa = [c for c in same if c.flagged]
+    print("\nexamples of false alarms (line / said):")
+    for c in fa[:6]:
+        print("   ", " ".join(c.target), "/", " ".join(c.take))
+
+
+# --- CLIP CLEANING ---
+
+# The speech denoisers compared: name -> (ONNX file in the model cache, sherpa-onnx model family).
+DENOISERS = {
+    "GTCRN denoiser": ("gtcrn_simple.onnx", "gtcrn"),
+    "DPDFNet denoiser": ("dpdfnet2.onnx", "dpdfnet"),
+}
+_denoisers: dict = {}  # each denoiser, loaded once per process
+
+
+def _denoise(kind: str, y: np.ndarray) -> np.ndarray:
+    """`y` through one of DENOISERS, back at SR and padded or cut to its length."""
+    import sherpa_onnx as so
+
+    from echo_voice.models import cache_dir
+
+    if kind not in _denoisers:
+        filename, family = DENOISERS[kind]
+        model = so.OfflineSpeechDenoiserModelConfig(num_threads=1)
+        getattr(model, family).model = str(cache_dir() / "models" / filename)
+        _denoisers[kind] = so.OfflineSpeechDenoiser(so.OfflineSpeechDenoiserConfig(model=model))
+    out = _denoisers[kind].run(y.astype(np.float32).tolist(), SR)
+    z = np.asarray(out.samples, dtype=np.float32)
+    if out.sample_rate != SR:
+        import librosa
+
+        z = librosa.resample(z, orig_sr=out.sample_rate, target_sr=SR)
+    return np.pad(z, (0, max(0, len(y) - len(z))))[: len(y)]
+
+
+def beat(n: int, seed: int) -> np.ndarray:
+    """A drum-and-bass loop at 100-130 bpm: kick, snare noise, hats, bass line."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / SR
+    beat_s = 60 / rng.uniform(100, 130)
+    y = np.zeros(n)
+    for k in range(int(n / SR / beat_s) + 1):
+        # A kick on even beats (a pitch falling towards 50 Hz), snare noise on odd ones, each
+        # 0.25 s at most; a hat half a beat later.
+        i = int(k * beat_s * SR)
+        tt = np.arange(min(n - i, int(0.25 * SR))) / SR
+        if k % 2 == 0:
+            kick = np.sin(2 * np.pi * (50 + 80 * np.exp(-tt * 30)) * tt) * np.exp(-tt * 12)
+            y[i : i + len(tt)] += kick
+        else:
+            y[i : i + len(tt)] += 0.5 * rng.standard_normal(len(tt)) * np.exp(-tt * 25)
+        h = i + int(beat_s * SR / 2)
+        if h < n:
+            hh = np.arange(min(n - h, int(0.05 * SR))) / SR
+            y[h : h + len(hh)] += 0.15 * rng.standard_normal(len(hh)) * np.exp(-hh * 80)
+    # The bass: a note a beat from a minor pentatonic scale on A1 (55 Hz).
+    notes = 55 * 2 ** (rng.choice([0, 3, 5, 7, 10], size=int(n / SR / beat_s) + 1) / 12)
+    y += 0.4 * np.sin(2 * np.pi * np.repeat(notes, int(beat_s * SR))[:n] * t)
+    return y.astype(np.float32)
+
+
+def _clean_speech(cache: Path) -> list[str]:
+    """The clean sentences: CMU ARCTIC from the tests' data, each RAVDESS actor's first neutral
+    take of statement 1, and 5 sentences of each VCC2018 target speaker."""
+    arctic = Path(__file__).parents[1] / "tests" / "data" / "arctic"
+    files = sorted(str(f) for f in arctic.glob("*.wav"))
+    files += sorted(str(f) for f in (cache / "ravdess").glob("Actor_*/03-01-01-01-01-01-*.wav"))
+    for spk in ("VCC2TF1", "VCC2TF2", "VCC2TM1", "VCC2TM2"):
+        folder = cache / "vcc2018" / "vcc2018_reference" / spk
+        files += sorted(str(f) for f in folder.glob("*.wav"))[:5]
+    return files
+
+
+def _cleaning_job(item):
+    """One sentence mixed with music (or nothing, or the beat) at `snr` dB under it, then
+    cleaned each way and measured against the clean sentence: SI-SDR, how far pitch and
+    formants moved (semitones), the listener model's rating and the headline score."""
+    import librosa
+
+    from echo_voice import clean
+    from echo_voice.analysis import AnalysisError, _prepare, analyze
+    from echo_voice.scoring import compare
+    from echo_voice.similarity import rating
+
+    # 1. The mix: a random stretch of the music, starting at least 20 s in and 40 s before its
+    # end, scaled to `snr` dB under the speech.
+    path, music_path, snr, seed = item
+    speech = _prepare(load(path))
+    if music_path == "beat":
+        music = beat(len(speech), seed)
+    elif music_path is None:
+        music = np.zeros_like(speech)
+    else:
+        rng = np.random.default_rng(seed)
+        dur = librosa.get_duration(path=music_path)
+        start = rng.uniform(20, dur - 40)
+        music, _ = librosa.load(
+            music_path,
+            sr=SR,
+            mono=True,
+            offset=start,
+            duration=len(speech) / SR + 0.5,
+        )
+        music = music[: len(speech)]
+    if music_path is not None:
+        scale = np.sqrt(np.mean(speech**2) / max(np.mean(music**2), 1e-12))
+        music = music * scale / 10 ** (snr / 20)
+    mix = speech + music
+
+    # 2. Each way of cleaning it.
+    versions = {"raw (no cleaning)": mix, "vocal separation (UVR)": clean.vocals(mix)}
+    for kind in DENOISERS:
+        versions[kind] = _denoise(kind, mix)
+
+    # 3. Each against the clean sentence.
+    ref = analyze(speech)
+    out = {}
+    for name, y in versions.items():
+        n = min(len(y), len(speech))
+        a = y[:n] @ speech[:n] / (speech[:n] @ speech[:n])
+        err = y[:n] - a * speech[:n]
+        sisdr = 10 * np.log10((a * a * (speech[:n] @ speech[:n])) / max(err @ err, 1e-12))
+        try:
+            v = analyze(y)
+        except AnalysisError:
+            out[name] = None
+            continue
+        if v.median_f0 is not None and ref.median_f0 is not None:
+            pitch = abs(12 * np.log2(v.median_f0 / ref.median_f0))
+        else:
+            pitch = np.nan
+        formants = float(np.nanmean(np.abs(12 * np.log2(v.median_formants / ref.median_formants))))
+        out[name] = {
+            "sisdr": float(sisdr),
+            "pitch": pitch,
+            "formants": formants,
+            "listener": rating(ref, v),
+            "headline": compare(ref, v)["overall"],
+        }
+    return {"file": path, "music": music_path, "snr": snr, "results": out}
+
+
+def validate_cleaning(music_dir: Path, workers: int) -> None:
+    """Every sentence clean and with music at 0, 5 and 10 dB, cleaned every way: the results
+    go to cache/cleaning_results.json, and the medians are printed per music level."""
+    import json
+    import random
+
+    # 1. Every version to clean and score.
+    cache = Path(__file__).parents[1] / "cache"
+    files = _clean_speech(cache)
+    music = sorted(str(f) for f in music_dir.glob("*.ogg")) + ["beat"]
+    rng = random.Random(0)
+    items = []
+    for i, f in enumerate(files):
+        items.append((f, None, None, i))
+        for snr in (0, 5, 10):
+            items.append((f, rng.choice(music), snr, rng.randrange(10**6)))
+    out_path = cache / "cleaning_results.json"
+    print(f"{len(files)} sentences, {len(items)} versions to clean and score...", file=sys.stderr)
+    with ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
+        rows = list(pool.map(_cleaning_job, items))
+    out_path.write_text(json.dumps(rows), "utf-8")
+
+    # 2. The medians, per music level.
+    methods = list(rows[0]["results"])
+    for snr in (None, 10, 5, 0):
+        sel = [r for r in rows if r["snr"] == snr]
+        if snr is None:
+            label = "no music (does cleaning harm clean speech?)"
+        else:
+            label = f"music at {snr} dB below the voice"
+        print(f"\n{label}: {len(sel)} sentences. Medians against the clean original.")
+        print(
+            f"{'':26s}{'SI-SDR':>8s}{'pitch off':>11s}{'formants off':>14s}"
+            f"{'listener 1-6':>14s}{'headline':>10s}"
+        )
+        for m in methods:
+            ok = [r["results"][m] for r in sel if r["results"].get(m)]
+
+            def med(k, ok=ok):
+                """The median of one result over the versions that could be measured."""
+                return np.nanmedian([o[k] for o in ok])
+
+            print(
+                f"{m:26s}{med('sisdr'):7.1f}dB{med('pitch'):9.2f} st{med('formants'):11.2f} st"
+                f"{med('listener'):13.2f}{med('headline'):10.0f}   ({len(sel) - len(ok)} failed)"
+            )
+
+
+# --- SPLITTING LONG RECORDINGS: THE "OTHER VOICE" TAG ---
+
+
+def _other_voice_job(item):
+    """One simulated recording: 30 sentences by the main speaker, 3 each by two others of the
+    same sex and 2 by one of the other sex, shuffled, 1.2 s apart. Returns, for each line the
+    job found that falls within one sentence and has a same_voice: (by the main speaker, same
+    sex as them, its same_voice)."""
+    _low_priority()
+    import random
+
+    from echo_voice import sources
+
+    # 1. The plan, and the recording, each sentence scaled to a 0.5 peak.
+    main_speaker, files, sexes, seed = item
+    rng = random.Random(seed)
+    names = sorted(files)
+    same = [n for n in names if n != main_speaker and sexes[n] == sexes[main_speaker]]
+    other = [n for n in names if sexes[n] != sexes[main_speaker]]
+    plan = [(main_speaker, f) for f in rng.sample(files[main_speaker], 30)]
+    for n in rng.sample(same, 2):
+        plan += [(n, f) for f in rng.sample(files[n], 3)]
+    n = rng.choice(other)
+    plan += [(n, f) for f in rng.sample(files[n], 2)]
+    rng.shuffle(plan)
+    parts, marks, t = [], [], 0.0
+    gap = np.zeros(int(1.2 * SR), np.float32)
+    for who, f in plan:
+        y = load(f)
+        y = 0.5 * y / max(1e-6, float(np.abs(y).max()))
+        marks.append((t, t + len(y) / SR, who))
+        parts += [y, gap]
+        t += (len(y) + len(gap)) / SR
+    y = np.concatenate(parts)
+
+    # 2. The job's lines, each matched to the sentence its middle falls in (0.3 s either side).
+    out = []
+    for row in sources.measure(y, sources.split_lines(sources.transcribe_words(y))):
+        middle = (row["start"] + row["end"]) / 2
+        who = next((w for a, b, w in marks if a - 0.3 <= middle <= b + 0.3), None)
+        if who is not None and row["same_voice"] is not None:  # skip lines run across two sentences
+            out.append((who == main_speaker, sexes[who] == sexes[main_speaker], row["same_voice"]))
+    return out
+
+
+def validate_other_voice(vcc: Path, rounds: int, workers: int) -> None:
+    """How the "other voice" tag splits main-speaker lines from others' at several cosine
+    thresholds, over `rounds` recordings per VCC2018 speaker."""
+    from echo_voice.sources import OTHER_VOICE
+
+    files = {}
+    for folder in ("vcc2018_evaluation", "vcc2018_reference"):
+        for d in sorted((vcc / folder).iterdir()):
+            if d.is_dir():
+                files.setdefault(d.name, []).extend(sorted(d.glob("*.wav")))
+    sexes = {n: n[5] for n in files}  # VCC2SF1 -> F
+    items = [
+        (n, files, sexes, 100 * r + i) for r in range(rounds) for i, n in enumerate(sorted(files))
+    ]
+    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
+        rows = [r for result in pool.map(_other_voice_job, items) for r in result]
+    main = np.array([s for is_main, _, s in rows if is_main])
+    others = np.array([s for is_main, _, s in rows if not is_main])
+    same_sex = np.array([s for is_main, same, s in rows if not is_main and same])
+    print(
+        f"{len(items)} recordings: {len(main)} main-speaker lines, "
+        f"{len(others)} by others ({len(same_sex)} same sex)"
+    )
+    print(f"lowest main-speaker line {main.min():.2f}; highest other {others.max():.2f}")
+    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
+        mark = "  <- used" if threshold == OTHER_VOICE else ""
+        print(
+            f"cosine < {threshold}: main lines tagged {np.mean(main < threshold):.1%}, "
+            f"others {np.mean(others < threshold):.1%}"
+            f" (same sex {np.mean(same_sex < threshold):.1%}){mark}"
+        )
+
+
+# --- SPLITTING LONG RECORDINGS: HOW MANY SPEAKERS, AND WHO SAID WHAT ---
+
+
+def _embed_file(path):
+    """A file's speaker embedding and its length in seconds: (path, embedding, seconds)."""
+    _low_priority()
+    from echo_voice import identity
+
+    y = load(path)
+    return str(path), identity.embed(y), len(y) / SR
+
+
+def _who_is_who(rows: list[dict], found: list[dict]) -> dict:
+    """Each found speaker matched to the real one most of its lines belong to."""
+    truth = {}
+    for s in found:
+        names = [r["who"] for r in rows if r["speaker"] == s["speaker"]]
+        truth[s["speaker"]] = max(set(names), key=names.count)
+    return truth
+
+
+def validate_speakers(vcc: Path, workers: int, trials: int = 60) -> None:
+    """Recordings of 1 to 4 VCC2018 speakers (all from one studio): a main
+    speaker with 20 sentences and the others with 4 to 12 each, shuffled. Each
+    sentence stands for one line. Reported per threshold: how often the number
+    of speakers found is right, and how many lines go to the right speaker
+    (after matching found speakers to real ones), to the wrong one, or to none."""
+    import random
+
+    from echo_voice.sources import SPEAKER_SIMILARITY, find_speakers
+
+    # 1. Every sentence's embedding.
+    files = {}
+    for folder in ("vcc2018_evaluation", "vcc2018_reference"):
+        for d in sorted((vcc / folder).iterdir()):
+            if d.is_dir():
+                files[d.name] = sorted(d.glob("*.wav"))
+    paths = [p for ps in files.values() for p in ps]
+    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
+        done = {p: (e, s) for p, e, s in pool.map(_embed_file, paths, chunksize=8)}
+
+    # 2. The simulated recordings.
+    rng = random.Random(1)
+    recordings = []
+    for k in (1, 2, 3, 4):
+        for _ in range(trials):
+            who = rng.sample(sorted(files), k)
+            plan = [(who[0], f) for f in rng.sample(files[who[0]], 20)]
+            for name in who[1:]:
+                plan += [(name, f) for f in rng.sample(files[name], rng.randint(4, 12))]
+            rng.shuffle(plan)
+            recordings.append((k, plan))
+    print(f"{len(recordings)} recordings, {trials} each with 1 to 4 speakers")
+
+    # 3. Each threshold on every recording. A sentence counts as a line of at least 1.6 s.
+    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
+        right_count = defaultdict(int)
+        right = wrong = unsure = total = 0
+        main_right = 0
+        for k, plan in recordings:
+            rows, emb = [], {}
+            for i, (name, f) in enumerate(plan):
+                e, seconds = done[str(f)]
+                rows.append(
+                    {
+                        "start": 0.0,
+                        "end": max(seconds, 1.6),
+                        "pitch": None,
+                        "voiced": 0.5,
+                        "confidence": 0.9,
+                        "who": name,
+                    }
+                )
+                emb[i] = e
+            found = find_speakers(rows, emb, threshold)
+            right_count[k] += len(found) == k
+            truth = _who_is_who(rows, found)
+            main_right += bool(found) and truth.get(0) == plan_main(plan)
+            for r in rows:
+                total += 1
+                if r["speaker"] is None:
+                    unsure += 1
+                elif truth[r["speaker"]] == r["who"]:
+                    right += 1
+                else:
+                    wrong += 1
+        mark = "  <- used" if threshold == SPEAKER_SIMILARITY else ""
+        counts = ", ".join(f"{k}: {right_count[k] / trials:.0%}" for k in (1, 2, 3, 4))
+        print(
+            f"threshold {threshold}: speaker count right ({counts}); "
+            f"main speaker right {main_right / len(recordings):.0%}; "
+            f"lines right {right / total:.1%}, wrong {wrong / total:.1%}, "
+            f"unsure {unsure / total:.1%}{mark}"
+        )
+
+
+def validate_speakers_wild(vox: Path, workers: int, trials: int = 30) -> None:
+    """The same test on VoxCeleb1: interviews from YouTube, in real rooms,
+    with real microphones and background noise. Each speaker's sentences
+    come from one of their videos, as they would in a single video."""
+    import os
+    import random
+
+    from echo_voice.sources import SPEAKER_SIMILARITY, find_speakers
+
+    # 1. Each speaker's best-stocked video, with at least 6 clips.
+    rng = random.Random(2)
+    videos = {}  # speaker -> [clips of their best-stocked video]
+    for speaker in sorted(os.listdir(vox)):
+        best = []
+        if not speaker.startswith("id"):
+            continue
+        for video in os.scandir(vox / speaker):
+            if video.is_dir():
+                clips = sorted(Path(video.path).glob("*.wav"))
+                if len(clips) > len(best):
+                    best = clips
+        if len(best) >= 6:
+            videos[speaker] = best
+
+    # 2. The simulated recordings: a main speaker with 12 or more clips (up to 20 used), and
+    # 6 clips of each other speaker.
+    main_pool = [s for s, clips in videos.items() if len(clips) >= 12]
+    recordings = []
+    for k in (1, 2, 3):
+        for _ in range(trials):
+            main = rng.choice(main_pool)
+            others = rng.sample([s for s in videos if s != main], k - 1)
+            plan = [(main, f) for f in videos[main][:20]]
+            for name in others:
+                plan += [(name, f) for f in rng.sample(videos[name], 6)]
+            rng.shuffle(plan)
+            recordings.append((k, plan))
+    paths = sorted({str(f) for _, plan in recordings for _, f in plan})
+    print(
+        f"VoxCeleb1: {len(videos)} speakers with a video of 6+ clips; embedding {len(paths)} clips"
+    )
+    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
+        done = {p: (e, s) for p, e, s in pool.map(_embed_file, paths, chunksize=8)}
+
+    # 3. Each threshold on every recording.
+    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
+        right_count = defaultdict(int)
+        right = wrong = unsure = total = 0
+        for k, plan in recordings:
+            rows, emb = [], {}
+            for i, (name, f) in enumerate(plan):
+                e, seconds = done[str(f)]
+                rows.append(
+                    {
+                        "start": 0.0,
+                        "end": seconds,
+                        "pitch": None,
+                        "voiced": 0.5,
+                        "confidence": 0.9,
+                        "who": name,
+                    }
+                )
+                emb[i] = e
+            found = find_speakers(rows, emb, threshold)
+            right_count[k] += len(found) == k
+            truth = _who_is_who(rows, found)
+            for r in rows:
+                total += 1
+                if r["speaker"] is None:
+                    unsure += 1
+                elif truth[r["speaker"]] == r["who"]:
+                    right += 1
+                else:
+                    wrong += 1
+        mark = "  <- used" if threshold == SPEAKER_SIMILARITY else ""
+        counts = ", ".join(f"{k}: {right_count[k] / trials:.0%}" for k in (1, 2, 3))
+        print(
+            f"threshold {threshold}: speaker count right ({counts}); "
+            f"lines right {right / total:.1%}, wrong {wrong / total:.1%}, "
+            f"unsure {unsure / total:.1%}{mark}"
+        )
+
+
+def plan_main(plan):
+    """The speaker with the most sentences in a simulated recording."""
+    names = [name for name, _ in plan]
+    return max(set(names), key=names.count)
+
+
+# --- COMMAND LINE ---
+
+# The --help text.
+HELP = """Check the measurements against data with known answers.
 
     python tools/validate.py pitch --ptdb cache/ptdb
         Pitch tracking against PTDB-TUG (Pirker et al., Interspeech 2011):
@@ -53,1239 +1677,13 @@
 Each prints the current method next to the alternatives that were considered.
 """
 
-from __future__ import annotations
-
-import argparse
-import sys
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
-
-import numpy as np
-import parselmouth
-
-from echo_voice.analysis import SR, load
-
-# ---------- pitch ----------
-
-
-def _track(snd: parselmouth.Sound, floor: float, ceiling: float, method: str) -> parselmouth.Pitch:
-    if method == "ac":
-        return snd.to_pitch_ac(time_step=0.01, pitch_floor=floor, pitch_ceiling=ceiling)
-    return snd.to_pitch_cc(time_step=0.01, pitch_floor=floor, pitch_ceiling=ceiling)
-
-
-def _on_grid(pitch: parselmouth.Pitch, times: np.ndarray) -> np.ndarray:
-    f0 = pitch.selected_array["frequency"]
-    xs = pitch.xs()
-    out = np.zeros(len(times))
-    idx = np.round((times - xs[0]) / pitch.get_time_step()).astype(int)
-    ok = (idx >= 0) & (idx < len(xs))
-    out[ok] = f0[idx[ok]]
-    return out
-
-
-PITCH_METHODS = {
-    # name: (algorithm, how the range is chosen)
-    "ac 60-600 (current)": ("ac", "fixed"),
-    "cc 60-600": ("cc", "fixed"),
-    "ac two-pass, q35*0.72 .. q65*1.9 (De Looze & Hirst 2008)": ("ac", "dlh"),
-    "ac two-pass, q25*0.75 .. q75*1.5 (Hirst 2011)": ("ac", "hirst"),
-    "cc two-pass, q25*0.75 .. q75*1.5 (Hirst 2011)": ("cc", "hirst"),
-}
-
-
-def pitch_tracks(y: np.ndarray, times: np.ndarray) -> dict[str, np.ndarray]:
-    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
-    out = {}
-    for name, (method, rng) in PITCH_METHODS.items():
-        floor, ceiling = 60.0, 600.0
-        if rng != "fixed":
-            first = _on_grid(_track(snd, 60.0, 700.0, method), times)
-            v = first[first > 0]
-            if v.size >= 20:
-                if rng == "dlh":
-                    floor, ceiling = np.quantile(v, 0.35) * 0.72, np.quantile(v, 0.65) * 1.9
-                else:
-                    floor, ceiling = np.quantile(v, 0.25) * 0.75, np.quantile(v, 0.75) * 1.5
-                floor = max(40.0, floor)
-        out[name] = _on_grid(_track(snd, floor, ceiling, method), times)
-    return out
-
-
-def _pitch_job(path: Path):
-    ref = np.loadtxt(path.parent / f"ref_{path.stem[4:]}.f0")[:, 0]
-    y = load(path)
-    times = np.arange(int(len(y) / SR * 100)) / 100.0
-    return path.stem, ref, pitch_tracks(y, times)
-
-
-def validate_pitch(root: Path, workers: int) -> None:
-    files = sorted(root.glob("mic_*.wav"))
-    with ProcessPoolExecutor(workers) as pool:
-        results = list(pool.map(_pitch_job, files))
-    # The reference's first frame sits half a 32 ms window in; find the lag
-    # (in 10 ms frames) that lines the current tracker up best and use it for all.
-    def gpe_at(lag):
-        errs = []
-        for _, ref, tracks in results:
-            est = tracks["ac 60-600 (current)"]
-            r = ref[max(0, -lag):][: len(est)]
-            e = est[max(0, lag):][: len(r)]
-            r = r[: len(e)]
-            both = (r > 0) & (e > 0)
-            errs.append(np.mean(np.abs(e[both] / r[both] - 1) > 0.2))
-        return float(np.mean(errs))
-
-    lag = min(range(-4, 5), key=gpe_at)
-    print(f"{len(results)} utterances, reference lag {lag * 10:+d} ms\n")
-    rows = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for stem, ref, tracks in results:
-        sex = "female" if stem.split("_")[1].startswith("F") else "male"
-        for name, est in tracks.items():
-            r = ref[max(0, -lag):]
-            e = est[max(0, lag):]
-            n = min(len(r), len(e))
-            r, e = r[:n], e[:n]
-            rv, ev = r > 0, e > 0
-            both = rv & ev
-            ratio = e[both] / r[both]
-            gross = np.abs(ratio - 1) > 0.2
-            for group in (sex, "all"):
-                d = rows[name][group]
-                d["frames"].append(n)
-                d["gross"].append(gross.sum())
-                d["both"].append(both.sum())
-                d["vde"].append(np.sum(rv != ev))
-                d["cents"].extend(np.abs(1200 * np.log2(ratio[~gross])))
-                d["octave_down"].append(np.sum(ratio < 0.6))
-                d["octave_up"].append(np.sum(ratio > 1.6))
-    print(f"{'method':58s} {'group':7s} {'GPE':>6s} {'VDE':>6s} {'fine err':>9s} {'oct down/up':>12s}")
-    for name, groups in rows.items():
-        for group in ("female", "male", "all"):
-            d = groups[group]
-            gpe = sum(d["gross"]) / sum(d["both"])
-            vde = sum(d["vde"]) / sum(d["frames"])
-            fine = np.median(d["cents"])
-            od = sum(d["octave_down"]) / sum(d["both"])
-            ou = sum(d["octave_up"]) / sum(d["both"])
-            print(f"{name:58s} {group:7s} {gpe:6.2%} {vde:6.2%} {fine:6.1f} c  {od:5.2%}/{ou:5.2%}")
-        print()
-    print("GPE: share of frames voiced in both with more than 20% error. VDE: share of")
-    print("frames whose voiced/unvoiced decision differs. Fine error: median cents on the rest.")
-
-
-# ---------- formants ----------
-
-FIXED_CEILINGS = (5000, 5500)
-CANDIDATES = np.arange(4500, 7501, 250)
-
-
-def _formant_values(y: np.ndarray, ceiling: float, times: list[float]) -> np.ndarray:
-    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
-    formant = snd.to_formant_burg(time_step=0.005, max_number_of_formants=5, maximum_formant=ceiling)
-    return np.array([[formant.get_value_at_time(k, t) for t in times] for k in (1, 2, 3)])
-
-
-def roughness(tracks: np.ndarray) -> float:
-    """How far F1-F3 stray from a smooth (cubic) path, in semitones. Used to
-    pick a ceiling per recording, after FastTrack (Barreda 2021): the wrong
-    ceiling makes tracks jump between resonances."""
-    total = 0.0
-    x = np.linspace(-1, 1, tracks.shape[1])
-    for f in tracks:
-        if not np.all(np.isfinite(f)):
-            return np.inf
-        st = 12 * np.log2(f)
-        fit = np.polyval(np.polyfit(x, st, 3), x)
-        total += float(np.mean(np.abs(st - fit)))
-    return total
-
-
-def _formant_job(item):
-    name, start, end, path = item
-    y = load(path)
-    probe = list(start + (end - start) * np.array([0.2, 0.5, 0.8]))
-    dense = list(np.linspace(start, end, 21)[2:-2])  # inner 80% of the vowel
-    out = {f"fixed {c}": _formant_values(y, c, probe) for c in FIXED_CEILINGS}
-    group_ceiling = {"m": 5000, "w": 5500, "b": 6000, "g": 6000}[name[0]]
-    out["by voice type (oracle)"] = _formant_values(y, group_ceiling, probe)
-    scores = [(roughness(_formant_values(y, c, dense)), c) for c in CANDIDATES]
-    best = min(scores)[1]
-    out["smoothest ceiling per recording"] = _formant_values(y, best, probe)
-    return name, out, best
-
-
-def _h95_truth(root: Path):
-    truth = {}
-    for line in (root / "vowdata.dat").read_text("latin-1").splitlines():
-        parts = line.split()
-        if len(parts) == 16 and parts[0][:1] in "mwbg" and parts[0][1:3].isdigit():
-            v = [float(x) for x in parts[1:]]
-            truth[parts[0]] = np.array([[v[6], v[9], v[12]], [v[7], v[10], v[13]], [v[8], v[11], v[14]]])
-    times = {}
-    for line in (root / "timedata.dat").read_text("latin-1").splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] in truth:
-            times[parts[0]] = (float(parts[1]) / 1000, float(parts[2]) / 1000)
-    return truth, times
-
-
-def validate_formants(root: Path, workers: int) -> None:
-    truth, times = _h95_truth(root)
-    items = [
-        (n, *times[n], root / "audio" / f"{n}.wav")
-        for n in sorted(truth)
-        if n in times and (root / "audio" / f"{n}.wav").exists()
-    ]
-    with ProcessPoolExecutor(workers) as pool:
-        results = list(pool.map(_formant_job, items, chunksize=8))
-
-    group_name = {"m": "men", "w": "women", "b": "children", "g": "children"}
-    err = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    chosen = defaultdict(list)
-    for name, out, best in results:
-        chosen[group_name[name[0]]].append(best)
-        ref = truth[name]
-        for method, est in out.items():
-            for k in range(3):
-                ok = (ref[k] > 0) & np.isfinite(est[k])
-                rel = np.abs(est[k][ok] / ref[k][ok] - 1)
-                for g in (group_name[name[0]], "all"):
-                    err[method][g][k].extend(rel)
-                missing = np.sum((ref[k] > 0) & ~np.isfinite(est[k]))
-                for g in (group_name[name[0]], "all"):
-                    err[method][g][f"missing{k}"].append(missing)
-    print(f"{len(results)} vowels. Median |error| and share off by more than 15% (gross), per formant.\n")
-    print(f"{'method':34s} {'group':9s}" + "".join(f"{'F' + str(k + 1) + ' med/gross':>17s}" for k in range(3)))
-    for method, groups in err.items():
-        for g in ("men", "women", "children", "all"):
-            cells = []
-            for k in range(3):
-                a = np.array(groups[g][k])
-                cells.append(f"{np.median(a):6.1%} / {np.mean(a > 0.15):5.1%}")
-            print(f"{method:34s} {g:9s}" + "".join(f"{c:>17s}" for c in cells))
-        print()
-    for g, c in chosen.items():
-        print(f"smoothest ceiling chosen for {g:9s}: median {np.median(c):.0f} Hz, IQR {np.percentile(c, 25):.0f}-{np.percentile(c, 75):.0f}")
-
-
-# ----- whole lines: one ceiling per recording, chosen without vowel labels -----
-
-LINE_CEILINGS = np.arange(4500, 7001, 250)
-
-
-def _runs(voiced: np.ndarray) -> list[np.ndarray]:
-    """Index arrays of consecutive voiced frames."""
-    idx = np.flatnonzero(voiced)
-    if idx.size == 0:
-        return []
-    return [r for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1) if r.size >= 5]
-
-
-def _line_tracks(snd: parselmouth.Sound, times: np.ndarray, ceiling: float) -> np.ndarray:
-    formant = snd.to_formant_burg(time_step=0.01, max_number_of_formants=5, maximum_formant=ceiling)
-    return np.array([[formant.get_value_at_time(k, float(t)) for t in times] for k in (1, 2, 3)])
-
-
-def _rough_jumps(st: np.ndarray, runs) -> float:
-    d = [np.abs(np.diff(st[:, r], axis=1)) for r in runs]
-    return float(np.nanmean(np.concatenate(d, axis=1))) if d else np.inf
-
-
-def _rough_median(st: np.ndarray, runs) -> float:
-    from scipy.ndimage import median_filter
-
-    res = []
-    for r in runs:
-        seg = st[:, r]
-        res.append(np.abs(seg - median_filter(seg, size=(1, 5), mode="nearest")))
-    return float(np.nanmean(np.concatenate(res, axis=1))) if res else np.inf
-
-
-def _rough_chunks(st: np.ndarray, runs) -> float:
-    res = []
-    for r in runs:
-        for chunk in np.array_split(r, max(1, len(r) // 10)):
-            if len(chunk) < 5:
-                continue
-            x = np.linspace(-1, 1, len(chunk))
-            seg = st[:, chunk]
-            if not np.all(np.isfinite(seg)):
-                res.append(np.full(3, 3.0))  # an undefined formant mid-vowel counts as a bad fit
-                continue
-            fit = np.array([np.polyval(np.polyfit(x, f, 2), x) for f in seg])
-            res.append(np.abs(seg - fit).mean(axis=1))
-    return float(np.mean(res)) if res else np.inf
-
-
-CRITERIA = {"frame-to-frame jumps": _rough_jumps, "distance from running median": _rough_median,
-            "quadratic fit per 100 ms": _rough_chunks}
-
-
-def _line_job(item):
-    speaker, parts = item
-    gap = np.zeros(int(0.15 * SR), dtype=np.float32)
-    pieces, probes, offset = [], [], 0.0
-    for name, start, end, path in parts:
-        y = load(path)
-        pieces += [y, gap]
-        probes.append((name, offset + start + (end - start) * np.array([0.2, 0.5, 0.8])))
-        offset += (len(y) + len(gap)) / SR
-    y = np.concatenate(pieces)
-    y = 0.9 * y / np.max(np.abs(y))
-    snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
-    times = np.arange(int(len(y) / SR * 100)) / 100.0
-    pitch = _on_grid(_track(snd, 60.0, 600.0, "ac"), times)
-    runs = _runs(pitch > 0)
-    st = {c: 12 * np.log2(_line_tracks(snd, times, c)) for c in LINE_CEILINGS}
-    chosen = {"fixed 5500 (current)": 5500.0}
-    for label, fn in CRITERIA.items():
-        chosen[label] = float(min(LINE_CEILINGS, key=lambda c: fn(st[c], runs)))
-    from echo_voice.analysis import formant_tracks
-
-    f0 = np.where(pitch > 0, pitch, np.nan)
-    chosen["echo_voice.analysis (production)"] = formant_tracks(snd, times, f0)[1]
-    out = {}
-    for label, ceiling in chosen.items():
-        formant = snd.to_formant_burg(time_step=0.005, max_number_of_formants=5, maximum_formant=ceiling)
-        out[label] = {name: np.array([[formant.get_value_at_time(k, float(t)) for t in ts] for k in (1, 2, 3)])
-                      for name, ts in probes}
-    return speaker, out, chosen
-
-
-def validate_formant_lines(root: Path, workers: int) -> None:
-    truth, times = _h95_truth(root)
-    by_speaker = defaultdict(list)
-    for n in sorted(truth):
-        path = root / "audio" / f"{n}.wav"
-        if n in times and path.exists():
-            by_speaker[n[:3]].append((n, *times[n], path))
-    with ProcessPoolExecutor(workers) as pool:
-        results = list(pool.map(_line_job, by_speaker.items()))
-    group_name = {"m": "men", "w": "women", "b": "children", "g": "children"}
-    err = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    picks = defaultdict(lambda: defaultdict(list))
-    for speaker, out, chosen in results:
-        g = group_name[speaker[0]]
-        for label, c in chosen.items():
-            picks[label][g].append(c)
-        for label, est in out.items():
-            for name, values in est.items():
-                ref = truth[name]
-                for k in range(3):
-                    ok = ref[k] > 0
-                    rel = np.abs(values[k][ok] / ref[k][ok] - 1)
-                    rel[~np.isfinite(rel)] = 1.0  # no value where the vowel has one: count as gross
-                    for gg in (g, "all"):
-                        err[label][gg][k].extend(rel)
-    print(f"{len(results)} speakers, each speaker's 12 words joined into one recording;")
-    print("one ceiling chosen per recording from its voiced frames, no vowel labels.\n")
-    print(f"{'method':32s} {'group':9s}" + "".join(f"{'F' + str(k + 1) + ' med/gross':>17s}" for k in range(3))
-          + "   ceiling chosen (median)")
-    for label, groups in err.items():
-        for g in ("men", "women", "children", "all"):
-            cells = []
-            for k in range(3):
-                a = np.array(groups[g][k])
-                cells.append(f"{np.median(a):6.1%} / {np.mean(a > 0.15):5.1%}")
-            pick = np.median(picks[label][g]) if g != "all" else np.median([p for group in picks[label].values() for p in group])
-            print(f"{label:32s} {g:9s}" + "".join(f"{c:>17s}" for c in cells) + f"   {pick:.0f} Hz")
-        print()
-
-
-# ---------- human similarity judgments (VCC2018) ----------
-
-
-def _vcc_path(root: Path, name: str) -> Path:
-    system, target, source, sentence, _ = name[:-4].split("_")
-    if system == "S00":
-        return root / "vcc2018_evaluation" / source / f"{sentence}.wav"
-    if system == "T00":
-        return root / "vcc2018_reference" / target / f"{sentence}.wav"
-    return root / "converted" / name
-
-
-def vcc_pairs(root: Path) -> list[dict]:
-    """Unique rated pairs with the mean listener score. The natural recording is
-    the target; the other side is the take."""
-    import csv
-
-    ratings = defaultdict(list)
-    path = root / "vcc2018_listening_test_scores" / "vcc2018_evaluation_sim_simple.txt"
-    with open(path, encoding="utf-8") as f:
-        for a, b, _, score in list(csv.reader(f))[1:]:
-            if b.split("_")[0] in ("S00", "T00") and a.split("_")[0] not in ("S00", "T00"):
-                a, b = b, a  # natural first
-            ratings[(a, b)].append(int(score))
-    pairs = []
-    for (a, b), scores in ratings.items():
-        pa, pb = _vcc_path(root, a), _vcc_path(root, b)
-        if pa == pb or not pa.exists() or not pb.exists():
-            continue
-        system = b.split("_")[0]
-        kind = {"S00": "natural", "T00": "natural"}.get(system, "converted")
-        against = "source" if a.startswith("S00") else "target"
-        pairs.append({
-            "target": str(pa), "take": str(pb), "rating": float(np.mean(scores)), "n": len(scores),
-            "system": system, "kind": kind, "against": against, "task": b[:-4].split("_")[-1],
-        })
-    return pairs
-
-
-def _vcc_job(group):
-    from echo_voice.analysis import AnalysisError, analyze
-    from echo_voice.scoring import compare
-
-    target_path, pairs = group
-    try:
-        target = analyze(load(target_path))
-    except AnalysisError:
-        return []
-    rows = []
-    for p in pairs:
-        try:
-            r = compare(target, analyze(load(p["take"])))
-        except AnalysisError:
-            continue
-        p = dict(p, overall=r["overall"], identity=r["identity"])
-        p.update({f"score_{c['key']}": c["score"] for c in r["components"]})
-        rows.append(p)
-    return rows
-
-
-def score_vcc(root: Path, out: Path, workers: int) -> None:
-    import json
-
-    groups = defaultdict(list)
-    for p in vcc_pairs(root):
-        groups[p["target"]].append(p)
-    print(f"scoring {sum(len(g) for g in groups.values())} pairs against {len(groups)} natural recordings...",
-          file=sys.stderr)
-    done = 0
-    with ProcessPoolExecutor(workers) as pool, open(out, "w", encoding="utf-8") as f:
-        for rows in pool.map(_vcc_job, groups.items()):
-            f.writelines(json.dumps(r) + "\n" for r in rows)
-            done += 1
-            if done % 50 == 0:
-                print(f"  {done}/{len(groups)}", file=sys.stderr)
-    report_vcc(out)
-
-
-def report_vcc(path: Path, extra: dict[str, dict] | None = None) -> None:
-    """Correlations with listeners, per pair and per system. `extra` maps a
-    label to {(target, take): value} for alternative measures."""
-    import json
-
-    from scipy.stats import pearsonr, spearmanr
-
-    rows = [json.loads(line) for line in Path(path).read_text("utf-8").splitlines()]
-    measures = ["overall", "identity"] + sorted(k for k in rows[0] if k.startswith("score_"))
-    values = {m: [r[m] for r in rows] for m in measures}
-    for label, table in (extra or {}).items():
-        measures.append(label)
-        values[label] = [table.get((r["target"], r["take"])) for r in rows]
-
-    def corr(idx, m):
-        x = np.array([values[m][i] for i in idx], dtype=float)
-        y = np.array([rows[i]["rating"] for i in idx])
-        ok = np.isfinite(x)
-        if ok.sum() < 5:
-            return float("nan"), float("nan")
-        return spearmanr(x[ok], y[ok])[0], pearsonr(x[ok], y[ok])[0]
-
-    def system_corr(idx, m):
-        groups = defaultdict(list)
-        for i in idx:
-            r = rows[i]
-            groups[(r["system"], r["against"], r["task"])].append(i)
-        xs, ys = [], []
-        for g in groups.values():
-            x = np.array([values[m][i] for i in g], dtype=float)
-            if np.isfinite(x).sum() == 0:
-                continue
-            w = np.array([rows[i]["n"] for i in g], dtype=float)
-            xs.append(np.nanmean(x))
-            ys.append(np.average([rows[i]["rating"] for i in g], weights=w))
-        return spearmanr(xs, ys)[0], pearsonr(xs, ys)[0], len(xs)
-
-    conv = [i for i, r in enumerate(rows) if r["kind"] == "converted"]
-    conv_t = [i for i in conv if rows[i]["against"] == "target"]
-    print(f"{len(rows)} pairs ({len(conv)} converted, {len(rows) - len(conv)} natural).")
-    print("Spearman / Pearson with the mean listener rating (1 = different, sure ... 4 = same, sure).\n")
-    head = f"{'measure':26s}{'all pairs':>15s}{'converted':>15s}{'conv vs target':>16s}{'per system':>16s}"
-    print(head)
-    for m in measures:
-        cells = [corr(range(len(rows)), m), corr(conv, m), corr(conv_t, m)]
-        sr, pr, _ = system_corr(conv, m)
-        print(f"{m:26s}" + "".join(f"{a:7.3f}/{b:6.3f} " for a, b in cells) + f"  {sr:6.3f}/{pr:6.3f}")
-    print(f"\nper system: {system_corr(conv, 'overall')[2]} groups (system x compared-with x task), "
-          "means weighted by number of ratings")
-
-
-# ----- other speaker models, and low-dimensional projections -----
-
-SPEAKER_MODELS = {
-    "resnet34-LM (current)": ("wespeaker_en_voxceleb_resnet34_LM.onnx", "wespeaker"),
-    "resnet293-LM": ("wespeaker_en_voxceleb_resnet293_LM.onnx", "wespeaker"),
-    "wespeaker CAM++-LM": ("wespeaker_en_voxceleb_CAM++_LM.onnx", "wespeaker"),
-    "3d-speaker ERes2Net": ("3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx", "3dspeaker"),
-    "3d-speaker CAM++": ("3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx", "3dspeaker"),
-}
-_sessions: dict = {}
-
-
-def embed_with(model: str, y: np.ndarray) -> np.ndarray:
-    """Embedding with each framework's own front end: WeSpeaker uses int16-scale
-    samples and a Hamming window, 3D-Speaker [-1, 1] samples and Kaldi's default
-    window; both subtract the utterance mean from 80-bin filterbanks."""
-    import kaldi_native_fbank as knf
-    import onnxruntime
-
-    from echo_voice.models import cache_dir
-
-    filename, framework = SPEAKER_MODELS[model]
-    if model not in _sessions:
-        opts = onnxruntime.SessionOptions()
-        opts.intra_op_num_threads = 1
-        _sessions[model] = onnxruntime.InferenceSession(str(cache_dir() / "models" / filename), opts,
-                                                        providers=["CPUExecutionProvider"])
-    sess = _sessions[model]
-    o = knf.FbankOptions()
-    o.frame_opts.samp_freq = SR
-    o.frame_opts.dither = 0.0
-    o.mel_opts.num_bins = 80
-    if framework == "wespeaker":
-        o.frame_opts.window_type = "hamming"
-    samples = y.astype(np.float64) * 32768 + np.random.default_rng(0).standard_normal(len(y))
-    if framework == "3dspeaker":
-        samples /= 32768
-    fb = knf.OnlineFbank(o)
-    fb.accept_waveform(SR, samples.astype(np.float32).tolist())
-    fb.input_finished()
-    feats = np.array([fb.get_frame(i) for i in range(fb.num_frames_ready)], dtype=np.float32)
-    feats -= feats.mean(axis=0)
-    e = sess.run(None, {sess.get_inputs()[0].name: feats[None]})[0][0].astype(np.float64)
-    return e / np.linalg.norm(e)
-
-
-def _embed_job(path: str):
-    from echo_voice.analysis import AnalysisError, _prepare
-
-    try:
-        y = _prepare(load(path))
-    except AnalysisError:
-        return path, None
-    return path, {m: embed_with(m, y).astype(np.float32) for m in SPEAKER_MODELS}
-
-
-def _embed_files(paths: list[str], cache: Path, workers: int) -> dict[str, dict[str, np.ndarray]]:
-    import pickle
-
-    done = pickle.loads(cache.read_bytes()) if cache.exists() else {}
-    todo = [p for p in paths if p not in done]
-    if todo:
-        print(f"embedding {len(todo)} files with {len(SPEAKER_MODELS)} models...", file=sys.stderr)
-        with ProcessPoolExecutor(workers) as pool:
-            for i, (path, e) in enumerate(pool.map(_embed_job, todo, chunksize=16), 1):
-                done[path] = e
-                if i % 2000 == 0:
-                    print(f"  {i}/{len(todo)}", file=sys.stderr)
-                    cache.write_bytes(pickle.dumps(done))
-        cache.write_bytes(pickle.dumps(done))
-    return done
-
-
-def vcc_models(root: Path, scored: Path, workers: int) -> None:
-    import json
-
-    rows = [json.loads(line) for line in Path(scored).read_text("utf-8").splitlines()]
-    files = sorted({r["target"] for r in rows} | {r["take"] for r in rows})
-    from calibrate import cohort_files
-
-    emb = _embed_files(files, root / "embeddings.pkl", workers)
-    cohort = cohort_files(Path(__file__).parents[1] / "cache")
-    cemb = _embed_files(sorted({f for fs in cohort.values() for f in fs}), root / "cohort_embeddings.pkl", workers)
-
-    extra = {}
-    for model in SPEAKER_MODELS:
-        def cos(a, b, f=lambda v: v, model=model):
-            ea, eb = emb.get(a), emb.get(b)
-            if ea is None or eb is None:
-                return None
-            x, y = f(ea[model]), f(eb[model])
-            return float(x @ y / np.linalg.norm(x) / np.linalg.norm(y))
-
-        extra[f"cos {model}"] = {(r["target"], r["take"]): cos(r["target"], r["take"]) for r in rows}
-        cents = np.array([np.mean([cemb[f][model] for f in fs if cemb.get(f) is not None], axis=0)
-                          for fs in cohort.values()])
-        mu = cents.mean(axis=0)
-        _, _, vt = np.linalg.svd(cents - mu, full_matrices=False)
-        extra[f"  mean-subtracted {model}"] = {
-            (r["target"], r["take"]): cos(r["target"], r["take"], lambda v, mu=mu: v - mu) for r in rows}
-        for k in (3, 10, 30):
-            basis = vt[:k]
-            extra[f"  top-{k} PCs {model}"] = {
-                (r["target"], r["take"]): cos(r["target"], r["take"], lambda v, b=basis, mu=mu: b @ (v - mu)) for r in rows}
-    print(f"cohort: {len(cohort)} speakers\n")
-    report_vcc(scored, extra)
-
-
-# ---------- VoxSim (human ratings of in-the-wild pairs) ----------
-
-VOX_ZIPS = {
-    "dev": "datasets/ProgramComputer/voxceleb/vox1/vox1_dev_wav.zip",
-    "test": "datasets/ProgramComputer/voxceleb/vox1/vox1_test_wav.zip",
-}
-
-
-def voxsim_pairs(root: Path, split: str) -> list[dict]:
-    import csv
-
-    name = "voxsim_test_list.txt" if split == "test" else "voxsim_train_list_average.txt"
-    with open(root / name, encoding="utf-8") as f:
-        return [{"a": r[0], "b": r[1], "same": r[2] == "1", "rating": float(r[4])} for r in csv.reader(f)]
-
-
-def _member_from(buf: bytes, base: int, info) -> bytes | None:
-    """One zip member out of a downloaded byte range starting at `base`,
-    checked against its CRC; None if it doesn't check out."""
-    import struct
-    import zlib
-
-    at = info.header_offset - base
-    if buf[at:at + 4] != b"PK\x03\x04":
-        return None
-    name_len, extra_len = struct.unpack("<HH", buf[at + 26:at + 30])
-    start = at + 30 + name_len + extra_len
-    data = buf[start:start + info.compress_size]
-    if len(data) != info.compress_size:
-        return None
-    if info.compress_type == 8:
-        data = zlib.decompress(data, -15)
-    elif info.compress_type != 0:
-        return None
-    return data if zlib.crc32(data) & 0xFFFFFFFF == info.CRC else None
-
-
-def _fetch_run(fs, zpath: str, run, out: Path) -> int:
-    """Download a run of neighbouring members in one ranged request. Each file
-    is written to a temporary name and renamed, so an interrupted fetch never
-    leaves a partial file behind. Returns how many failed."""
-    first, last = run[0][1], run[-1][1]
-    # Local headers can carry more "extra" bytes than the central directory says.
-    end = last.header_offset + 30 + len(last.filename.encode()) + 1024 + last.compress_size
-    buf = fs.cat_file(zpath, start=first.header_offset, end=end)
-    failed = 0
-    for clip, info in run:
-        data = _member_from(buf, first.header_offset, info)
-        if data is None:
-            failed += 1
-            continue
-        path = out / clip
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".part")
-        tmp.write_bytes(data)
-        tmp.replace(path)
-    return failed
-
-
-def voxsim_fetch(root: Path, out: Path, train_pairs: int, workers: int) -> None:
-    import random
-    import zipfile
-    from concurrent.futures import ThreadPoolExecutor
-
-    from huggingface_hub import HfFileSystem
-
-    pairs = voxsim_pairs(root, "test")
-    if train_pairs:
-        pairs += random.Random(0).sample(voxsim_pairs(root, "train"), train_pairs)
-    need = {c for p in pairs for c in (p["a"], p["b"])}
-    fs = HfFileSystem()
-    bad_sizes = []
-    for split, zpath in VOX_ZIPS.items():
-        with fs.open(zpath, "rb", block_size=16 * 2**20) as f:
-            index = {i.filename.split("wav/", 1)[-1]: i for i in zipfile.ZipFile(f).infolist()}
-        todo = []
-        for c in sorted(need):
-            info = index.get(c)
-            if info is None:
-                continue
-            path = out / c
-            if path.exists() and path.stat().st_size != info.file_size:
-                bad_sizes.append(c)  # left over from an interrupted run
-                path.unlink()
-            if not path.exists():
-                todo.append((c, info))
-        todo.sort(key=lambda t: t[1].header_offset)
-        # Members that sit next to each other in the zip come down together.
-        runs, size = [], 0
-        for c, info in todo:
-            gap_free = runs and info.header_offset - runs[-1][-1][1].header_offset < 2 * 2**20 and (
-                info.header_offset <= runs[-1][-1][1].header_offset + 30 + len(runs[-1][-1][1].filename.encode())
-                + 1024 + runs[-1][-1][1].compress_size)
-            if gap_free and size < 16 * 2**20:
-                runs[-1].append((c, info))
-                size += info.compress_size
-            else:
-                runs.append([(c, info)])
-                size = info.compress_size
-        print(f"{split}: {len(todo)} clips to fetch in {len(runs)} requests", file=sys.stderr)
-        failed = 0
-        with ThreadPoolExecutor(workers) as pool:
-            for i, n in enumerate(pool.map(lambda r, zpath=zpath: _fetch_run(fs, zpath, r, out), runs), 1):
-                failed += n
-                if i % 1000 == 0:
-                    print(f"  {i}/{len(runs)}", file=sys.stderr)
-        print(f"{split}: {len(todo) - failed} written, {failed} failed their check", file=sys.stderr)
-    if bad_sizes:
-        (out / "refetched.txt").write_text("\n".join(bad_sizes), "utf-8")
-        print(f"{len(bad_sizes)} partial files from an earlier run were fetched again (listed in refetched.txt)",
-              file=sys.stderr)
-    missing = [c for c in need if not (out / c).exists()]
-    print(f"done; {len(missing)} clips still missing", file=sys.stderr)
-
-
-def _voxsim_features(path: str):
-    """Word-independent features of one clip: speaker embeddings, median pitch
-    and median formants (as the app measures them)."""
-    from echo_voice import identity
-    from echo_voice.analysis import MAX_SECONDS, AnalysisError, _prepare, analyze
-
-    y = load(path)[: int((MAX_SECONDS - 1) * SR)]
-    try:
-        v = analyze(y)
-    except AnalysisError:
-        return path, None
-    yp = _prepare(y)
-    formants = np.nanmedian(v.formants[:, v.voiced], axis=1) if v.voiced.sum() >= 20 else np.full(3, np.nan)
-    return path, {
-        "emb": v.embedding,
-        "raw": identity.raw_embed(yp),
-        "cam": embed_with("wespeaker CAM++-LM", yp),
-        "eres": embed_with("3d-speaker ERes2Net", yp),
-        "f0": v.median_f0,
-        "formants": formants,
-    }
-
-
-def voxsim_eval(root: Path, audio: Path, workers: int) -> None:
-    import pickle
-    import random
-
-    from scipy.stats import pearsonr, spearmanr
-
-    from echo_voice.scoring import CALIBRATION, curve
-
-    sets = {"VoxSim test": voxsim_pairs(root, "test"),
-            "VoxSim train sample": random.Random(0).sample(voxsim_pairs(root, "train"), 3000)}
-    clips = sorted({c for ps in sets.values() for p in ps for c in (p["a"], p["b"]) if (audio / c).exists()})
-    cache = audio / "features.pkl"
-    feats = pickle.loads(cache.read_bytes()) if cache.exists() else {}
-    todo = [str(audio / c) for c in clips if str(audio / c) not in feats]
-    if todo:
-        print(f"analysing {len(todo)} clips...", file=sys.stderr)
-        with ProcessPoolExecutor(workers) as pool:
-            for i, (path, f) in enumerate(pool.map(_voxsim_features, todo, chunksize=8), 1):
-                feats[path] = f
-                if i % 2000 == 0:
-                    print(f"  {i}/{len(todo)}", file=sys.stderr)
-                    cache.write_bytes(pickle.dumps(feats))
-        cache.write_bytes(pickle.dumps(feats))
-
-    def cosine(a, b):
-        return float(a @ b / np.linalg.norm(a) / np.linalg.norm(b))
-
-    curves = CALIBRATION["curves"]
-    w = CALIBRATION["weights"]
-
-    from types import SimpleNamespace
-
-    from echo_voice import similarity
-
-    def measures(fa, fb):
-        def ns(f):
-            return SimpleNamespace(embedding=f["emb"], median_f0=f["f0"], median_formants=f["formants"])
-
-        listener = similarity.predict(similarity.features(ns(fa), ns(fb)))
-        out = {
-            "Voice: listener model (current)": listener,
-            "  embedding similarity alone": cosine(fa["emb"], fb["emb"]),
-            "  ...without mean subtraction": cosine(fa["raw"], fb["raw"]),
-            "  ...average of 3 models": (cosine(fa["emb"], fb["emb"]) + cosine(fa["cam"], fb["cam"])
-                                         + cosine(fa["eres"], fb["eres"])) / 3,
-        }
-        pitch = None
-        if fa["f0"] and fb["f0"]:
-            pitch = abs(12 * np.log2(fa["f0"] / fb["f0"]))
-            out["Pitch (median, semitones apart)"] = -pitch
-        res = None
-        if np.all(np.isfinite(fa["formants"])) and np.all(np.isfinite(fb["formants"])):
-            res = float(np.mean(np.abs(12 * np.log2(fa["formants"] / fb["formants"]))))
-            out["Resonance (median formants apart)"] = -res
-        parts = {"identity": curve(6 - listener, **curves["identity"])}
-        if pitch is not None:
-            parts["pitch"] = curve(pitch, **curves["pitch"])
-        if res is not None:
-            parts["resonance"] = curve(res, **curves["resonance"])
-        out["Voice + Pitch + Resonance (app weights)"] = (
-            sum(w[k] * v for k, v in parts.items()) / sum(w[k] for k in parts))
-        return out
-
-    for label, pairs in sets.items():
-        rows = []
-        for p in pairs:
-            fa, fb = feats.get(str(audio / p["a"])), feats.get(str(audio / p["b"]))
-            if fa and fb:
-                rows.append((p, measures(fa, fb)))
-        print(f"\n{label}: {len(rows)} pairs ({sum(p['same'] for p, _ in rows)} same speaker), "
-              "human ratings 1-6. Pearson / Spearman.")
-        print(f"{'measure':42s}{'all pairs':>17s}{'different speakers':>20s}{'same speaker':>17s}")
-        names = list(dict.fromkeys(k for _, m in rows for k in m))
-        for name in names:
-            cells = []
-            for sel in (lambda p: True, lambda p: not p["same"], lambda p: p["same"]):
-                xs = [(m[name], p["rating"]) for p, m in rows if sel(p) and name in m]
-                x, y = np.array(xs).T
-                cells.append(f"{pearsonr(x, y)[0]:6.3f} / {spearmanr(x, y)[0]:6.3f}")
-            print(f"{name:42s}" + "".join(f"{c:>18s}" for c in cells))
-
-
-# ---------- the word check (line.py) ----------
-
-
-def _low_priority():
-    if sys.platform == "win32":
-        import ctypes
-
-        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)
-
-
-def _transcribe_job(item):
-    import zlib
-
-    from calibrate import channel
-
-    from echo_voice.analysis import AnalysisError, _prepare
-    from echo_voice.line import transcribe
-
-    path, cut = item
-    y = load(path)
-    out = {}
-    try:
-        out["clean"] = transcribe(_prepare(y))
-        mic = channel(y, zlib.crc32(Path(path).stem.encode()))
-        out["mic"] = transcribe(_prepare(mic))
-        if cut:
-            prepared = _prepare(mic)
-            out["first60"] = transcribe(prepared[: int(len(prepared) * 0.6)])
-            out["last60"] = transcribe(prepared[int(len(prepared) * 0.4):])
-    except AnalysisError:
-        return path, None
-    return path, out
-
-
-def validate_line(ravdess: Path, workers: int) -> None:
-    import json
-    import random
-
-    from echo_voice.line import compare_words
-
-    files = sorted(str(f) for f in ravdess.glob("Actor_*/03-01-*.wav"))
-    rng = random.Random(0)
-    cut = set(rng.sample(files, 300))
-    cache = ravdess.parent / "ravdess_transcripts.json"
-    words = json.loads(cache.read_text("utf-8")) if cache.exists() else {}
-    todo = [(f, f in cut) for f in files if f not in words]
-    if todo:
-        print(f"transcribing {len(todo)} files...", file=sys.stderr)
-        with ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
-            for i, (path, out) in enumerate(pool.map(_transcribe_job, todo, chunksize=8), 1):
-                words[path] = out
-                if i % 200 == 0:
-                    cache.write_text(json.dumps(words), "utf-8")
-                    print(f"  {i}/{len(todo)}", file=sys.stderr)
-        cache.write_text(json.dumps(words), "utf-8")
-
-    truth = {"01": "kids are talking by the door", "02": "dogs are sitting by the door"}
-    meta = {f: Path(f).stem.split("-") for f in files if words.get(f)}
-    # How well the recogniser hears the sentences at all.
-    for kind in ("clean", "mic"):
-        rates = [compare_words(truth[meta[f][4]].split(), words[f][kind]).match_rate for f in meta]
-        print(f"recognised words, {kind:5s}: {np.mean(rates):.1%} of the sentence on average, "
-              f"{np.mean(np.array(rates) == 1):.1%} of files word-perfect")
-
-    by_statement = defaultdict(list)
-    for f, m in meta.items():
-        by_statement[m[4]].append(f)
-    same, other = [], []
-    for _ in range(3000):
-        st = rng.choice(["01", "02"])
-        a, b = rng.sample(by_statement[st], 2)
-        same.append(compare_words(words[a]["clean"], words[b]["mic"]))
-        c = rng.choice(by_statement["02" if st == "01" else "01"])
-        other.append(compare_words(words[a]["clean"], words[c]["mic"]))
-    first = [compare_words(words[f]["clean"], words[f]["first60"]) for f in cut if words.get(f)]
-    last = [compare_words(words[f]["clean"], words[f]["last60"]) for f in cut if words.get(f)]
-
-    def flagged(checks):
-        return np.mean([c.flagged for c in checks])
-
-    print("\nTarget clean, take through the simulated mic; target words come from the recogniser too.")
-    print(f"same sentence, other actor/emotion: flagged {flagged(same):.1%} (false alarms); "
-          f"median match {np.median([c.match_rate for c in same]):.2f}")
-    print(f"the other sentence:                 flagged {flagged(other):.1%}; "
-          f"median match {np.median([c.match_rate for c in other]):.2f}")
-    print(f"take cut to its first 60%:          flagged {flagged(first):.1%}")
-    print(f"take cut to its last 60%:           flagged {flagged(last):.1%}")
-    fa = [c for c in same if c.flagged]
-    print("\nexamples of false alarms (line / said):")
-    for c in fa[:6]:
-        print("   ", " ".join(c.target), "/", " ".join(c.take))
-
-
-# ---------- clip cleaning ----------
-
-DENOISERS = {"GTCRN denoiser": ("gtcrn_simple.onnx", "gtcrn"), "DPDFNet denoiser": ("dpdfnet2.onnx", "dpdfnet")}
-_denoisers: dict = {}
-
-
-def _denoise(kind: str, y: np.ndarray) -> np.ndarray:
-    import sherpa_onnx as so
-
-    from echo_voice.models import cache_dir
-
-    if kind not in _denoisers:
-        filename, family = DENOISERS[kind]
-        model = so.OfflineSpeechDenoiserModelConfig(num_threads=1)
-        getattr(model, family).model = str(cache_dir() / "models" / filename)
-        _denoisers[kind] = so.OfflineSpeechDenoiser(so.OfflineSpeechDenoiserConfig(model=model))
-    out = _denoisers[kind].run(y.astype(np.float32).tolist(), SR)
-    z = np.asarray(out.samples, dtype=np.float32)
-    if out.sample_rate != SR:
-        import librosa
-
-        z = librosa.resample(z, orig_sr=out.sample_rate, target_sr=SR)
-    return np.pad(z, (0, max(0, len(y) - len(z))))[: len(y)]
-
-
-def beat(n: int, seed: int) -> np.ndarray:
-    """A drum-and-bass loop at 100-130 bpm: kick, snare noise, hats, bass line."""
-    rng = np.random.default_rng(seed)
-    t = np.arange(n) / SR
-    beat_s = 60 / rng.uniform(100, 130)
-    y = np.zeros(n)
-    for k in range(int(n / SR / beat_s) + 1):
-        i = int(k * beat_s * SR)
-        tt = np.arange(min(n - i, int(0.25 * SR))) / SR
-        if k % 2 == 0:
-            y[i:i + len(tt)] += np.sin(2 * np.pi * (50 + 80 * np.exp(-tt * 30)) * tt) * np.exp(-tt * 12)
-        else:
-            y[i:i + len(tt)] += 0.5 * rng.standard_normal(len(tt)) * np.exp(-tt * 25)
-        h = i + int(beat_s * SR / 2)
-        if h < n:
-            hh = np.arange(min(n - h, int(0.05 * SR))) / SR
-            y[h:h + len(hh)] += 0.15 * rng.standard_normal(len(hh)) * np.exp(-hh * 80)
-    notes = 55 * 2 ** (rng.choice([0, 3, 5, 7, 10], size=int(n / SR / beat_s) + 1) / 12)
-    y += 0.4 * np.sin(2 * np.pi * np.repeat(notes, int(beat_s * SR))[:n] * t)
-    return y.astype(np.float32)
-
-
-def _clean_speech(cache: Path) -> list[str]:
-    files = sorted(str(f) for f in (Path(__file__).parents[1] / "tests" / "data" / "arctic").glob("*.wav"))
-    files += sorted(str(f) for f in (cache / "ravdess").glob("Actor_*/03-01-01-01-01-01-*.wav"))
-    for spk in ("VCC2TF1", "VCC2TF2", "VCC2TM1", "VCC2TM2"):
-        files += sorted(str(f) for f in (cache / "vcc2018" / "vcc2018_reference" / spk).glob("*.wav"))[:5]
-    return files
-
-
-def _cleaning_job(item):
-    import librosa
-
-    from echo_voice import clean
-    from echo_voice.analysis import AnalysisError, _prepare, analyze
-    from echo_voice.scoring import compare
-    from echo_voice.similarity import rating
-
-    path, music_path, snr, seed = item
-    speech = _prepare(load(path))
-    if music_path == "beat":
-        music = beat(len(speech), seed)
-    elif music_path is None:
-        music = np.zeros_like(speech)
-    else:
-        rng = np.random.default_rng(seed)
-        dur = librosa.get_duration(path=music_path)
-        start = rng.uniform(20, dur - 40)
-        music, _ = librosa.load(music_path, sr=SR, mono=True, offset=start, duration=len(speech) / SR + 0.5)
-        music = music[: len(speech)]
-    if music_path is not None:
-        music = music * np.sqrt(np.mean(speech**2) / max(np.mean(music**2), 1e-12)) / 10 ** (snr / 20)
-    mix = speech + music
-    versions = {"raw (no cleaning)": mix, "vocal separation (UVR)": clean.vocals(mix)}
-    for kind in DENOISERS:
-        versions[kind] = _denoise(kind, mix)
-    ref = analyze(speech)
-    out = {}
-    for name, y in versions.items():
-        n = min(len(y), len(speech))
-        a = y[:n] @ speech[:n] / (speech[:n] @ speech[:n])
-        err = y[:n] - a * speech[:n]
-        sisdr = 10 * np.log10((a * a * (speech[:n] @ speech[:n])) / max(err @ err, 1e-12))
-        try:
-            v = analyze(y)
-        except AnalysisError:
-            out[name] = None
-            continue
-        pitch = (abs(12 * np.log2(v.median_f0 / ref.median_f0))
-                 if v.median_f0 is not None and ref.median_f0 is not None else np.nan)
-        formants = float(np.nanmean(np.abs(12 * np.log2(v.median_formants / ref.median_formants))))
-        out[name] = {"sisdr": float(sisdr), "pitch": pitch, "formants": formants,
-                     "listener": rating(ref, v), "headline": compare(ref, v)["overall"]}
-    return {"file": path, "music": music_path, "snr": snr, "results": out}
-
-
-def validate_cleaning(music_dir: Path, workers: int) -> None:
-    import json
-    import random
-
-    cache = Path(__file__).parents[1] / "cache"
-    files = _clean_speech(cache)
-    music = sorted(str(f) for f in music_dir.glob("*.ogg")) + ["beat"]
-    rng = random.Random(0)
-    items = []
-    for i, f in enumerate(files):
-        items.append((f, None, None, i))
-        for snr in (0, 5, 10):
-            items.append((f, rng.choice(music), snr, rng.randrange(10**6)))
-    out_path = cache / "cleaning_results.json"
-    print(f"{len(files)} sentences, {len(items)} versions to clean and score...", file=sys.stderr)
-    with ProcessPoolExecutor(workers, initializer=_low_priority) as pool:
-        rows = list(pool.map(_cleaning_job, items))
-    out_path.write_text(json.dumps(rows), "utf-8")
-
-    methods = list(rows[0]["results"])
-    for snr in (None, 10, 5, 0):
-        sel = [r for r in rows if r["snr"] == snr]
-        label = "no music (does cleaning harm clean speech?)" if snr is None else f"music at {snr} dB below the voice"
-        print(f"\n{label}: {len(sel)} sentences. Medians against the clean original.")
-        print(f"{'':26s}{'SI-SDR':>8s}{'pitch off':>11s}{'formants off':>14s}{'listener 1-6':>14s}{'headline':>10s}")
-        for m in methods:
-            ok = [r["results"][m] for r in sel if r["results"].get(m)]
-            def med(k, ok=ok):
-                return np.nanmedian([o[k] for o in ok])
-            print(f"{m:26s}{med('sisdr'):7.1f}dB{med('pitch'):9.2f} st{med('formants'):11.2f} st"
-                  f"{med('listener'):13.2f}{med('headline'):10.0f}   ({len(sel) - len(ok)} failed)")
-
-
-# ---------- splitting long recordings: the "other voice" tag ----------
-
-
-def _other_voice_job(item):
-    _low_priority()
-    import random
-
-    from echo_voice import sources
-
-    main_speaker, files, sexes, seed = item
-    rng = random.Random(seed)
-    names = sorted(files)
-    same = [n for n in names if n != main_speaker and sexes[n] == sexes[main_speaker]]
-    other = [n for n in names if sexes[n] != sexes[main_speaker]]
-    plan = [(main_speaker, f) for f in rng.sample(files[main_speaker], 30)]
-    for n in rng.sample(same, 2):
-        plan += [(n, f) for f in rng.sample(files[n], 3)]
-    n = rng.choice(other)
-    plan += [(n, f) for f in rng.sample(files[n], 2)]
-    rng.shuffle(plan)
-    parts, marks, t = [], [], 0.0
-    gap = np.zeros(int(1.2 * SR), np.float32)
-    for who, f in plan:
-        y = load(f)
-        y = 0.5 * y / max(1e-6, float(np.abs(y).max()))
-        marks.append((t, t + len(y) / SR, who))
-        parts += [y, gap]
-        t += (len(y) + len(gap)) / SR
-    y = np.concatenate(parts)
-    out = []
-    for row in sources.measure(y, sources.split_lines(sources.transcribe_words(y))):
-        middle = (row["start"] + row["end"]) / 2
-        who = next((w for a, b, w in marks if a - 0.3 <= middle <= b + 0.3), None)
-        if who is not None and row["same_voice"] is not None:  # skip lines run across two sentences
-            out.append((who == main_speaker, sexes[who] == sexes[main_speaker], row["same_voice"]))
-    return out
-
-
-def validate_other_voice(vcc: Path, rounds: int, workers: int) -> None:
-    from echo_voice.sources import OTHER_VOICE
-
-    files = {}
-    for folder in ("vcc2018_evaluation", "vcc2018_reference"):
-        for d in sorted((vcc / folder).iterdir()):
-            if d.is_dir():
-                files.setdefault(d.name, []).extend(sorted(d.glob("*.wav")))
-    sexes = {n: n[5] for n in files}  # VCC2SF1 -> F
-    items = [(n, files, sexes, 100 * r + i) for r in range(rounds) for i, n in enumerate(sorted(files))]
-    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
-        rows = [r for result in pool.map(_other_voice_job, items) for r in result]
-    main = np.array([s for is_main, _, s in rows if is_main])
-    others = np.array([s for is_main, _, s in rows if not is_main])
-    same_sex = np.array([s for is_main, same, s in rows if not is_main and same])
-    print(f"{len(items)} recordings: {len(main)} main-speaker lines, {len(others)} by others ({len(same_sex)} same sex)")
-    print(f"lowest main-speaker line {main.min():.2f}; highest other {others.max():.2f}")
-    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
-        mark = "  <- used" if threshold == OTHER_VOICE else ""
-        print(
-            f"cosine < {threshold}: main lines tagged {np.mean(main < threshold):.1%}, others {np.mean(others < threshold):.1%}"
-            f" (same sex {np.mean(same_sex < threshold):.1%}){mark}"
-        )
-
-
-# ---------- splitting long recordings: how many speakers, and who said what ----------
-
-
-def _embed_file(path):
-    _low_priority()
-    from echo_voice import identity
-
-    y = load(path)
-    return str(path), identity.embed(y), len(y) / SR
-
-
-def validate_speakers(vcc: Path, workers: int, trials: int = 60) -> None:
-    """Recordings of 1 to 4 VCC2018 speakers (all from one studio): a main
-    speaker with 20 sentences and the others with 4 to 12 each, shuffled. Each
-    sentence stands for one line. Reported per threshold: how often the number
-    of speakers found is right, and how many lines go to the right speaker
-    (after matching found speakers to real ones), to the wrong one, or to none."""
-    import random
-
-    from echo_voice.sources import SPEAKER_SIMILARITY, find_speakers
-
-    files = {}
-    for folder in ("vcc2018_evaluation", "vcc2018_reference"):
-        for d in sorted((vcc / folder).iterdir()):
-            if d.is_dir():
-                files[d.name] = sorted(d.glob("*.wav"))
-    paths = [p for ps in files.values() for p in ps]
-    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
-        done = {p: (e, s) for p, e, s in pool.map(_embed_file, paths, chunksize=8)}
-    rng = random.Random(1)
-    recordings = []
-    for k in (1, 2, 3, 4):
-        for _ in range(trials):
-            who = rng.sample(sorted(files), k)
-            plan = [(who[0], f) for f in rng.sample(files[who[0]], 20)]
-            for name in who[1:]:
-                plan += [(name, f) for f in rng.sample(files[name], rng.randint(4, 12))]
-            rng.shuffle(plan)
-            recordings.append((k, plan))
-    print(f"{len(recordings)} recordings, {trials} each with 1 to 4 speakers")
-    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
-        right_count = defaultdict(int)
-        right = wrong = unsure = total = 0
-        main_right = 0
-        for k, plan in recordings:
-            rows, emb = [], {}
-            for i, (name, f) in enumerate(plan):
-                e, seconds = done[str(f)]
-                rows.append({"start": 0.0, "end": max(seconds, 1.6), "pitch": None, "voiced": 0.5, "confidence": 0.9, "who": name})
-                emb[i] = e
-            found = find_speakers(rows, emb, threshold)
-            right_count[k] += len(found) == k
-            # Match each found speaker to the real one most of its lines belong to.
-            truth = {s["speaker"]: max({r["who"] for r in rows if r["speaker"] == s["speaker"]},
-                                       key=lambda n: sum(1 for r in rows if r["speaker"] == s["speaker"] and r["who"] == n))
-                     for s in found}
-            main_right += bool(found) and truth.get(0) == plan_main(plan)
-            for r in rows:
-                total += 1
-                if r["speaker"] is None:
-                    unsure += 1
-                elif truth[r["speaker"]] == r["who"]:
-                    right += 1
-                else:
-                    wrong += 1
-        mark = "  <- used" if threshold == SPEAKER_SIMILARITY else ""
-        counts = ", ".join(f"{k}: {right_count[k] / trials:.0%}" for k in (1, 2, 3, 4))
-        print(
-            f"threshold {threshold}: speaker count right ({counts}); main speaker right {main_right / len(recordings):.0%}; "
-            f"lines right {right / total:.1%}, wrong {wrong / total:.1%}, unsure {unsure / total:.1%}{mark}"
-        )
-
-
-def validate_speakers_wild(vox: Path, workers: int, trials: int = 30) -> None:
-    """The same test on VoxCeleb1: interviews from YouTube, in real rooms,
-    with real microphones and background noise. Each speaker's sentences
-    come from one of their videos, as they would in a single video."""
-    import os
-    import random
-
-    from echo_voice.sources import SPEAKER_SIMILARITY, find_speakers
-
-    rng = random.Random(2)
-    videos = {}  # speaker -> [clips of their best-stocked video]
-    for speaker in sorted(os.listdir(vox)):
-        best = []
-        if not speaker.startswith("id"):
-            continue
-        for video in os.scandir(vox / speaker):
-            if video.is_dir():
-                clips = sorted(Path(video.path).glob("*.wav"))
-                if len(clips) > len(best):
-                    best = clips
-        if len(best) >= 6:
-            videos[speaker] = best
-    main_pool = [s for s, clips in videos.items() if len(clips) >= 12]
-    recordings = []
-    for k in (1, 2, 3):
-        for _ in range(trials):
-            main = rng.choice(main_pool)
-            others = rng.sample([s for s in videos if s != main], k - 1)
-            plan = [(main, f) for f in videos[main][:20]]
-            for name in others:
-                plan += [(name, f) for f in rng.sample(videos[name], 6)]
-            rng.shuffle(plan)
-            recordings.append((k, plan))
-    paths = sorted({str(f) for _, plan in recordings for _, f in plan})
-    print(f"VoxCeleb1: {len(videos)} speakers with a video of 6+ clips; embedding {len(paths)} clips")
-    with ProcessPoolExecutor(min(workers, 4), initializer=_low_priority) as pool:
-        done = {p: (e, s) for p, e, s in pool.map(_embed_file, paths, chunksize=8)}
-    for threshold in (0.3, 0.35, 0.4, 0.45, 0.5):
-        right_count = defaultdict(int)
-        right = wrong = unsure = total = 0
-        for k, plan in recordings:
-            rows, emb = [], {}
-            for i, (name, f) in enumerate(plan):
-                e, seconds = done[str(f)]
-                rows.append({"start": 0.0, "end": seconds, "pitch": None, "voiced": 0.5, "confidence": 0.9, "who": name})
-                emb[i] = e
-            found = find_speakers(rows, emb, threshold)
-            right_count[k] += len(found) == k
-            truth = {s["speaker"]: max({r["who"] for r in rows if r["speaker"] == s["speaker"]},
-                                       key=lambda n: sum(1 for r in rows if r["speaker"] == s["speaker"] and r["who"] == n))
-                     for s in found}
-            for r in rows:
-                total += 1
-                if r["speaker"] is None:
-                    unsure += 1
-                elif truth[r["speaker"]] == r["who"]:
-                    right += 1
-                else:
-                    wrong += 1
-        mark = "  <- used" if threshold == SPEAKER_SIMILARITY else ""
-        counts = ", ".join(f"{k}: {right_count[k] / trials:.0%}" for k in (1, 2, 3))
-        print(f"threshold {threshold}: speaker count right ({counts}); lines right {right / total:.1%}, wrong {wrong / total:.1%}, unsure {unsure / total:.1%}{mark}")
-
-
-def plan_main(plan):
-    """The speaker with the most sentences in a simulated recording."""
-    names = [name for name, _ in plan]
-    return max(set(names), key=names.count)
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    """Run the check named on the command line."""
+    parser = argparse.ArgumentParser(
+        description=HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("pitch")
     p.add_argument("--ptdb", type=Path, required=True)
@@ -1301,7 +1699,12 @@ def main() -> None:
     vf = sub.add_parser("voxsim-fetch")
     vf.add_argument("--voxsim", type=Path, required=True)
     vf.add_argument("--out", type=Path, required=True)
-    vf.add_argument("--train-pairs", type=int, default=0, help="also fetch this many random training pairs")
+    vf.add_argument(
+        "--train-pairs",
+        type=int,
+        default=0,
+        help="also fetch this many random training pairs",
+    )
     li = sub.add_parser("line")
     li.add_argument("--ravdess", type=Path, required=True)
     cl = sub.add_parser("cleaning")
@@ -1311,10 +1714,19 @@ def main() -> None:
     ve.add_argument("--audio", type=Path, required=True)
     ov = sub.add_parser("other-voice")
     ov.add_argument("--vcc", type=Path, required=True)
-    ov.add_argument("--rounds", type=int, default=3, help="recordings per speaker, each with fresh random picks")
+    ov.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="recordings per speaker, each with fresh random picks",
+    )
     sp = sub.add_parser("speakers")
     sp.add_argument("--vcc", type=Path, required=True)
-    sp.add_argument("--voxceleb", type=Path, help="also test on VoxCeleb1 interviews (cache/voxceleb1)")
+    sp.add_argument(
+        "--voxceleb",
+        type=Path,
+        help="also test on VoxCeleb1 interviews (cache/voxceleb1)",
+    )
     for s in (p, f, fl, v, vf, ve, li, cl, ov, sp):
         s.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()

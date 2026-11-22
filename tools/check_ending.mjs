@@ -1,27 +1,28 @@
-// Check the page's end-of-speech detector (static/ending.js) on saved takes.
-//
-//   node tools/check_ending.mjs <data dir> [noise dB under the speech peak, default 45]
-//
-// Every take in the data folder is played to the detector as the page would
-// hear it: a lead-in of room noise, the take, then four seconds of room noise,
-// read in 43 ms stretches 60 times a second. The quiet it waits for comes from
-// the take's own line (`waitFor`), as on the page. A take must not be ended
-// before its last word, and should be ended soon after.
-//
-// Where the last word ends is read from the take's record: the scorer lines
-// the take up with the target and keeps each word's place in the take. That
-// is the reference, and not the end of the file, because a take recorded
-// before this existed ends with whatever came after the line: a breath, and
-// the click on Stop.
-//
-// Saved takes are trimmed of their lead-in and tail, cleaned of background
-// and scaled to a 0.9 peak, so the room is put back as white noise at a
-// chosen level under that peak.
+/*
+tools/check_ending.mjs
+Author: maymeridian
+Description: Checks the page's end-of-speech detector (static/ending.js) on saved takes.
+             - Usage: node tools/check_ending.mjs <data dir> [noise dB under the speech peak,
+               default 45]
+             - Every take in the data folder is played to the detector as the page would hear
+               it: a lead-in of room noise, the take, then four seconds of room noise, read in
+               43 ms stretches 60 times a second. The quiet it waits for comes from the take's
+               own line (`waitFor`), as on the page. A take must not be ended before its last
+               word, and should be ended soon after.
+             - Where the last word ends is read from the take's record: the scorer lines the
+               take up with the target and keeps each word's place in the take. That is the
+               reference, and not the end of the file, because a take recorded before this
+               existed ends with whatever came after the line: a breath, and the click on Stop.
+             - Saved takes are trimmed of their lead-in and tail, cleaned of background and
+               scaled to a 0.9 peak, so the room is put back as white noise at a chosen level
+               under that peak.
+*/
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { Ending, spoken, waitFor } from "../src/echo_voice/static/ending.js";
 
+// The samples of a 16-bit PCM WAV file, scaled to [-1, 1), and its rate.
 function readWav(path) {
   const buf = readFileSync(path);
   let offset = 12;
@@ -32,7 +33,9 @@ function readWav(path) {
     if (id === "fmt ") rate = buf.readUInt32LE(offset + 12);
     else if (id === "data") {
       const samples = new Float32Array(size / 2);
-      for (let i = 0; i < samples.length; i++) samples[i] = buf.readInt16LE(offset + 8 + i * 2) / 32768;
+      for (let i = 0; i < samples.length; i++) {
+        samples[i] = buf.readInt16LE(offset + 8 + i * 2) / 32768;
+      }
       return { rate, samples };
     }
     offset += 8 + size + (size % 2);
@@ -40,18 +43,24 @@ function readWav(path) {
   throw new Error(`${path}: no data chunk`);
 }
 
-// A small generator with a seed, so every run hears the same room.
+// A small generator with a seed, so every run hears the same room: Gaussian noise (Box-Muller)
+// from a linear congruential generator (Numerical Recipes' constants, modulo 2^32).
 function noiseMaker(seed) {
   let s = seed >>> 0;
   const uniform = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
   return () => Math.sqrt(-2 * Math.log(uniform() + 1e-12)) * Math.cos(2 * Math.PI * uniform());
 }
 
+// The q-quantile of some numbers: the one at that share of the way through them, sorted.
+function quantile(xs, q) {
+  const sorted = [...xs].sort((a, b) => a - b);
+  return sorted[Math.min(xs.length - 1, Math.floor(q * xs.length))];
+}
+
 const root = process.argv[2];
 const under = Number(process.argv[3] ?? 45);
-const LEAD = 0.4;
-const TAIL = 4;
-const quantile = (xs, q) => [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(q * xs.length))];
+const LEAD = 0.4; // s of room noise before the take
+const TAIL = 4; // s of room noise after it
 
 let takes = 0;
 const early = [];
@@ -65,15 +74,25 @@ for (const id of readdirSync(join(root, "targets"))) {
   const wait = waitFor(words);
   const enough = 0.5 * spoken(words);
   for (const file of readdirSync(join(folder, "takes")).filter((f) => f.endsWith(".wav"))) {
+    // 1. The take with the room put back around it.
     const { rate, samples } = readWav(join(folder, "takes", file));
     const noise = noiseMaker(takes + 1);
     const level = 0.9 * 10 ** (-under / 20);
     const lead = Math.round(LEAD * rate);
     const heard = new Float32Array(lead + samples.length + Math.round(TAIL * rate));
-    for (let i = 0; i < heard.length; i++) heard[i] = level * noise() + (i >= lead && i < lead + samples.length ? samples[i - lead] : 0);
-    const record = JSON.parse(readFileSync(join(folder, "takes", file.replace(/\.wav$/, ".json")), "utf8"));
+    for (let i = 0; i < heard.length; i++) {
+      const inTake = i >= lead && i < lead + samples.length;
+      heard[i] = level * noise() + (inTake ? samples[i - lead] : 0);
+    }
+
+    // 2. Where its last word ends, from the take's record (else the end of the file).
+    const recordPath = join(folder, "takes", file.replace(/\.wav$/, ".json"));
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
     const ends = (record.words ?? []).map((w) => w.take_end).filter((x) => x != null);
     const end = LEAD + (ends.length ? Math.max(...ends) : samples.length / rate);
+
+    // 3. The detector hears the RMS of the latest 2048 samples at 48 kHz (43 ms), 60 times a
+    // second, until it calls the take over.
     const span = Math.round((2048 / 48000) * rate);
     const ending = new Ending({ wait, enough });
     let stopped = null;
@@ -86,16 +105,31 @@ for (const id of readdirSync(join(root, "targets"))) {
         break;
       }
     }
+
+    // 4. Too early, never, or how long after the last word.
     takes++;
-    const name = `${id}/${file} (${(samples.length / rate).toFixed(1)} s, waits ${wait.toFixed(2)} s)`;
-    if (stopped == null) never.push(name);
-    else if (stopped < end) early.push(`${name}: stopped ${(end - stopped).toFixed(2)} s before its last word ended`);
-    else delays.push(stopped - end);
+    const seconds = (samples.length / rate).toFixed(1);
+    const name = `${id}/${file} (${seconds} s, waits ${wait.toFixed(2)} s)`;
+    if (stopped == null) {
+      never.push(name);
+    } else if (stopped < end) {
+      early.push(`${name}: stopped ${(end - stopped).toFixed(2)} s before its last word ended`);
+    } else {
+      delays.push(stopped - end);
+    }
   }
 }
+
 console.log(`${takes} takes, room noise ${under} dB under the peak`);
 console.log(`ended early: ${early.length}`);
 for (const line of early) console.log(`  ${line}`);
 console.log(`never ended: ${never.length}`);
 for (const line of never) console.log(`  ${line}`);
-if (delays.length) console.log(`ended after the last word by: median ${quantile(delays, 0.5).toFixed(2)} s, 90% within ${quantile(delays, 0.9).toFixed(2)} s, at most ${Math.max(...delays).toFixed(2)} s`);
+if (delays.length) {
+  const p50 = quantile(delays, 0.5).toFixed(2);
+  const p90 = quantile(delays, 0.9).toFixed(2);
+  const most = Math.max(...delays).toFixed(2);
+  console.log(
+    `ended after the last word by: median ${p50} s, 90% within ${p90} s, at most ${most} s`,
+  );
+}

@@ -1,4 +1,10 @@
-"""Practise a voice impression and measure how close you get."""
+'''
+src/echo_voice/__init__.py
+Author: maymeridian
+Description: Practise a voice impression and measure how close you get.
+             - The package's version, and what most callers need: load or decode a recording,
+               analyze it into a Voice, and compare a take with its target.
+'''
 
 __version__ = "1.1.1"
 

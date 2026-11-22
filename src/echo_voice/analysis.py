@@ -1,8 +1,12 @@
-"""Turn a recording into the per-frame features the scorer compares.
-
-Everything is sampled on one 10 ms frame grid so pitch, formants and MFCCs can
-be indexed with the same frame numbers after time alignment.
-"""
+'''
+src/echo_voice/analysis.py
+Author: maymeridian
+Description: Turns a recording into the per-frame features the scorer compares.
+             - Everything is sampled on one 10 ms frame grid, so pitch, formants and MFCCs can
+               be indexed with the same frame numbers after time alignment.
+             - Each recording picks its own formant ceiling (the one with the smoothest F1-F3
+               tracks); Resonance reads both sides at one ceiling per speaker (steadied).
+'''
 
 from __future__ import annotations
 
@@ -18,17 +22,17 @@ import soundfile as sf
 
 from . import identity, line
 
-SR = 16000
+SR = 16000  # Hz: every recording is analysed at this rate, the one the speech models take
 HOP = 160  # 10 ms
 N_FFT = 400  # 25 ms
-MAX_SECONDS = 30.0
-MIN_SECONDS = 0.3
+MAX_SECONDS = 30.0  # the longest clip scored: the speech recogniser's window (line.sounds)
+MIN_SECONDS = 0.3  # anything shorter is too little to score
 MIN_VOICED_FRAMES = 20  # 0.2 s of voiced sound before pitch is trusted
 STRAY = 0.15  # s: a sound shorter than this, on its own at either end, is not part of the line
 APART = 0.4  # s of quiet between it and the rest
 
-PITCH_FLOOR = 60.0
-PITCH_CEILING = 600.0
+PITCH_FLOOR = 60.0  # Hz: pitch is looked for between these two,
+PITCH_CEILING = 600.0  # wide enough for any speaking voice
 # The formant ceiling has to suit the vocal tract: about 5000 Hz for men, more for
 # women and children. Each recording gets the candidate whose F1-F3 tracks jump
 # least from frame to frame (the idea behind Barreda's FastTrack, 2021): a wrong
@@ -44,7 +48,10 @@ PITCH_CEILING = 600.0
 # Resonance from AUC 0.825 to 0.848 at telling a retake from a stranger, with five
 # recordings to go by (cache/experiments/ceiling, 2026-11).
 FORMANT_CEILINGS = tuple(range(4500, 7001, 250))
-FALLBACK_CEILING = 5500.0
+FALLBACK_CEILING = 5500.0  # Hz, when there is too little continuous voicing to pick one
+
+
+# --- THE ANALYSED RECORDING ---
 
 
 class AnalysisError(ValueError):
@@ -53,6 +60,8 @@ class AnalysisError(ValueError):
 
 @dataclass
 class Voice:
+    """One analysed recording: the audio and its features on the 10 ms frame grid."""
+
     y: np.ndarray  # trimmed, peak-normalised mono at SR
     times: np.ndarray  # frame centres in seconds
     f0: np.ndarray  # Hz per frame, NaN where unvoiced
@@ -60,8 +69,9 @@ class Voice:
     formant_ceiling: float  # Hz, the one this recording picks for itself (or was given)
     mfcc: np.ndarray  # (12, frames), mean-normalised, energy dropped
     steady: np.ndarray | None = None  # F1-F3 tracked at the ceiling Resonance reads at (steadied)
-    steady_ceiling: float | None = None
-    tracks: dict = field(default_factory=dict, repr=False, compare=False)  # F1-F3 at other ceilings (at)
+    steady_ceiling: float | None = None  # Hz, the ceiling `steady` was tracked at
+    # F1-F3 at other ceilings (at), and other readings worked out once (word_drill's words)
+    tracks: dict = field(default_factory=dict, repr=False, compare=False)
 
     def at(self, ceiling: float) -> np.ndarray:
         """F1-F3 tracked at `ceiling` on the voiced frames, worked out once."""
@@ -93,10 +103,12 @@ class Voice:
 
     @property
     def duration(self) -> float:
+        """Length in seconds."""
         return len(self.y) / SR
 
     @property
     def voiced(self) -> np.ndarray:
+        """For each frame: was a pitch found?"""
         return np.isfinite(self.f0)
 
     @property
@@ -127,10 +139,12 @@ class Voice:
             runs.pop()
         while len(runs) > 1 and len(runs[0]) < 5 and runs[1][0] - runs[0][-1] > apart:
             runs.pop(0)
+        # 5 frames either side; the stop is one past the last frame.
         return slice(max(0, runs[0][0] - 5), min(len(self.times), runs[-1][-1] + 6))
 
     @property
     def spoken_duration(self) -> float:
+        """Seconds from the first to the last voiced sound (spoken)."""
         span = self.spoken
         return (span.stop - span.start) * HOP / SR
 
@@ -147,6 +161,9 @@ class Voice:
         if self.voiced.sum() < MIN_VOICED_FRAMES:
             return None
         return float(np.nanmedian(self.f0))
+
+
+# --- READING AND ANALYSING AUDIO ---
 
 
 def load(path: str | Path) -> np.ndarray:
@@ -183,25 +200,38 @@ def analyze(y: np.ndarray, ceiling: float | None = None, trim: bool = True) -> V
     on a clip that starts in digital silence it moved the start 160 ms. The
     line's word timings were measured on the audio as saved, so it is read
     as saved (trim=False)."""
+    # 1. Check, trim and normalise the audio
     y = _prepare(y, trim)
-    mfcc = librosa.feature.mfcc(
-        y=y, sr=SR, n_mfcc=13, n_fft=N_FFT, hop_length=HOP, n_mels=40
-    )[1:]
-    # Removing each coefficient's mean takes out most of the microphone and
-    # room colouring, which would otherwise swamp a clip-vs-live comparison.
+
+    # 2. MFCCs, which set the frame grid. Coefficient 0, the energy, is dropped.
+    #    Removing each coefficient's mean takes out most of the microphone and room
+    #    colouring, which would otherwise swamp a clip-vs-live comparison.
+    mfcc = librosa.feature.mfcc(y=y, sr=SR, n_mfcc=13, n_fft=N_FFT, hop_length=HOP, n_mels=40)[1:]
     mfcc = mfcc - mfcc.mean(axis=1, keepdims=True)
     times = librosa.frames_to_time(np.arange(mfcc.shape[1]), sr=SR, hop_length=HOP)
 
+    # 3. Pitch
     snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=SR)
     f0 = _pitch(snd, times)
+
+    # 4. Formants, at the ceiling given or at the one the recording picks
     if ceiling is None:
         formants, ceiling = formant_tracks(snd, times, f0)
     else:
         formants = _tracks_at(snd, times, np.flatnonzero(np.isfinite(f0)), float(ceiling))
-    return Voice(y=y, times=times, f0=f0, formants=formants, formant_ceiling=float(ceiling), mfcc=mfcc)
+    return Voice(
+        y=y,
+        times=times,
+        f0=f0,
+        formants=formants,
+        formant_ceiling=float(ceiling),
+        mfcc=mfcc,
+    )
 
 
 def _prepare(y: np.ndarray, trim: bool = True) -> np.ndarray:
+    """The recording ready to analyse: checked it can be scored, trimmed (with `trim`)
+    and scaled to a peak of 0.9. Raises AnalysisError when it can't be scored."""
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0 or float(np.max(np.abs(y))) < 1e-4:
         raise AnalysisError("That recording is silent — check the microphone.")
@@ -230,7 +260,11 @@ def _trim(y: np.ndarray, pad: float = 0.05) -> np.ndarray:
     second of silence and a click moved Rhythm by 49 points for one take in
     ten). It goes when it lasts under STRAY seconds and more than APART
     seconds of quiet lie between it and the rest.
+
+    `pad`: seconds kept either side of the sound.
     """
+    # 1. Loudness, and the cut-off: 30% of the way from the noise floor (the 10th
+    #    percentile) to the peak, kept 6-15 dB over the floor and at least the peak less 40 dB
     rms = librosa.feature.rms(y=y, frame_length=N_FFT, hop_length=HOP)[0]
     db = 20 * np.log10(np.maximum(rms, 1e-10))
     peak, floor = float(db.max()), float(np.percentile(db, 10))
@@ -238,12 +272,24 @@ def _trim(y: np.ndarray, pad: float = 0.05) -> np.ndarray:
     loud = np.flatnonzero(db > threshold)
     if loud.size == 0:
         return y
+
+    # 2. Drop a short sound on its own at either end
     runs = np.split(loud, np.flatnonzero(np.diff(loud) > 1) + 1)
     seconds = HOP / SR
-    while len(runs) > 1 and len(runs[-1]) * seconds < STRAY and (runs[-1][0] - runs[-2][-1]) * seconds > APART:
+    while (
+        len(runs) > 1
+        and len(runs[-1]) * seconds < STRAY
+        and (runs[-1][0] - runs[-2][-1]) * seconds > APART
+    ):
         runs.pop()
-    while len(runs) > 1 and len(runs[0]) * seconds < STRAY and (runs[1][0] - runs[0][-1]) * seconds > APART:
+    while (
+        len(runs) > 1
+        and len(runs[0]) * seconds < STRAY
+        and (runs[1][0] - runs[0][-1]) * seconds > APART
+    ):
         runs.pop(0)
+
+    # 3. Cut, keeping `pad` either side (and the last frame's half-window)
     margin = int(pad * SR)
     start = max(0, runs[0][0] * HOP - margin)
     end = min(len(y), (runs[-1][-1] + 1) * HOP + N_FFT // 2 + margin)
@@ -251,8 +297,11 @@ def _trim(y: np.ndarray, pad: float = 0.05) -> np.ndarray:
 
 
 def _pitch(snd: parselmouth.Sound, times: np.ndarray) -> np.ndarray:
+    """Pitch in Hz at each of `times` (Praat's autocorrelation tracker), NaN where unvoiced."""
     pitch = snd.to_pitch_ac(
-        time_step=HOP / SR, pitch_floor=PITCH_FLOOR, pitch_ceiling=PITCH_CEILING
+        time_step=HOP / SR,
+        pitch_floor=PITCH_FLOOR,
+        pitch_ceiling=PITCH_CEILING,
     )
     track = pitch.selected_array["frequency"]
     xs = pitch.xs()
@@ -268,15 +317,21 @@ def _pitch(snd: parselmouth.Sound, times: np.ndarray) -> np.ndarray:
     return f0
 
 
+# --- FORMANTS AND CEILINGS ---
+
+
 def formant_tracks(
-    snd: parselmouth.Sound, times: np.ndarray, f0: np.ndarray
+    snd: parselmouth.Sound,
+    times: np.ndarray,
+    f0: np.ndarray,
 ) -> tuple[np.ndarray, float]:
     """F1-F3 on voiced frames, with the ceiling that gives the smoothest tracks."""
     voiced = np.flatnonzero(np.isfinite(f0))  # formants only mean much when voiced
+    # Smoothness is judged inside runs of at least 5 voiced frames (50 ms).
     runs = [r for r in np.split(voiced, np.flatnonzero(np.diff(voiced) > 1) + 1) if r.size >= 5]
     if not runs:  # too little continuous voicing to judge smoothness
         return _tracks_at(snd, times, voiced, FALLBACK_CEILING), FALLBACK_CEILING
-    best = (np.inf, FALLBACK_CEILING, None)
+    best = (np.inf, FALLBACK_CEILING, None)  # roughness, ceiling, tracks
     for ceiling in FORMANT_CEILINGS:
         tracks = _tracks_at(snd, times, voiced, ceiling)
         semitones = 12 * np.log2(tracks)
@@ -289,9 +344,18 @@ def formant_tracks(
     return best[2], best[1]
 
 
-def _tracks_at(snd: parselmouth.Sound, times: np.ndarray, frames: np.ndarray, ceiling: float) -> np.ndarray:
+def _tracks_at(
+    snd: parselmouth.Sound,
+    times: np.ndarray,
+    frames: np.ndarray,
+    ceiling: float,
+) -> np.ndarray:
+    """F1-F3 in Hz at `ceiling` on the given frames (Praat's Burg tracker), NaN elsewhere."""
+    # Five formants under the ceiling, Praat's standard setting; the first three are kept.
     formant = snd.to_formant_burg(
-        time_step=HOP / SR, max_number_of_formants=5, maximum_formant=float(ceiling)
+        time_step=HOP / SR,
+        max_number_of_formants=5,
+        maximum_formant=float(ceiling),
     )
     out = np.full((3, len(times)), np.nan)
     for i in frames:
@@ -328,7 +392,8 @@ def steadied(voice: Voice, ceiling: float | None) -> Voice:
     if ceiling is None or ceiling == voice.steady_ceiling:
         return voice
     out = replace(voice, steady=voice.at(ceiling), steady_ceiling=float(ceiling))
-    for name in ("embedding", "sounds", "sound"):  # already worked out; no need to run the models again
+    # Already worked out; no need to run the models again.
+    for name in ("embedding", "sounds", "sound"):
         if name in voice.__dict__:
             out.__dict__[name] = voice.__dict__[name]
     return out
