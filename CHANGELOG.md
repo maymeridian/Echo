@@ -4,10 +4,46 @@ This file lists the changes in each release of Echo, newest first.
 
 ## Unreleased
 
-The code and documentation are reorganised; behaviour is unchanged. Every
-saved take, trainer attempt and voice check was scored again from its audio
-with the previous and the new code, and every result and every API response
-was byte-identical. All 86 tests pass before and after.
+The code and documentation are reorganised, and the faults found while doing
+so are fixed. The reorganisation alone changed no behaviour: every saved take,
+trainer attempt and voice check was scored again from its audio with the
+previous and the new code, and every result and every API response was
+byte-identical, and all 86 tests passed before and after. Of the fixes, only
+the one for trainer attempts on regrouped words changes a saved result.
+
+### Fixes
+
+- Choosing a recording's speaker while it was still being processed could be
+  undone: the processing job rewrote the recording's `meta.json` from its own
+  copy. The job now writes only the fields it changed, and the server and the
+  job each read and write that file under a lock shared between the two
+  processes.
+- A trainer attempt made before a line's words were regrouped failed to be
+  scored again at every start. It is now measured against the unit that holds
+  it, the unit the page lists it under; one that no unit holds is left as it
+  is.
+- An attempt at a word with too little sound to measure was saved without its
+  length against the word, which every other attempt has.
+- Deleting a recording whose processing took over 10 s to stop returned a
+  server error; it now asks to try again in a moment.
+- Leaving the trimming page while its selection was playing kept the audio
+  playing.
+- Showing an earlier take from the line's history reported nothing when the
+  request failed, and could show the take on another line opened meanwhile.
+- "Next line" on a recording still being processed reported an internal
+  error; it now says the recording is still being processed.
+- Drawing the trimming page's waveform scanned the whole clip, up to 10
+  minutes, and looked up a colour for every pixel column at each move of a
+  slider; the peak is now found once and the colours once a drawing.
+- `tools/check_live_pitch.mjs` and `tools/check_live_resonance.mjs` failed or
+  printed "NaN" for a group with nothing to measure; they now print "n/a".
+- `tools/validate.py` broke ties between speakers by set order, which changes
+  from run to run; ties now go to the first. Its formant check also reports
+  the share of reference values a method gave no estimate for, which it
+  collected but did not print.
+- Two tests checked less than they claimed: one read a voice's line count
+  from before the upload it was checking, and one described a second
+  speaker's attempt at a word that it did not make. Both now check it.
 
 ### Code
 

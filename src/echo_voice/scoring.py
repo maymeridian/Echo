@@ -522,6 +522,8 @@ def word_drill(target: Voice, word: dict, attempt: Voice) -> dict:
         "resonance": None,
         "percent": None,
         "articulation": None,
+        # The attempt's length against the word's (at least 50 ms)
+        "duration": round(attempt.spoken_duration / max(0.05, word["end"] - word["start"]), 2),
     }
     if on.size < 3 or spoken.size < 3:
         return out | {"scores": dict.fromkeys(DRILL_PARTS), "voiced": False}
@@ -555,10 +557,9 @@ def word_drill(target: Voice, word: dict, attempt: Voice) -> dict:
     said = attempt.sound[path[:, 1]]
     out["articulation"] = round(float(steps[said].mean() if said.sum() >= 2 else steps.mean()), 3)
 
-    # 5. Scores, and the attempt's length against the word's (at least 50 ms)
+    # 5. Scores
     out["scores"] = _part_scores(out, DRILL_PARTS)
     out["voiced"] = voiced
-    out["duration"] = round(attempt.spoken_duration / max(0.05, word["end"] - word["start"]), 2)
     return out
 
 

@@ -80,11 +80,11 @@ console.log(
 );
 for (const [g, t] of Object.entries(totals)) {
   t.cents.sort((a, b) => a - b);
+  // A group with no frames, or none within 20% of the reference, has nothing to report.
+  const percent = (n, of) => (of ? `${((100 * n) / of).toFixed(2)}%` : "n/a");
   const median = t.cents[Math.floor(t.cents.length / 2)];
-  const gross = ((100 * t.gross) / t.both).toFixed(2);
-  const vde = ((100 * t.vde) / t.frames).toFixed(2);
-  const fine = median.toFixed(1);
-  console.log(
-    `  ${g.padEnd(7)} gross errors ${gross}%   voicing wrong ${vde}%   fine error ${fine} cents`,
-  );
+  const fine = median == null ? "n/a" : `${median.toFixed(1)} cents`;
+  const gross = percent(t.gross, t.both);
+  const vde = percent(t.vde, t.frames);
+  console.log(`  ${g.padEnd(7)} gross errors ${gross}   voicing wrong ${vde}   fine error ${fine}`);
 }

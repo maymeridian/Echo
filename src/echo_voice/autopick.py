@@ -119,8 +119,10 @@ def _cut(store: Store, recording: dict, row: dict):
 
 def _skip(store: Store, recording: dict, row: dict) -> None:
     """Remember a line that can't be used, so it isn't suggested again."""
-    skipped = sorted({*(store.source_meta(recording["id"]).get("skipped") or []), row["start"]})
-    store.update_source(recording["id"], skipped=skipped)
+    store.change_source(
+        recording["id"],
+        lambda meta: {"skipped": sorted({*(meta.get("skipped") or []), row["start"]})},
+    )
 
 
 # --- ADDING LINES ---

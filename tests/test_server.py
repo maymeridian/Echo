@@ -249,6 +249,13 @@ def test_takes_get_word_by_word_feedback_and_a_coach(tmp_path):
     assert mine["text"].lower().startswith("danger")
     assert mine["scores"]["resonance"] > 90 and mine["scores"]["pitch"] > 90
     assert client.post(drill, params={"word": 99}, content=wav(piece)).status_code == 404
+    # rms's own "Danger", cut where the take's word breakdown found it: 6.6 semitones lower
+    # and 15% darker when measured.
+    said = first["words"][k]
+    theirs, rate = sf.read(ARCTIC / "rms_arctic_a0001.wav", dtype="float32")
+    piece = theirs[int((said["take_start"] - 0.05) * rate) : int((said["take_end"] + 0.05) * rate)]
+    other = client.post(drill, params={"word": k}, content=wav(piece)).json()
+    assert other["pitch"] < -3 and other["percent"] < -5
 
     # 5. Both takes are kept with their parts and focus, and the list of lines sums them up.
     takes = client.get(f"/api/targets/{target['id']}/takes").json()
@@ -430,6 +437,8 @@ def test_a_pasted_link_makes_a_voice_named_after_the_video(tmp_path):
 
     from synth import compilation
 
+    from echo_voice.scoring import CHECK_LINES
+
     # 1. A compilation served over HTTP, to paste a link to.
     sf.write(tmp_path / "Voice lines.wav", compilation(), SR, subtype="PCM_16")
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
@@ -447,6 +456,9 @@ def test_a_pasted_link_makes_a_voice_named_after_the_video(tmp_path):
         voice = client.get(f"/api/voices/{meta['voice_id']}").json()
         assert voice["name"] == "Voice lines" and not voice["name_pending"]
         assert voice["named_from"] == "title"
+        assert (
+            voice["line_count"] == 4
+        )  # its best lines, picked (bdl's four; slt's is another voice)
 
         # 3. A name typed in is the voice's own, and the link stays with the voice.
         renamed = client.patch(f"/api/voices/{voice['id']}", json={"name": "Sally"}).json()
@@ -465,7 +477,9 @@ def test_a_pasted_link_makes_a_voice_named_after_the_video(tmp_path):
         not_a_link = client.patch(f"/api/sources/{upload['id']}", json={"link": "not a link"})
         assert not_a_link.status_code == 422
         wait_ready(client, upload["id"])
-        assert voice["line_count"] == 4  # its best lines, picked
+        # The upload's job tops the voice up to the lines a voice check uses.
+        topped_up = client.get(f"/api/voices/{voice['id']}").json()
+        assert topped_up["line_count"] == CHECK_LINES
     finally:
         web.shutdown()
 
@@ -656,6 +670,21 @@ def test_a_damaged_file_is_left_out_and_files_are_written_whole(tmp_path):
 
 
 # --- SCORING SAVED WORK AGAIN ---
+
+
+def test_a_trainer_attempt_finds_its_word_after_the_words_are_regrouped():
+    """An attempt is matched to the unit starting where its word did, else to the unit that
+    now holds that point, as the page does; its saved index no longer counts, as it can
+    point past the end once words are joined."""
+    from echo_voice.server import attempted_word
+
+    units = [
+        {"text": "The proper course", "start": 0.0, "end": 1.1},
+        {"text": "to pursue", "start": 1.1, "end": 1.8},
+    ]
+    assert attempted_word({"word": 0, "start": 1.11}, units) is units[1]  # starts there
+    assert attempted_word({"word": 5, "start": 0.6}, units) is units[0]  # "course", joined
+    assert attempted_word({"word": 2, "start": 2.5}, units) is None  # the line was cut
 
 
 def test_takes_from_an_earlier_scoring_are_scored_again(tmp_path):

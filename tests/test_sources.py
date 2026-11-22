@@ -275,6 +275,33 @@ def test_a_recording_from_before_speakers_gets_them_without_moving_its_lines(tmp
     assert all("speaker" in r for r in again) and store.source_meta(meta["id"])["speakers"] == 1
 
 
+def test_a_change_the_server_makes_while_the_job_runs_is_kept(tmp_path, monkeypatch):
+    """Choosing a speaker while the job is still working survives the job's own
+    writes to meta.json, which used to write its whole copy over it."""
+    # 1. A recording whose audio and lines are found already, so the job only sums them up.
+    store = Store(tmp_path / "data")
+    meta, folder = store.new_source("Two voices", file=str(tmp_path / "gone.wav"))
+    sf.write(folder / sources.AUDIO, np.zeros(2 * SR, dtype=np.float32), SR)
+    rows = [row("One.", 0.0, 1.0) | {"speaker": 0}, row("Two.", 1.0, 2.0) | {"speaker": 1}]
+    (folder / sources.LINES).write_text(json.dumps(rows), "utf-8")
+
+    # 2. The server chooses speaker 1 part-way through the job; picking lines is left out.
+    summary = sources.speaker_summary
+
+    def server_chooses_a_speaker(found):
+        """Stands in for the page choosing a speaker while the job sums up the lines."""
+        store.update_source(meta["id"], speaker=1)
+        return summary(found)
+
+    monkeypatch.setattr(sources, "speaker_summary", server_chooses_a_speaker)
+    monkeypatch.setattr("echo_voice.autopick.pick", lambda *args, **kwargs: None)
+
+    # 3. The job finishes, and the choice is still there.
+    assert sources.run(folder) == 0
+    after = store.source_meta(meta["id"])
+    assert after["status"] == "ready" and after["speaker"] == 1 and after["speakers"] == 2
+
+
 # --- NAMING A VOICE ---
 
 

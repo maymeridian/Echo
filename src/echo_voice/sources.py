@@ -39,6 +39,7 @@ import numpy as np
 import soundfile as sf
 
 from .analysis import HOP, PITCH_CEILING, PITCH_FLOOR, SR
+from .store import META_LOCK, _load, held
 
 MAX_HOURS = 4  # the longest recording taken
 # The files in a recording's folder.
@@ -697,7 +698,24 @@ def run(folder: Path, report=lambda step, share: None) -> int:
     if lock is None:
         return 0  # another process is already on it
     meta = json.loads((folder / META).read_text("utf-8"))
+    synced = dict(meta)  # meta.json as this job last read or wrote it
     last = [0.0]  # when the status was last written
+
+    def save() -> None:
+        """Write what the job changed in `meta` since it last wrote it onto
+        meta.json as it is now. The server changes the same file meanwhile (a
+        new speaker, a link), and those changes are kept; `meta` then holds
+        them too."""
+        nonlocal synced
+        with held(folder / META_LOCK):
+            current = _load(folder / META)
+            for key in synced.keys() - meta.keys():
+                current.pop(key, None)
+            current |= {k: v for k, v in meta.items() if k not in synced or synced[k] != v}
+            _write_meta(folder, current)
+        meta.clear()
+        meta.update(current)
+        synced = dict(current)
 
     def status(step: str, share: float | None = None, force: bool = False):
         """Write the job's step and how far through it is (0 to 1), at most
@@ -707,7 +725,7 @@ def run(folder: Path, report=lambda step, share: None) -> int:
             return
         last[0] = now
         meta.update(status=step, progress=None if share is None else round(share, 3))
-        _write_meta(folder, meta)
+        save()
         report(step, share)
 
     try:
@@ -782,12 +800,7 @@ def run(folder: Path, report=lambda step, share: None) -> int:
                     want = max(autopick.CHECK_LINES, have + 3)
 
                 def picked(done, total):
-                    """Report picking's progress, keeping the lines it skipped."""
-                    # Picking notes the lines it had to skip in this file. Keep them:
-                    # `meta` is written whole.
-                    skipped = store.source_meta(folder.name).get("skipped")
-                    if skipped:
-                        meta["skipped"] = skipped
+                    """Report picking's progress."""
                     status("picking", done / total)
 
                 autopick.pick(store, voice_id, want or autopick.CHECK_LINES, report=picked)

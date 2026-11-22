@@ -60,9 +60,15 @@ const median = (values) => {
   return sorted[sorted.length >> 1];
 };
 
-// The share of `values` that pass `test`, as a whole percentage, e.g. "42%".
+// The share of `values` that pass `test`, as a whole percentage, e.g. "42%"; "n/a" for none.
 function share(values, test) {
+  if (!values.length) return "n/a";
   return `${((100 * values.filter(test).length) / values.length).toFixed(0)}%`;
+}
+
+// A number to `digits` decimals; "n/a" when there is none (a median or correlation of nothing).
+function fixed(value, digits) {
+  return value == null || Number.isNaN(value) ? "n/a" : value.toFixed(digits);
 }
 
 // Pearson's correlation between two lists of numbers.
@@ -114,7 +120,7 @@ for (const k of [0, 1, 2]) {
   const errors = ref.files
     .map((f, i) => (live[i] ? Math.abs(live[i][k] / f.formants[k] - 1) * 100 : null))
     .filter((e) => e != null);
-  const middle = median(errors).toFixed(1);
+  const middle = fixed(median(errors), 1);
   const over5 = share(errors, (e) => e > 5);
   const over10 = share(errors, (e) => e > 10);
   console.log(`  F${k + 1}  median ${middle}% apart, over 5% in ${over5}, over 10% in ${over10}`);
@@ -165,13 +171,13 @@ for (const [key, label, measure] of WAYS) {
     .filter((r) => r.app != null && r.live != null);
   const apart = rows.map((r) => Math.abs(r.live - r.app));
   const way = rows.filter((r) => Math.abs(r.app) >= 3);
-  const correlation = pearson(rows.map((r) => r.live), rows.map((r) => r.app)).toFixed(3);
+  const correlation = fixed(pearson(rows.map((r) => r.live), rows.map((r) => r.app)), 3);
   const within3 = share(apart, (e) => e <= 3);
   const over6 = share(apart, (e) => e > 6);
   const rightWay = share(way, (r) => Math.sign(r.live) === Math.sign(r.app));
   console.log(`The gap between two speakers on one sentence (${rows.length} pairs), ${label}:`);
   console.log(
-    `  correlation ${correlation}; median ${median(apart).toFixed(1)} points apart, ` +
+    `  correlation ${correlation}; median ${fixed(median(apart), 1)} points apart, ` +
       `within 3 points in ${within3}, over 6 in ${over6}`,
   );
   console.log(
@@ -191,13 +197,13 @@ const gaps = ref.pairs
     app: 12 * Math.log2(ref.files[p.take].f0 / ref.files[p.target].f0),
   }));
 const off = gaps.map((g) => Math.abs(g.live - g.app));
-const pitchCorrelation = pearson(gaps.map((g) => g.live), gaps.map((g) => g.app)).toFixed(3);
+const pitchCorrelation = fixed(pearson(gaps.map((g) => g.live), gaps.map((g) => g.app)), 3);
 console.log(
   `The pitch gap between two speakers on one sentence (${gaps.length} pairs), ` +
     "live tracker against Praat:",
 );
 console.log(
-  `  correlation ${pitchCorrelation}; median ${median(off).toFixed(2)} semitones apart, ` +
+  `  correlation ${pitchCorrelation}; median ${fixed(median(off), 2)} semitones apart, ` +
     `over 1 semitone in ${share(off, (e) => e > 1)}`,
 );
 console.log(`${perFrame.toFixed(2)} ms of work per reading on this machine.`);

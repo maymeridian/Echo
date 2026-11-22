@@ -301,9 +301,13 @@ def validate_formants(root: Path, workers: int) -> None:
                 rel = np.abs(est[k][ok] / ref[k][ok] - 1)
                 for g in (group_name[name[0]], "all"):
                     err[method][g][k].extend(rel)
-                missing = np.sum((ref[k] > 0) & ~np.isfinite(est[k]))
+                # Reference values the method gave no estimate for: left out of the
+                # errors above, so they are reported on their own.
+                has = int(np.sum(ref[k] > 0))
+                missing = int(np.sum((ref[k] > 0) & ~np.isfinite(est[k])))
                 for g in (group_name[name[0]], "all"):
                     err[method][g][f"missing{k}"].append(missing)
+                    err[method][g][f"reference{k}"].append(has)
 
     # 3. The table.
     print(
@@ -321,6 +325,10 @@ def validate_formants(root: Path, workers: int) -> None:
                 a = np.array(groups[g][k])
                 cells.append(f"{np.median(a):6.1%} / {np.mean(a > 0.15):5.1%}")
             print(f"{method:34s} {g:9s}" + "".join(f"{c:>17s}" for c in cells))
+        # The share of reference values with no estimate, over all vowels.
+        every = groups["all"]
+        gaps = [sum(every[f"missing{k}"]) / max(1, sum(every[f"reference{k}"])) for k in range(3)]
+        print(f"{method:34s} {'no value':9s}" + "".join(f"{x:>17.1%}" for x in gaps))
         print()
     for g, c in chosen.items():
         print(
@@ -1451,7 +1459,7 @@ def _who_is_who(rows: list[dict], found: list[dict]) -> dict:
     truth = {}
     for s in found:
         names = [r["who"] for r in rows if r["speaker"] == s["speaker"]]
-        truth[s["speaker"]] = max(set(names), key=names.count)
+        truth[s["speaker"]] = max(dict.fromkeys(names), key=names.count)
     return truth
 
 
@@ -1616,7 +1624,7 @@ def validate_speakers_wild(vox: Path, workers: int, trials: int = 30) -> None:
 def plan_main(plan):
     """The speaker with the most sentences in a simulated recording."""
     names = [name for name, _ in plan]
-    return max(set(names), key=names.count)
+    return max(dict.fromkeys(names), key=names.count)
 
 
 # --- COMMAND LINE ---

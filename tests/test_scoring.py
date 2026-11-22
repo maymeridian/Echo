@@ -250,6 +250,20 @@ def test_one_word_against_the_same_word_says_which_way_to_move():
     assert higher["pitch"] == pytest.approx(3.86, abs=0.4) and higher["scores"]["pitch"] < 40
 
 
+def test_an_attempt_at_a_word_with_too_little_sound_has_every_field():
+    """A word span with too little sound to measure still gives the attempt's length
+    against it, like any other attempt: the page reads it for every attempt."""
+    from echo_voice.scoring import word_drill
+
+    target = analyze(voice())
+    attempt = analyze(voice()[: int(0.45 * 16000)])
+    beyond = {"text": "gone", "start": 50.0, "end": 50.4}  # past the end of the target
+    measured = word_drill(target, VOWEL_TIMES[0], attempt)
+    empty = word_drill(target, beyond, attempt)
+    assert empty.keys() == measured.keys() and not empty["voiced"]
+    assert empty["duration"] == pytest.approx(attempt.spoken_duration / 0.4, abs=0.01)
+
+
 def test_a_target_with_an_unreliable_pitch_is_scored_without_pitch_and_melody():
     """A target whose pitch can't be trusted is scored without pitch and melody, and says why."""
     target, take = analyze(voice()), analyze(voice(f0=240))  # an octave apart

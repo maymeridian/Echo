@@ -26,8 +26,10 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +41,8 @@ from .analysis import SR, AnalysisError, Voice, analyze, load
 # Ids come straight from URLs: letters, digits and hyphens only, so a path built from one
 # stays inside its folder.
 _ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+# Held while a recording's meta.json is read, changed and written (held).
+META_LOCK = "meta.lock"
 
 
 # --- FILES ---
@@ -73,6 +77,43 @@ def _load(path: Path):
             if attempt == 39:
                 raise
             time.sleep(0.025)
+
+
+@contextmanager
+def held(path: Path, seconds: float = 5.0):
+    """Hold an operating-system lock on `path` (created if missing), shared
+    between processes. The server and a recording's job (a separate process)
+    both change the recording's meta.json; each reads, changes and writes it
+    while holding the lock, so neither writes over a change the other made in
+    between. Waits up to `seconds` for the other to let go (each holds it for
+    milliseconds), then raises TimeoutError."""
+    handle = open(path, "a+b")  # noqa: SIM115 (the lock lasts as long as the handle)
+    try:
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path} stayed locked for {seconds} s") from exc
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()  # closing also lets go of the lock
 
 
 def _listed(paths) -> list:
@@ -305,9 +346,17 @@ class Store:
 
     def update_source(self, source_id: str, **fields) -> dict:
         """Set some of the recording's fields; returns its whole meta as it now is."""
-        with self.lock:
-            meta = self.source_meta(source_id) | fields
-            _write(self.source_dir(source_id) / "meta.json", json.dumps(meta, indent=2))
+        return self.change_source(source_id, lambda meta: fields)
+
+    def change_source(self, source_id: str, change) -> dict:
+        """Set the fields `change(meta)` returns from the recording's meta as it
+        is now, read and written in one step: its job may be writing the same
+        file from another process (held). Returns the whole meta."""
+        folder = self.source_dir(source_id)
+        with self.lock, held(folder / META_LOCK):
+            meta = self.source_meta(source_id)
+            meta |= change(meta)
+            _write(folder / "meta.json", json.dumps(meta, indent=2))
             return meta
 
     def list_sources(self) -> list[dict]:

@@ -753,6 +753,8 @@ function leave() {
   page++;
   stopPlayback();
   stopLinePlayback();
+  stopTrimPlayback();
+  trimming = null;
   // A take, a warm-up or a clip left part-way is kept nowhere: it belonged to
   // the page being left.
   if (session) stopRecording({ discard: true });
@@ -2044,7 +2046,7 @@ async function deleteSource() {
 // --- TRIM PAGE ---
 // Trimming a new clip to the line.
 
-let trimming = null; // { samples, name, back, extra }
+let trimming = null; // { samples, peak, name, back, extra }
 let trimPlayer = null; // the AudioContext playing the selection
 
 // Open a clip to trim. `start` and `end` preselect a part; `back` is the page
@@ -2063,7 +2065,11 @@ async function openTrim(
   const seconds = samples.length / SR;
   stopLinePlayback();
   stopPlayback();
-  trimming = { samples, name, back, extra };
+  // The waveform is drawn to the clip's own peak, so a soft-spoken or whispered
+  // voice is visible. Found once: a clip can be ten minutes long.
+  let peak = 1e-3;
+  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+  trimming = { samples, peak, name, back, extra };
   for (const id of ["#trim-start", "#trim-end"]) $(id).max = seconds.toFixed(2);
   $("#trim-start").value = start.toFixed(2);
   $("#trim-end").value = Math.min(end ?? seconds, start + MAX_SECONDS, seconds).toFixed(2);
@@ -2097,7 +2103,7 @@ function renderTrim() {
 /** The clip's waveform, with the selection from a to b seconds in the accent colour. */
 function drawWave(a, b) {
   const canvas = $("#trim-wave");
-  const { samples } = trimming;
+  const { samples, peak } = trimming;
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -2108,10 +2114,10 @@ function drawWave(a, b) {
   g.scale(dpr, dpr);
   const seconds = samples.length / SR;
   const per = Math.max(1, Math.floor(samples.length / w));
-  // Drawn to the clip's own peak, so a soft-spoken or whispered voice is visible.
-  let peak = 1e-3;
-  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
   const gain = 0.95 / peak;
+  // The colours, looked up once a drawing rather than once a column.
+  const inside = css("--accent");
+  const outside = css("--line");
   for (let x = 0; x < w; x++) {
     let lo = 0;
     let hi = 0;
@@ -2120,7 +2126,7 @@ function drawWave(a, b) {
       hi = Math.max(hi, samples[i]);
     }
     const t = (x / w) * seconds;
-    g.fillStyle = css(t >= a && t <= b ? "--accent" : "--line");
+    g.fillStyle = t >= a && t <= b ? inside : outside;
     g.fillRect(x, h / 2 - (hi * gain * h) / 2, 1, Math.max(1, ((hi - lo) * gain * h) / 2));
   }
 }
@@ -3083,10 +3089,12 @@ function renderPlateau() {
 async function nextLine(sourceId) {
   try {
     const rec = await api(`/api/sources/${sourceId}`);
+    // A recording has no lines until its processing is done.
+    if (!rec.lines) return setStatus("That recording is still being processed.");
     // Whether a line of it isn't added yet.
     const fresh = (line) => !practised(line, rec);
     const pick =
-      rec.suggested.map((i) => rec.lines[i]).find(fresh) ??
+      (rec.suggested ?? []).map((i) => rec.lines[i]).find(fresh) ??
       rec.lines.find((l) => !l.flags.length && fresh(l));
     if (!pick) return setStatus("You've added every clear line of this recording.");
     await practiseLine(pick, rec);
@@ -4356,7 +4364,14 @@ function renderHistory() {
       button.setAttribute("aria-current", String(take.id === shown?.id));
       button.onclick = async () => {
         stopPlayback();
-        setShown(await api(`/api/targets/${current.id}/takes/${take.id}`));
+        const line = current.id;
+        try {
+          const full = await api(`/api/targets/${line}/takes/${take.id}`);
+          // Only onto the line it belongs to, should another page have opened meanwhile.
+          if (current?.id === line) setShown(full);
+        } catch (err) {
+          setStatus(err.message, true);
+        }
       };
       return button;
     }),

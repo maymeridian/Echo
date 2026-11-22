@@ -80,6 +80,19 @@ def number(body: dict, key: str, default, kind=int):
         raise HTTPException(422, f"`{key}` must be a number.") from exc
 
 
+def attempted_word(record: dict, timed: list[dict]) -> dict | None:
+    """The unit of the line a trainer attempt was at, found by where it starts:
+    the unit starting there (within 0.02 s), else the one that holds that point,
+    as the page assigns attempts. A line's units can be regrouped after an
+    attempt, so its saved index may point elsewhere or past the end. None when
+    no unit holds it."""
+    start = record.get("start", -1)
+    exact = next((w for w in timed if abs(w["start"] - start) < 0.02), None)
+    if exact is not None:
+        return exact
+    return next((w for w in timed if w["start"] - 0.02 <= start < w["end"]), None)
+
+
 def create_app(
     data_dir: str | Path | None = None,
     hosts: tuple[str, ...] | None = LOCAL_HOSTS,
@@ -234,12 +247,11 @@ def create_app(
                 ceiling = pair_ceiling(meta["id"])
                 target = steady_target(meta["id"], ceiling)
                 _, timed = target_words(meta["id"], target)
-                # The word it was an attempt at: by where it starts (within 0.02 s), should
-                # the words have been regrouped since, else by its place in the line.
-                start = record.get("start", -1)
-                word = next((w for w in timed if abs(w["start"] - start) < 0.02), None)
-                if not word:
-                    word = timed[record["word"]]
+                word = attempted_word(record, timed)
+                if word is None:
+                    # The line's words were regrouped and no unit holds this
+                    # attempt any more; the page doesn't show it either.
+                    continue
                 audio = load(store.drill_audio(meta["id"], record["id"]))
                 attempt = analyze(audio, ceiling, trim=False)
                 result = word_drill(target, word, attempt)
@@ -910,7 +922,14 @@ def create_app(
                 subprocess.run(kill, capture_output=True, check=False)
             else:
                 job.terminate()
-            job.wait(timeout=10)
+            try:
+                job.wait(timeout=10)
+            except subprocess.TimeoutExpired as exc:
+                jobs[source_id] = job  # still ours, still stopping
+                raise HTTPException(
+                    409,
+                    "That recording's processing is still stopping; try again in a moment.",
+                ) from exc
         if sources.job_running(folder):
             raise HTTPException(
                 409,

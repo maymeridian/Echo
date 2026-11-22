@@ -693,7 +693,6 @@ button.brand:hover h1 { color: var(--accent); }
 .drill-track .mark.now { background: var(--panel); border: 3px solid var(--accent); box-shadow: none; transition: left 0.1s linear; }
 .live-res { margin-top: 8px; max-width: 520px; }
 .live-res .zone { left: 43.4%; width: 13.2%; } /* within 3.3%: where a word scores 90 or more */
-.pill.on { border-color: var(--accent); color: var(--accent); }
 
 /* --- MICROPHONE BOX AND VERSION --- */
 
