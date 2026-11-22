@@ -15,9 +15,10 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import lfilter
 
-SR = 16000
+SR = 16000  # Hz, the rate Echo analyses at
+# F1, F2 and F3 in Hz of the four synthetic vowels: near /a/, /i/, /u/ and a neutral one.
 VOWELS = [(700, 1200, 2600), (300, 2300, 3000), (350, 800, 2400), (500, 1500, 2500)]
-ARCTIC = Path(__file__).parent / "data" / "arctic"
+ARCTIC = Path(__file__).parent / "data" / "arctic"  # the CMU ARCTIC test clips
 
 
 def voice(

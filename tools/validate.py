@@ -604,6 +604,7 @@ def report_vcc(path: Path, extra: dict[str, dict] | None = None) -> None:
 
     from scipy.stats import pearsonr, spearmanr
 
+    # 1. The scored pairs, and the measures to correlate with the ratings.
     rows = [json.loads(line) for line in Path(path).read_text("utf-8").splitlines()]
     measures = ["overall", "identity"] + sorted(k for k in rows[0] if k.startswith("score_"))
     values = {m: [r[m] for r in rows] for m in measures}
@@ -639,6 +640,8 @@ def report_vcc(path: Path, extra: dict[str, dict] | None = None) -> None:
             ys.append(np.average([rows[i]["rating"] for i in g], weights=w))
         return spearmanr(xs, ys)[0], pearsonr(xs, ys)[0], len(xs)
 
+    # 2. The table: each measure over all pairs, the converted ones, the converted ones
+    # against their target, and per system.
     conv = [i for i, r in enumerate(rows) if r["kind"] == "converted"]
     conv_t = [i for i in conv if rows[i]["against"] == "target"]
     print(f"{len(rows)} pairs ({len(conv)} converted, {len(rows) - len(conv)} natural).")
@@ -1688,6 +1691,7 @@ Each prints the current method next to the alternatives that were considered.
 
 def main() -> None:
     """Run the check named on the command line."""
+    # 1. The checks and their options.
     parser = argparse.ArgumentParser(
         description=HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1737,6 +1741,7 @@ def main() -> None:
     )
     for s in (p, f, fl, v, vf, ve, li, cl, ov, sp):
         s.add_argument("--workers", type=int, default=8)
+    # 2. Run the one asked for.
     args = parser.parse_args()
     if args.command == "speakers":
         validate_speakers(args.vcc, args.workers)

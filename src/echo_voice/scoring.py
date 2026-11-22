@@ -414,6 +414,7 @@ def compare(
 
 # --- WORD BY WORD ---
 
+# The parts read word by word; Voice and Rhythm need the whole line.
 WORD_PARTS = ("pitch", "melody", "resonance", "articulation")
 MIN_WORD_FRAMES = 5  # aligned voiced frames before a word's pitch or formants count
 
@@ -498,6 +499,7 @@ def word_breakdown(target: Voice, take: Voice, m: Measures, word_times: list[dic
 
 # --- TRAINING ONE PART ON ONE WORD ---
 
+# The parts the trainer measures on one word: Melody and Rhythm need more than one.
 DRILL_PARTS = ("resonance", "pitch", "articulation")
 
 
@@ -565,6 +567,8 @@ def word_drill(target: Voice, word: dict, attempt: Voice) -> dict:
 
 # --- COACHING: ONE THING AT A TIME ---
 
+# The parts the coach can make the focus. Voice is not one: it follows from the
+# others and has no exercise of its own.
 FOCUSABLE = ("pitch", "melody", "resonance", "articulation", "rhythm")
 GOOD_ENOUGH = 80  # a part at or above this stops being the focus
 STAY = 0.6  # keep the last focus while its gain is at least this share of the biggest

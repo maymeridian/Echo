@@ -428,6 +428,7 @@ class Store:
         scored; `original` (samples at SR) is the upload as it came, kept for
         reference. `source`, `voice_name` and `line_start` say which
         recording's line it came from, if any."""
+        # 1. The line's meta.
         meta = {
             "id": secrets.token_hex(6),
             "name": name,
@@ -446,6 +447,7 @@ class Store:
             "takes": 0,
             "best": None,
         }
+        # 2. Its folder and audio, then its meta.json, which makes it a line.
         path = self.root / meta["id"]
         (path / "takes").mkdir(parents=True)
         sf.write(path / "target.wav", voice.y, SR, subtype="PCM_16")

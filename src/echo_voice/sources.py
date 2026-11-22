@@ -54,6 +54,8 @@ MAX_LINE = 10.0  # s; longer stretches are split near the middle
 MIN_PIECE = 1.5  # s; neither half of a split may be shorter
 MIN_LINE = 0.6  # s; shorter lines ("Hm.") are dropped
 LEAD, TAIL = 0.2, 0.35  # s added before the first word and after the last
+# A word that ends a sentence (. ? ! or …) or a clause (, ; : or a dash), either
+# followed by closing quotes or brackets.
 SENTENCE_END = re.compile(r"[.?!…]['\"’”)\]]*$")
 CLAUSE_END = re.compile(r"[,;:—–-]['\"’”)\]]*$")
 
@@ -193,6 +195,7 @@ def decode(path: Path, out: Path, progress=lambda share: None) -> float:
     of audio never sit in memory twice. Returns the length in seconds."""
     import av
 
+    # 1. Open the file, and check that it has sound and is not too long.
     try:
         container = av.open(str(path))
     except Exception as exc:  # PyAV raises a family of FFmpeg errors
@@ -204,7 +207,8 @@ def decode(path: Path, out: Path, progress=lambda share: None) -> float:
         total = container.duration / 1e6 if container.duration else None
         if total and total > MAX_HOURS * 3600:
             raise SourceError(f"That recording is over {MAX_HOURS} hours long.")
-        # Keep the channels and average them here: FFmpeg's stereo-to-mono
+        # 2. Decode it a block at a time into 16 kHz mono FLAC. Keep the channels and
+        # average them here: FFmpeg's stereo-to-mono
         # matrix adds the channels at 0.71 each, which can clip.
         resampler = av.AudioResampler(format="fltp", rate=SR)
         written = 0
@@ -227,6 +231,7 @@ def decode(path: Path, out: Path, progress=lambda share: None) -> float:
                 if written < SR:  # a damaged tail is fine; a file that won't start isn't
                     raise SourceError("Couldn't read that file as audio or video.") from exc
             write(resampler.resample(None))
+    # 3. Check the length of what was read.
     if written < SR:
         raise SourceError("That recording is under a second long.")
     if written > MAX_HOURS * 3600 * SR:

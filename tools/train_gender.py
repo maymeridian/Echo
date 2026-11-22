@@ -24,9 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]  # the repository
 CACHE = ROOT / "cache"  # where the corpora are downloaded
-OUT = ROOT / "src" / "echo_voice" / "gender_model.json"
+OUT = ROOT / "src" / "echo_voice" / "gender_model.json"  # the model this writes
 
 
 def _low_priority():

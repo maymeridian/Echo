@@ -121,12 +121,15 @@ function roots(c) {
   const m = c.length - 1;
   const re = new Float64Array(m);
   const im = new Float64Array(m);
-  // The first guesses: spread round a circle of radius 0.9, turned 0.4 rad so none is real.
+  // 1. The first guesses: spread round a circle of radius 0.9, turned 0.4 rad so none
+  //    is real.
   for (let k = 0; k < m; k++) {
     const angle = (2 * Math.PI * k) / m + 0.4;
     re[k] = 0.9 * Math.cos(angle);
     im[k] = 0.9 * Math.sin(angle);
   }
+  // 2. Move each guess by the polynomial there over its distances to the others, until
+  //    none moves.
   for (let round = 0; round < 300; round++) {
     let moved = 0;
     for (let i = 0; i < m; i++) {

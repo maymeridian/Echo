@@ -321,7 +321,9 @@ def test_a_links_voice_is_named_after_its_channel_and_a_second_video_joins_it(tm
         """Paste a link to a video: a voice waiting for a name, then named as the job names it."""
         voice = store.update_voice(store.new_voice("New voice")["id"], name_pending=True)
         meta, folder = store.new_source(
-            sources.clean_title(title), link="https://example.com/v", status="downloading"
+            sources.clean_title(title),
+            link="https://example.com/v",
+            status="downloading",
         )
         meta = store.update_source(meta["id"], voice_id=voice["id"], channel=channel, title=title)
         sources._name_voice(folder, meta)

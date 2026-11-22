@@ -31,10 +31,16 @@ from validate import voxsim_pairs
 from echo_voice import similarity
 from echo_voice.analysis import MAX_SECONDS, SR, AnalysisError, analyze, load
 
+# --- SETTINGS ---
+
+# The model this writes, shipped with the app.
 OUT = Path(__file__).parents[1] / "src" / "echo_voice" / "similarity_model.json"
 # Which way each feature may move the predicted rating (similarity.FEATURES): up with embedding
 # similarity, down with the pitch gap and each formant gap.
 MONOTONIC = [1, -1, -1, -1, -1]
+
+
+# --- MEASURING THE CLIPS ---
 
 
 def _low_priority():
@@ -89,6 +95,9 @@ def table(pairs, clips, audio: Path):
     return np.array(X), np.array(y), np.array(same)
 
 
+# --- THE MODEL AS JSON ---
+
+
 def export(model) -> dict:
     """The fitted trees as plain lists. Leaf values already include the
     learning rate in scikit-learn's HistGradientBoostingRegressor."""
@@ -107,6 +116,9 @@ def export(model) -> dict:
             }
         )
     return {"baseline": float(np.ravel(model._baseline_prediction)[0]), "trees": trees}
+
+
+# --- CHOOSING THE SETTINGS ---
 
 
 def _speaker(clip: str) -> str:
@@ -159,6 +171,8 @@ def tune(train: list[dict], clips, audio: Path) -> dict:
     )
     return best[1]
 
+
+# --- COMMAND LINE ---
 
 # The --help text.
 HELP = """Train the listener-similarity model (src/echo_voice/similarity.py) on VoxSim.

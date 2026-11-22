@@ -23,6 +23,8 @@ import numpy as np
 
 from .models import fetch
 
+# The vocal separation model (UVR-MDX-NET Voc_FT, run by sherpa-onnx), where it is
+# published, and its SHA-256, checked before it is used (models.fetch).
 MODEL_NAME = "UVR-MDX-NET-Voc_FT.onnx"
 MODEL_URL = (
     f"https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/{MODEL_NAME}"

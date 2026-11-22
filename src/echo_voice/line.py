@@ -25,7 +25,7 @@ import numpy as np
 
 # --- THE RECOGNISER ---
 
-MODEL = "base.en"
+MODEL = "base.en"  # Whisper's English base model: about 30 s for 25 minutes on a CPU
 # Beam search at temperature 0 only. faster-whisper's default
 # retries an unsure pass with random sampling at rising temperatures, which
 # made the same audio come back differently from run to run (4 transcripts in

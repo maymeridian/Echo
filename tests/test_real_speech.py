@@ -16,7 +16,7 @@ from calibrate import channel
 
 from echo_voice import analyze, compare, identity, load
 
-DATA = Path(__file__).parent / "data" / "arctic"
+DATA = Path(__file__).parent / "data" / "arctic"  # the CMU ARCTIC test clips
 
 
 @pytest.fixture(scope="module")

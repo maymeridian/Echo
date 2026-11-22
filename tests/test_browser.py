@@ -31,7 +31,10 @@ def server(tmp_path):
         port = s.getsockname()[1]
     srv = uvicorn.Server(
         uvicorn.Config(
-            create_app(tmp_path / "data"), host="127.0.0.1", port=port, log_level="warning"
+            create_app(tmp_path / "data"),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
         )
     )
     thread = threading.Thread(target=srv.run, daemon=True)
@@ -45,6 +48,7 @@ def server(tmp_path):
 
 def open_page(tmp_path, samples):
     """A page in headless Edge or Chrome whose microphone plays `samples` in a loop."""
+    # 1. The microphone: a file the browser plays as one.
     mic = tmp_path / "mic.wav"
     sf.write(mic, samples, SR, subtype="PCM_16")
     args = [
@@ -53,6 +57,7 @@ def open_page(tmp_path, samples):
         f"--use-file-for-fake-audio-capture={mic}",
     ]
     with sync_api.sync_playwright() as p:
+        # 2. Edge, or Chrome if Edge is not installed.
         browser = None
         for channel in ("msedge", "chrome"):
             try:
@@ -62,6 +67,7 @@ def open_page(tmp_path, samples):
                 continue
         if browser is None:
             pytest.skip("neither Edge nor Chrome is installed")
+        # 3. A page that records every error, and answers every dialog.
         context = browser.new_context(permissions=["microphone"])
         page = context.new_page()
         page.errors = []
@@ -77,7 +83,8 @@ def open_page(tmp_path, samples):
                 dialog.accept()
 
         page.on("dialog", answer)
-        # Every time the page asks the browser for a microphone, and which one it asked for.
+        # 4. Every time the page asks the browser for a microphone, and which one it asked
+        # for.
         page.add_init_script(
             "window.micAsks = [];"
             " const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);"
@@ -174,7 +181,8 @@ def warm_up(page) -> None:
     page.click("#warmup")
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warming up')")
     page.wait_for_function(
-        "document.querySelector('#live-text').textContent.startsWith('You:')", timeout=10000
+        "document.querySelector('#live-text').textContent.startsWith('You:')",
+        timeout=10000,
     )
     page.click("#warmup")
     page.wait_for_function(
@@ -268,11 +276,13 @@ def test_a_long_clip_is_trimmed_to_the_line(server, page, tmp_path):
 
     # 2. 40 s is too long; 2 s to 8 s will do.
     page.eval_on_selector(
-        "#trim-end", "e => { e.value = 40; e.dispatchEvent(new Event('input')); }"
+        "#trim-end",
+        "e => { e.value = 40; e.dispatchEvent(new Event('input')); }",
     )
     assert page.is_disabled("#trim-use")
     page.eval_on_selector(
-        "#trim-start", "e => { e.value = 2; e.dispatchEvent(new Event('input')); }"
+        "#trim-start",
+        "e => { e.value = 2; e.dispatchEvent(new Event('input')); }",
     )
     page.eval_on_selector("#trim-end", "e => { e.value = 8; e.dispatchEvent(new Event('input')); }")
     assert "6.0 s selected" in page.text_content("#trim-len")
@@ -334,7 +344,8 @@ def test_a_long_recording_becomes_lines_to_add_to_the_voice(server, page, tmp_pa
     page.fill("#line-search", "")
     page.click("#lines .line-item:first-child .play")
     page.wait_for_function(
-        "document.querySelector('#lines .play').textContent === '▶'", timeout=10000
+        "document.querySelector('#lines .play').textContent === '▶'",
+        timeout=10000,
     )
 
     # 4. A line not added yet opens in the trimmer; one added already opens to practise.
@@ -422,7 +433,8 @@ def test_a_long_recording_becomes_lines_to_add_to_the_voice(server, page, tmp_pa
     for n in (2, 3, 4):
         record(page, "#record", fresh=True)
         page.wait_for_function(
-            f"document.querySelectorAll('#takes button').length === {n}", timeout=30000
+            f"document.querySelectorAll('#takes button').length === {n}",
+            timeout=30000,
         )
     page.wait_for_selector("#plateau:not([hidden])")
     assert page.is_visible("#ladder-best")
@@ -516,7 +528,8 @@ def test_warming_up_shows_live_pitch_and_saves_nothing(server, page, tmp_path):
     page.click("#warmup")
     page.wait_for_function("document.querySelector('#status').textContent.startsWith('Warming up')")
     page.wait_for_function(
-        "document.querySelector('#live-text').textContent.startsWith('You:')", timeout=10000
+        "document.querySelector('#live-text').textContent.startsWith('You:')",
+        timeout=10000,
     )
     # Resonance shows live too, read in the browser. The microphone plays the
     # target's own vowels at another pitch, so it sits close to level.
@@ -588,7 +601,8 @@ def test_a_pasted_link_becomes_a_voice_and_its_speakers_are_told_apart(server, p
         # 4. Make the voice slt instead: Echo's picks of bdl give way to hers.
         speakers.nth(1).locator("button:has-text('Use this one')").click()
         page.wait_for_function(
-            "document.querySelectorAll('#voice-lines .vline').length === 3", timeout=60000
+            "document.querySelectorAll('#voice-lines .vline').length === 3",
+            timeout=60000,
         )
         assert "This voice" in page.locator("#speakers-card .speaker").nth(1).text_content()
 
@@ -630,7 +644,8 @@ def test_the_trainer_follows_your_voice_live_and_keeps_nothing(server, page):
     # microphone's pitch and resonance, read in the browser.
     page.click("#train-try")
     page.wait_for_function(
-        "document.querySelector('#train-live').textContent.startsWith('Now:')", timeout=15000
+        "document.querySelector('#train-live').textContent.startsWith('Now:')",
+        timeout=15000,
     )
     page.wait_for_function(
         "/brighter|darker|level/.test(document.querySelector('#train-live').textContent)",
@@ -650,7 +665,8 @@ def test_the_trainer_follows_your_voice_live_and_keeps_nothing(server, page):
     # 4. A scored attempt shows the ring while it records, then the server's dot.
     page.click("#train-say")
     page.wait_for_function(
-        "document.querySelector('#train-live').textContent.startsWith('Now:')", timeout=15000
+        "document.querySelector('#train-live').textContent.startsWith('Now:')",
+        timeout=15000,
     )
     assert page.is_disabled("#train-try")
     page.wait_for_timeout(1500)
@@ -684,10 +700,12 @@ def test_the_microphone_is_opened_once_chosen_once_and_remembered(server, page, 
     page.select_option("#mic-select", index=1)
     chosen = page.input_value("#mic-select")
     page.wait_for_function(
-        "document.querySelector('#mic-note').textContent.startsWith('Say something')", timeout=10000
+        "document.querySelector('#mic-note').textContent.startsWith('Say something')",
+        timeout=10000,
     )
     page.wait_for_function(
-        "parseFloat(document.querySelector('#mic-level').style.width) > 0", timeout=10000
+        "parseFloat(document.querySelector('#mic-level').style.width) > 0",
+        timeout=10000,
     )
     assert page.evaluate("window.micAsks") == [None, chosen]
     assert page.evaluate("localStorage.getItem('echo.mic')") == chosen
@@ -728,7 +746,8 @@ def test_a_microphone_that_hears_nothing_is_called_out(server, silent_page, tmp_
     # 2. The test button says so too, and the box asks for attention.
     page.click("#mic-test")
     page.wait_for_function(
-        "document.querySelector('#mic-note').textContent.startsWith('Say something')", timeout=10000
+        "document.querySelector('#mic-note').textContent.startsWith('Say something')",
+        timeout=10000,
     )
     page.wait_for_timeout(500)
     page.click("#mic-test")
@@ -815,7 +834,8 @@ def test_a_trainer_attempt_stops_by_itself(server, pausing_page):
     page.wait_for_function("document.querySelector('#train-say-label').textContent === 'Stop'")
     # The voice lasts 1.8 s. The attempt ends well before the 6 s it is allowed.
     page.wait_for_function(
-        "document.querySelector('#train-say-label').textContent === 'Say it'", timeout=4500
+        "document.querySelector('#train-say-label').textContent === 'Say it'",
+        timeout=4500,
     )
     page.wait_for_selector("#train-attempts li", timeout=20000)
     assert len(httpx.get(f"{server}/api/targets/{line['id']}/drills").json()) == 1
@@ -875,19 +895,22 @@ def test_hearing_the_end_of_a_line(server, page):
 
     # 3. Speaking from the first moment, with no quiet before it to measure the room by.
     heard = page.evaluate(
-        run, {"lead": 0, "speech": 2.0, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.0}
+        run,
+        {"lead": 0, "speech": 2.0, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.0},
     )
     assert not heard["early"] and 1.0 <= heard["after"] < 1.15, heard
 
     # 4. A false start: half a second of a three-second line. It waits longer before giving up.
     heard = page.evaluate(
-        run, {"lead": 0.5, "speech": 0.5, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.5}
+        run,
+        {"lead": 0.5, "speech": 0.5, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 1.5},
     )
     assert not heard["early"] and 2.5 <= heard["after"] < 2.65, heard
 
     # 5. A click is not speech: nothing ends on it.
     heard = page.evaluate(
-        run, {"lead": 0.5, "speech": 0.1, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 0}
+        run,
+        {"lead": 0.5, "speech": 0.1, "room": 0.0005, "voice": 0.1, "wait": 1.0, "enough": 0},
     )
     assert not heard["early"] and heard["after"] is None, heard
 

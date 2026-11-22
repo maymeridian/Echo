@@ -534,11 +534,10 @@ function renderMic() {
   const chosen = stored.get("echo.mic") || "";
   const name = stored.get("echo.mic.label");
   const options = [el("option", { value: "", textContent: "The browser's choice" })];
-  mic.devices.forEach((d, i) =>
-    options.push(
-      el("option", { value: d.deviceId, textContent: d.label || `Microphone ${i + 1}` }),
-    ),
-  );
+  mic.devices.forEach((d, i) => {
+    const label = d.label || `Microphone ${i + 1}`;
+    options.push(el("option", { value: d.deviceId, textContent: label }));
+  });
   // The chosen one stays listed while the browser isn't naming its microphones
   // (before it's allowed) or it's unplugged.
   if (chosen && !mic.devices.some((d) => d.deviceId === chosen)) {
@@ -825,15 +824,17 @@ function renderHome() {
             `Add ${v.min_check_lines - v.line_count} more for a voice check.`;
       const since =
         v.previous != null ? `, ${delta(v.score, v.previous)} since the check before` : "";
-      const score =
-        v.score == null
-          ? el("p", { className: "fine", textContent: unscored })
-          : el(
-              "p",
-              { className: "voice-card-score" },
-              el("b", { textContent: Math.round(v.score) }),
-              ` voice score${since}`,
-            );
+      let score;
+      if (v.score == null) {
+        score = el("p", { className: "fine", textContent: unscored });
+      } else {
+        score = el(
+          "p",
+          { className: "voice-card-score" },
+          el("b", { textContent: Math.round(v.score) }),
+          ` voice score${since}`,
+        );
+      }
       const from = v.recording_count ? ` from ${plural(v.recording_count, "recording")}` : "";
       return el(
         "div",
@@ -976,10 +977,12 @@ async function addRecordingLink(s) {
 
 // Recordings with more than one speaker: who they are, and which one the voice is.
 function renderSpeakers() {
+  // 1. The recordings with more than one speaker; the card shows only if there are any.
   const multi = voice.recordings.filter((s) => s.status === "ready" && s.speakers?.length > 1);
   $("#speakers-card").hidden = !multi.length;
   $("#speakers-card").replaceChildren(
     ...multi.map((s) => {
+      // 2. A row per speaker: play a sample, and use it or make it a voice of its own.
       const rows = s.speakers.map((sp) => {
         const play = el("button", { type: "button", className: "play", textContent: "▶" });
         play.setAttribute("aria-label", `Play speaker ${sp.speaker + 1}`);
@@ -1024,6 +1027,7 @@ function renderSpeakers() {
           actions,
         );
       });
+      // 3. A card per recording: what it is, and its speakers.
       return el(
         "div",
         { className: "speakers" },
@@ -1305,6 +1309,15 @@ function renderScoreCard() {
     textContent: "See the last check",
   });
   seeLast.onclick = () => openCheck(voice.id, last.id);
+  // The voice score at each check, once there are two.
+  let trend = null;
+  if (voice.checks.length >= 2) {
+    trend = el(
+      "div",
+      { className: "check-trend", title: "Voice score at each check" },
+      sparkline(voice.checks.map((c) => c.average)),
+    );
+  }
   $("#score-card").replaceChildren(
     el(
       "div",
@@ -1328,13 +1341,7 @@ function renderScoreCard() {
             `${before ? ` ${delta(last.average, before.average)} since the check before.` : ""}`,
         }),
       ),
-      voice.checks.length >= 2
-        ? el(
-            "div",
-            { className: "check-trend", title: "Voice score at each check" },
-            sparkline(voice.checks.map((c) => c.average)),
-          )
-        : null,
+      trend,
     ),
     ...[
       ladder(voice.score, before?.average ?? null),
@@ -1518,6 +1525,7 @@ async function autoPick() {
 
 /** The voice's lines, each to play, tick for the voice check, or practise. */
 function renderVoiceLines() {
+  // 1. The heading, and a note in place of the list when there are no lines yet.
   const ticked = new Set(voice.check_set);
   $("#lines-head").textContent = voice.lines.length
     ? `Your lines (${voice.lines.length})`
@@ -1533,6 +1541,7 @@ function renderVoiceLines() {
     );
     return;
   }
+  // 2. A row per line: play it, tick it for the voice check, practise it, and how it went.
   $("#voice-lines").replaceChildren(
     ...voice.lines.map((line) => {
       const play = el("button", { type: "button", className: "play", textContent: "▶" });
@@ -1552,13 +1561,12 @@ function renderVoiceLines() {
         textContent: line.takes ? "Practise" : "Start",
       });
       practise.onclick = () => openLine(line);
-      const stats =
-        (line.takes
-          ? `best ${Math.round(line.best)} · ` +
-            `last ${Math.round(line.last_score ?? line.best)} · ` +
-            `${plural(line.takes, "take")}`
-          : "not practised yet") +
-        (line.pitch_suspect ? " · pitch unreliable: a poor line to train pitch on" : "");
+      let stats = "not practised yet";
+      if (line.takes) {
+        const last = Math.round(line.last_score ?? line.best);
+        stats = `best ${Math.round(line.best)} · last ${last} · ${plural(line.takes, "take")}`;
+      }
+      if (line.pitch_suspect) stats += " · pitch unreliable: a poor line to train pitch on";
       return el(
         "li",
         { className: "vline" },
@@ -1790,9 +1798,7 @@ async function addLink(event) {
 // Add a clip as a new line, with `extra` saying whose it is and where it came
 // from, then open it.
 async function createTarget(samples, name, extra = {}) {
-  setStatus(
-    "Adding the line: separating the voice from any music, which can take a little while…",
-  );
+  setStatus("Adding the line: separating the voice from any music, which can take a little while…");
   const params = new URLSearchParams({ name: name || "Clip" });
   for (const key of ["voice", "source", "line_start"]) {
     if (extra[key] != null) params.set(key, extra[key]);
@@ -1961,10 +1967,12 @@ let linePlayer = null; // { audio, button }: a clip playing on a recording's pag
 
 /** A row for one of the recording's lines: play it, its tags, and Add or Open. */
 function lineItem(line) {
+  // 1. Play it.
   const play = el("button", { type: "button", className: "play", textContent: "▶" });
   play.setAttribute("aria-label", "Play this line");
   play.onclick = () =>
     playUrl(`/api/sources/${source.id}/audio?start=${line.start}&end=${line.end}`, play, "line");
+  // 2. Its words, tagged with its speaker, its flags, and whether it is added.
   const text = el("span", { className: "text", textContent: line.text });
   if (source.speakers?.length > 1 && line.speaker != null) {
     text.append(
@@ -1991,6 +1999,7 @@ function lineItem(line) {
       }),
     );
   }
+  // 3. Add it to the voice, or open it if it is added, and the row.
   const use = el("button", {
     type: "button",
     className: "btn practise",
@@ -2051,10 +2060,7 @@ let trimPlayer = null; // the AudioContext playing the selection
 
 // Open a clip to trim. `start` and `end` preselect a part; `back` is the page
 // Cancel returns to; `extra` goes with the new line (see createTarget).
-async function openTrim(
-  blob,
-  { start = 0, end = null, name = "", back = null, extra = {} } = {},
-) {
+async function openTrim(blob, { start = 0, end = null, name = "", back = null, extra = {} } = {}) {
   let samples;
   try {
     samples = await decodeMono(blob, MAX_TRIM_SECONDS);
@@ -2336,11 +2342,7 @@ let playing = null; // { kind, cancelled }
 
 /** Show which of the line's play buttons is playing. */
 function updatePlayButtons() {
-  const buttons = [
-    ["#play-target", "target"],
-    ["#play-take", "take"],
-    ["#play-both", "both"],
-  ];
+  const buttons = [["#play-target", "target"], ["#play-take", "take"], ["#play-both", "both"]];
   for (const [id, kind] of buttons) {
     const on = playing?.kind === kind;
     $(id).classList.toggle("on", on);
@@ -2714,6 +2716,7 @@ let unitCache = { key: "", rows: [] };
 // were grouped has a row per word; those are combined, unit by unit (a row
 // belongs to the unit its middle falls in, give or take 20 ms).
 function takeUnits(take) {
+  // 1. Rows that already match the units are used as they are.
   const units = profile?.words ?? [];
   const rows = take?.words ?? [];
   if (!rows.length || !units.length) return rows;
@@ -2721,6 +2724,7 @@ function takeUnits(take) {
     rows.length === units.length &&
     rows.every((r, i) => Math.abs(r.start - units[i].start) < 0.02);
   if (same) return rows;
+  // 2. Combined once per take and grouping.
   const key = `${take.id}:${units.length}:${units[0].start}`;
   if (unitCache.key === key) return unitCache.rows;
   // The mean of the values there are; null when there are none.
@@ -2728,6 +2732,7 @@ function takeUnits(take) {
     const v = values.filter((x) => x != null);
     return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
   };
+  // 3. Each unit gets the mean of its rows' measures and scores.
   const combined = units.map((u) => {
     const inside = rows.filter(
       (r) => (r.start + r.end) / 2 >= u.start - 0.02 && (r.start + r.end) / 2 < u.end + 0.02,
@@ -2882,12 +2887,11 @@ function renderCoach() {
       : coach?.why === "keep"
         ? `Keep working on ${name}`
         : `Work on ${name}`;
-    message =
-      (focus === coach?.focus && coach.message) ||
-      part?.hint ||
-      (part?.score != null
+    const fallback =
+      part?.score != null
         ? `${part.label} is at ${Math.round(part.score)}: ${part.detail}.`
-        : "Listen for it in the target, then record.");
+        : "Listen for it in the target, then record.";
+    message = (focus === coach?.focus && coach.message) || part?.hint || fallback;
   } else if (coach?.why === "all good") {
     heading = "Every part is close";
     message = coach.message;
@@ -2983,16 +2987,16 @@ function renderChecklist() {
     [false, "Record your first take, following the blue pitch line as you speak.", ["record"]],
   ];
   const now = items.findIndex(([ok]) => !ok);
-  $("#checklist").replaceChildren(
-    ...items.map(([ok, text, keys], i) =>
-      el(
-        "li",
-        { className: ok ? "done" : i === now ? "now" : "" },
-        el("span", { className: "check-text", textContent: text }),
-        el("span", { className: "drill-actions" }, ...actionButtons(keys)),
-      ),
-    ),
-  );
+  const rows = items.map(([ok, text, keys], i) => {
+    const state = ok ? "done" : i === now ? "now" : "";
+    return el(
+      "li",
+      { className: state },
+      el("span", { className: "check-text", textContent: text }),
+      el("span", { className: "drill-actions" }, ...actionButtons(keys)),
+    );
+  });
+  $("#checklist").replaceChildren(...rows);
 }
 
 // What to do for each part once a take is on screen: steps, and the coach's buttons for them.
@@ -3343,24 +3347,20 @@ function renderTrainer() {
   const components = trainedParts(part)
     .map((k) => shown?.components.find((c) => c.key === k))
     .filter((c) => c?.score != null);
-  $("#train-now").textContent = components.length
-    ? `On your last take: ${components
-        .map((c) => `${c.label.toLowerCase()} ${Math.round(c.score)}, ${c.detail}`)
-        .join("; ")}.`
-    : "";
+  const summary = components
+    .map((c) => `${c.label.toLowerCase()} ${Math.round(c.score)}, ${c.detail}`)
+    .join("; ");
+  $("#train-now").textContent = components.length ? `On your last take: ${summary}.` : "";
   let tips;
   if (part === "both") {
     // From the latest attempt at this word if there is one, else the last take
     // (its resonance turned from semitones into percent).
     const latest = (training.attempts[order[at]] ?? []).at(-1);
+    const takeShift = shown?.measures?.resonance;
+    const takePercent = takeShift == null ? null : (2 ** (takeShift / 12) - 1) * 100;
     const advice = latest
       ? bothTips(latest.pitch, latest.percent)
-      : bothTips(
-          shown?.measures?.pitch,
-          shown?.measures?.resonance == null
-            ? null
-            : (2 ** (shown.measures.resonance / 12) - 1) * 100,
-        );
+      : bothTips(shown?.measures?.pitch, takePercent);
     tips = advice.tips;
   } else {
     // Either way, or the way the last take was off, or else two tips of each.
@@ -4514,22 +4514,17 @@ function renderCheckResult(result) {
       );
     }),
   );
-  const parts = el(
-    "ul",
-    { className: "components" },
-    ...ALL_PARTS.map(([key, label]) =>
-      el(
-        "li",
-        { className: key === result.focus ? "focus" : "" },
-        el("span", { className: "label", textContent: label }),
-        bar(result.parts[key]),
-        el("span", {
-          className: "num",
-          textContent: result.parts[key] == null ? "–" : Math.round(result.parts[key]),
-        }),
-      ),
-    ),
-  );
+  const partRows = ALL_PARTS.map(([key, label]) => {
+    const value = result.parts[key];
+    return el(
+      "li",
+      { className: key === result.focus ? "focus" : "" },
+      el("span", { className: "label", textContent: label }),
+      bar(value),
+      el("span", { className: "num", textContent: value == null ? "–" : Math.round(value) }),
+    );
+  });
+  const parts = el("ul", { className: "components" }, ...partRows);
 
   // 3. What to work on: habits in every line, the part to lift, the weakest line.
   const habits = habitList(result.habits ?? {});
@@ -4762,11 +4757,7 @@ document.addEventListener("keydown", (e) => {
     toggleDrill();
     return;
   }
-  if (
-    $("#practice").hidden ||
-    (session && session.kind !== "take") ||
-    $("#record").disabled
-  ) {
+  if ($("#practice").hidden || (session && session.kind !== "take") || $("#record").disabled) {
     return;
   }
   e.preventDefault();

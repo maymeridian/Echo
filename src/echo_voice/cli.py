@@ -20,8 +20,13 @@ from . import __version__
 from .analysis import AnalysisError, analyze, load
 from .scoring import compare
 
+# --- SETTINGS ---
+
 NAME_CHARS = 80  # a voice's name is cut to this many characters
 BELOW_NORMAL_PRIORITY = 0x4000  # Windows' BELOW_NORMAL_PRIORITY_CLASS
+
+
+# --- COMMANDS ---
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -116,6 +121,9 @@ def main(argv: list[str] | None = None) -> int:
     for hint in result["hints"]:
         print(f"- {hint}")
     return 0
+
+
+# --- IMPORTING A RECORDING ---
 
 
 def _import(args: argparse.Namespace) -> int:

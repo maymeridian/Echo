@@ -346,6 +346,7 @@ def cohort_mean(cache: Path, workers: int) -> None:
 
 # --- FIT ---
 
+# The distances a curve is fitted for: each part, with Rhythm as its two halves.
 KEYS = ["identity", "pitch", "melody", "resonance", "articulation", "tempo", "timing"]
 
 

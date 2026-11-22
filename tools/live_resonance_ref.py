@@ -40,7 +40,12 @@ from echo_voice.analysis import (
 )
 from echo_voice.scoring import align, on_grid, read_resonance
 
+# --- THE RECORDINGS ---
+
 SENTENCES = range(30001, 30013)  # the 12 sentences every VCC2018 speaker reads
+
+
+# --- MEASURING ---
 
 
 def low_priority() -> None:
@@ -67,6 +72,8 @@ def aligned_shift(a, b) -> float | None:
     si, sj, _ = align(a, b)
     return read_resonance(a, b, *on_grid(a, b, si, sj))[2]
 
+
+# --- COMMAND LINE ---
 
 # The --help text.
 HELP = """Reference measurements for tools/check_live_resonance.mjs.

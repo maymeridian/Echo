@@ -559,26 +559,29 @@ def create_app(
     def target_profile(target_id: str) -> dict:
         """What the page draws the guide from: the target's pitch band and
         contour, where its voice starts, and its words on the timeline."""
+        # 1. The line, its words and its voiced frames.
         voice = target_voice(target_id)
         _, timed = target_words(target_id, voice)
         f0 = voice.f0[voice.voiced]
         step = 2  # 20 ms is plenty for a chart
         voiced = np.flatnonzero(voice.voiced)
-        # For drawing, leave out the pitch tracker's slips: points more than 7
-        # semitones from the line's median, nearly always an octave error on a
-        # creaky or breathy stretch. They'd stretch the chart and aren't a
-        # tune anyone should follow. Scoring uses medians, which ignore them.
-        # Pitch is read only from 20 voiced frames (0.2 s) up.
+        # 2. The pitch contour to draw. For drawing, leave out the pitch tracker's
+        # slips: points more than 7 semitones from the line's median, nearly always
+        # an octave error on a creaky or breathy stretch. They'd stretch the chart
+        # and aren't a tune anyone should follow. Scoring uses medians, which ignore
+        # them. Pitch is read only from 20 voiced frames (0.2 s) up.
         drawn = voice.f0.copy()
         if f0.size >= 20:
             middle = np.median(f0)
             filled = np.where(np.isfinite(drawn), drawn, middle)
             drawn[np.abs(12 * np.log2(filled / middle)) > 7] = np.nan
+        # 3. Whether its pitch can be trusted, and the formant ceiling for the live meter.
         suspect = pitch_suspect(store.target_meta(target_id))
         # For the live resonance meter (static/formants.js): the formant ceilings
         # Resonance uses for this voice and for whoever practises it. Both are the
         # pair's one ceiling (pair_ceiling).
         ceiling = pair_ceiling(target_id)
+        # 4. The profile, with the pitch band once there is enough voiced sound.
         out = {
             "pitch_suspect": suspect,
             "duration": round(voice.duration, 2),

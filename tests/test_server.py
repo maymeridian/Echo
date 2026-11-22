@@ -167,19 +167,22 @@ def test_a_long_recording_is_split_into_lines_by_a_background_job(tmp_path):
     # 4. slt's line can still be added by hand; a start with no line there can't.
     slt = source["lines"][-1]
     added = client.post(
-        f"/api/voices/{voice['id']}/lines", json={"source": meta["id"], "start": slt["start"]}
+        f"/api/voices/{voice['id']}/lines",
+        json={"source": meta["id"], "start": slt["start"]},
     )
     assert added.status_code == 201
     assert added.json()["line_start"] == slt["start"] and added.json()["voice_id"] == voice["id"]
     nowhere = client.post(
-        f"/api/voices/{voice['id']}/lines", json={"source": meta["id"], "start": 999}
+        f"/api/voices/{voice['id']}/lines",
+        json={"source": meta["id"], "start": 999},
     )
     assert nowhere.status_code == 404
 
     # 5. A line's audio is cut from the recording; a stretch past its end is refused.
     line = source["lines"][0]
     audio = client.get(
-        f"/api/sources/{meta['id']}/audio", params={"start": line["start"], "end": line["end"]}
+        f"/api/sources/{meta['id']}/audio",
+        params={"start": line["start"], "end": line["end"]},
     )
     assert audio.headers["content-type"] == "audio/wav"
     samples = sf.read(io.BytesIO(audio.content))[0]
@@ -233,7 +236,9 @@ def test_takes_get_word_by_word_feedback_and_a_coach(tmp_path):
 
     # 3. A second take, working on melody by choice.
     second = client.post(
-        f"/api/targets/{target['id']}/takes", params={"focus": "melody"}, content=rms
+        f"/api/targets/{target['id']}/takes",
+        params={"focus": "melody"},
+        content=rms,
     ).json()
     assert second["coach"]["focus"] == "melody" and second["coach"]["why"] == "chosen"
     assert second["coach"]["progress"]["key"] == "melody"  # what this take worked on
@@ -287,7 +292,9 @@ def test_a_line_from_a_recording_remembers_where_it_came_from(tmp_path):
     assert came_from == (recording["id"], "Lighthouse", 12.5)
     # A recording that doesn't exist is left out.
     gone = client.post(
-        "/api/targets", params={"name": "x", "source": "deadbeef0000"}, content=wav(voice())
+        "/api/targets",
+        params={"name": "x", "source": "deadbeef0000"},
+        content=wav(voice()),
     ).json()
     assert gone["source"] is None and gone["line_start"] is None
 
@@ -355,7 +362,8 @@ def test_a_voice_gathers_lines_and_scores_them_together_in_a_voice_check(tmp_pat
     # 6. Rename it and choose the lines to check, leaving out an unknown one; then delete it,
     # with its lines.
     edited = client.patch(
-        f"/api/voices/{voice_id}", json={"name": "Brad", "check_lines": [lines[2]["id"], "nope"]}
+        f"/api/voices/{voice_id}",
+        json={"name": "Brad", "check_lines": [lines[2]["id"], "nope"]},
     ).json()
     assert edited["name"] == "Brad" and edited["check_set"] == [lines[2]["id"]]
     assert client.delete(f"/api/voices/{voice_id}").status_code == 204
@@ -376,7 +384,9 @@ def test_lines_and_recordings_from_before_voices_get_one(tmp_path):
 
     # 2. A line saved before voices existed, named "<recording>: <words>".
     line = client.post(
-        "/api/targets", params={"name": "Lighthouse: Hello there"}, content=wav(voice())
+        "/api/targets",
+        params={"name": "Lighthouse: Hello there"},
+        content=wav(voice()),
     ).json()
     path = tmp_path / "targets" / line["id"] / "meta.json"
     meta = json.loads(path.read_text("utf-8"))
@@ -421,7 +431,8 @@ def test_a_recording_with_two_speakers_can_be_either_voice(tmp_path):
 
     # 4. And bdl as a voice of his own.
     split = client.post(
-        f"/api/sources/{meta['id']}/split", json={"speaker": 0, "name": "Brad"}
+        f"/api/sources/{meta['id']}/split",
+        json={"speaker": 0, "name": "Brad"},
     ).json()
     assert split["voice"]["name"] == "Brad" and len(split["added"]) == 4
     brad = client.get(f"/api/voices/{split['voice']['id']}").json()
@@ -537,7 +548,9 @@ def test_the_trainer_measures_a_word_at_the_ceiling_the_voice_and_your_takes_set
     client = TestClient(create_app(tmp_path))
     voice_id = client.post("/api/voices", json={"name": "Synth"}).json()["id"]
     line_id = client.post(
-        "/api/targets", params={"name": "line", "voice": voice_id}, content=wav(voice())
+        "/api/targets",
+        params={"name": "line", "voice": voice_id},
+        content=wav(voice()),
     ).json()["id"]
     time_the_first_word(client, tmp_path, line_id)
     piece = wav(voice()[: int(0.45 * SR)])
@@ -545,7 +558,9 @@ def test_the_trainer_measures_a_word_at_the_ceiling_the_voice_and_your_takes_set
     def drill():
         """An attempt at the first word in the trainer: the line's own first vowel."""
         return client.post(
-            f"/api/targets/{line_id}/drill", params={"word": 0}, content=piece
+            f"/api/targets/{line_id}/drill",
+            params={"word": 0},
+            content=piece,
         ).json()
 
     # 3. With no takes to go by, the attempt is read at the voice's ceiling: what its line picks.
@@ -818,15 +833,21 @@ def test_other_websites_cannot_use_the_server(tmp_path):
 
     # 2. Changes need to come from Echo's own page, or from no page at all (a script).
     other = client.post(
-        "/api/voices", json={"name": "x"}, headers={"origin": "https://evil.example"}
+        "/api/voices",
+        json={"name": "x"},
+        headers={"origin": "https://evil.example"},
     )
     assert other.status_code == 403 and client.get("/api/voices").json() == []
     cross_site = client.post(
-        "/api/voices", json={"name": "x"}, headers={"sec-fetch-site": "cross-site"}
+        "/api/voices",
+        json={"name": "x"},
+        headers={"sec-fetch-site": "cross-site"},
     )
     assert cross_site.status_code == 403
     own_page = client.post(
-        "/api/voices", json={"name": "x"}, headers={"origin": "http://testserver"}
+        "/api/voices",
+        json={"name": "x"},
+        headers={"origin": "http://testserver"},
     )
     assert own_page.status_code == 201
     assert client.post("/api/voices", json={"name": "y"}).status_code == 201
@@ -834,7 +855,9 @@ def test_other_websites_cannot_use_the_server(tmp_path):
     # 3. An upload over the limit is turned down before it is read, and an empty file is a
     # clear error.
     big = client.post(
-        "/api/targets", content=b"0" * 16, headers={"content-length": str(64 * 1024 * 1024)}
+        "/api/targets",
+        content=b"0" * 16,
+        headers={"content-length": str(64 * 1024 * 1024)},
     )
     assert big.status_code == 413
     empty = client.post("/api/targets", content=wav(np.zeros(0, dtype=np.float32)))

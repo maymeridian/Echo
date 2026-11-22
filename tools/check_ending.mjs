@@ -47,6 +47,7 @@ function readWav(path) {
 // from a linear congruential generator (Numerical Recipes' constants, modulo 2^32).
 function noiseMaker(seed) {
   let s = seed >>> 0;
+  // The generator's next number, in [0, 1).
   const uniform = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
   return () => Math.sqrt(-2 * Math.log(uniform() + 1e-12)) * Math.cos(2 * Math.PI * uniform());
 }

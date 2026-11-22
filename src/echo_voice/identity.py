@@ -22,6 +22,9 @@ from .models import fetch
 
 # --- THE MODEL ---
 
+# The speaker-embedding model (WeSpeaker ResNet34-LM, trained on VoxCeleb), where it
+# is published (the release tag's spelling is the publisher's), and its SHA-256,
+# checked before it is used (models.fetch).
 MODEL_NAME = "wespeaker_en_voxceleb_resnet34_LM.onnx"
 MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/"

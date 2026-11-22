@@ -11,6 +11,7 @@ from pathlib import Path
 from echo_voice import analyze, compare, load
 from echo_voice.line import compare_words, transcribe
 
+# The words of CMU ARCTIC a0001, as the target line's transcript has them.
 LINE = ["Author", "of", "the", "Danger", "Trail,", "Philip", "Steels,", "etc."]
 
 
